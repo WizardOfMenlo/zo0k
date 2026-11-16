@@ -1,0 +1,50 @@
+[package]
+name = "zo0k"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.88"
+description = "Zero-knowledge IOPP for constrained interleaved Reed-Solomon codes: reference implementation"
+readme = "README.md"
+keywords = ["zero-knowledge", "iop", "reed-solomon", "polynomial-commitment", "cryptography"]
+categories = ["cryptography"]
+default-run = "zo0k"
+
+[features]
+default = ["cli"]
+# The command-line tool `zo0k`. A crate that uses the library alone can
+# disable it, and with it the dependencies on `clap` and `serde_json`.
+cli = ["dep:clap", "dep:serde_json"]
+
+[dependencies]
+blake3 = "1.8"
+clap = { version = "4.5", features = ["derive"], optional = true }
+getrandom = "0.3"
+rayon = "1.10"
+serde = { version = "1", features = ["derive"] }
+serde_json = { version = "1", optional = true }
+sha3 = "0.10"
+
+[dev-dependencies]
+serde_json = "1"
+
+[[bin]]
+name = "zo0k"
+path = "src/bin/zo0k/main.rs"
+required-features = ["cli"]
+
+# These tests run the command-line tool.
+[[test]]
+name = "cli"
+required-features = ["cli"]
+
+[[test]]
+name = "paper"
+required-features = ["cli"]
+
+[profile.release]
+codegen-units = 1
+lto = "thin"
+
+# The tests compute proofs, which is slow without optimization.
+[profile.test]
+opt-level = 2

@@ -1,0 +1,9 @@
+# The field arithmetic uses carry-less multiplication when the build enables
+# it, and a slow portable implementation otherwise. These flags enable it:
+# PCLMULQDQ on x86-64, and PMULL, which belongs to the feature `aes`, on
+# AArch64. The environment variable RUSTFLAGS replaces them.
+[target.'cfg(target_arch = "x86_64")']
+rustflags = ["-C", "target-feature=+pclmulqdq"]
+
+[target.'cfg(target_arch = "aarch64")']
+rustflags = ["-C", "target-feature=+aes"]
