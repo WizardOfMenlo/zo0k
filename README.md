@@ -266,3 +266,7 @@ The comparison without zero knowledge is a model, `Variant::Baseline`: the
 same protocol without seeds, masks, auxiliary blocks, pads, the mask sum and
 batching challenge of every sumcheck, and the mask of the base case. It has
 the same accounting, and no prover or verifier.
+
+## License
+
+Licensed under the [Apache License, Version 2.0](LICENSE).

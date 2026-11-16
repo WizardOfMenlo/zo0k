@@ -14,7 +14,7 @@
 
 use crate::error::{Error, Result};
 use crate::field::Field;
-use crate::hash::{DIGEST_BYTES, Digest, Domain, Hasher};
+use crate::hash::{Digest, Domain, Hasher};
 use rayon::prelude::*;
 
 /// Below this many digests, a level is hashed on one thread.
@@ -43,11 +43,7 @@ pub fn leaf_digest<H: Hasher, F: Field>(position: usize, column: impl IntoIterat
 
 /// The digest of a node with one or two children.
 fn node_digest<H: Hasher>(children: &[Digest]) -> Digest {
-    let mut bytes = [0; 2 * DIGEST_BYTES];
-    for (slot, child) in bytes.chunks_exact_mut(DIGEST_BYTES).zip(children) {
-        slot.copy_from_slice(child);
-    }
-    H::hash(Domain::MerkleNode, &bytes[..children.len() * DIGEST_BYTES])
+    H::hash(Domain::MerkleNode, children.as_flattened())
 }
 
 /// A Merkle tree, kept by the prover to answer openings.

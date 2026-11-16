@@ -4,6 +4,7 @@ version = "0.1.0"
 edition = "2024"
 rust-version = "1.88"
 description = "Zero-knowledge IOPP for constrained interleaved Reed-Solomon codes: reference implementation"
+license = "Apache-2.0"
 readme = "README.md"
 keywords = ["zero-knowledge", "iop", "reed-solomon", "polynomial-commitment", "cryptography"]
 categories = ["cryptography"]
