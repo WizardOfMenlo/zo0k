@@ -3,7 +3,7 @@
 use crate::field::Field;
 
 /// A cryptographic random generator: the BLAKE3 output stream of a seed.
-pub struct Rng(blake3::OutputReader);
+pub struct Rng(crate::blake3::OutputReader);
 
 impl Rng {
     /// A generator seeded by the operating system.
@@ -12,13 +12,14 @@ impl Rng {
     /// Panics if the operating system cannot supply entropy.
     pub fn from_entropy() -> Self {
         let mut seed = [0; 32];
-        getrandom::fill(&mut seed).expect("the operating system supplies entropy");
+        assert!(crate::entropy::fill(&mut seed), "the operating system supplies entropy");
+        assert!(seed != [0; 32]);
         Self::from_seed(seed)
     }
 
     /// A deterministic generator, for tests and reproducible benchmarks.
     pub fn from_seed(seed: [u8; 32]) -> Self {
-        Self(blake3::Hasher::new_keyed(&seed).finalize_xof())
+        Self(crate::blake3::Hasher::new_keyed(&seed).finalize_xof())
     }
 
     /// A uniform field element.
