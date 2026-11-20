@@ -56,6 +56,8 @@ pub mod costs;
 pub mod error;
 pub mod field;
 pub mod hash;
+#[allow(missing_docs)]
+pub mod json;
 pub mod mask;
 pub mod merkle;
 pub mod oracle;

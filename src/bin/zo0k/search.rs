@@ -16,48 +16,48 @@
 //! few vectors. The result is a local optimum and not provably the best
 //! schedule.
 
-use crate::{Result, in_range};
-use clap::Args;
+use crate::Result;
+use crate::args::Matches;
 use rayon::prelude::*;
 use std::collections::HashMap;
 use std::sync::Mutex;
+use zo0k::json::ToJson;
 use zo0k::reed_solomon::MAX_DOMAIN_SIZE;
 use zo0k::tuning::{Analysis, assign_pow_bits_and_slack, optimize_queries, polish_queries};
 use zo0k::{FieldSize, Parameters, StageParameters, Variant};
 
-#[derive(Args)]
 pub struct Search {
-    /// Tables have 2^N entries.
-    #[arg(long, value_name = "N", value_parser = in_range::<1, 40>)]
     num_variables: usize,
-    /// Number of stages. One gives the sublinear protocol. By default every
-    /// number up to `--max-stages` is tried.
-    #[arg(long, value_parser = in_range::<1, 8>)]
     stages: Option<usize>,
-    #[arg(long, default_value_t = 6, value_parser = in_range::<1, 8>)]
     max_stages: usize,
-    /// Limit on the IOP proof length, as a multiple of the size of the table.
-    #[arg(long, default_value_t = 5.0)]
     budget: f64,
-    /// Security target in bits.
-    #[arg(long, default_value_t = 100)]
     security: u32,
-    /// Bits of proof of work before every round of queries.
-    #[arg(long, default_value_t = 24)]
     pow_bits: u32,
-    /// Limit on the bits of proof of work before each other verifier message.
-    /// Such a message gets the fewest bits that the security target needs,
-    /// which is none over a large field.
-    #[arg(long, default_value_t = 24, value_parser = clap::value_parser!(u32).range(..=40))]
     max_pow_bits: u32,
-    /// Distance of the proximity parameters from the Johnson bound. A
-    /// schedule that needs more than `--max-pow-bits` at this slack gets the
-    /// smallest larger slack at which it does not.
-    #[arg(long, default_value_t = 0.0002)]
     johnson_slack: f64,
-    /// Search for the protocol without zero knowledge.
-    #[arg(long)]
     baseline: bool,
+}
+
+impl Search {
+    pub fn new(matches: &Matches) -> Self {
+        let search = Self {
+            num_variables: matches.count("num-variables").expect("a required number of variables"),
+            stages: matches.count("stages"),
+            max_stages: matches.count("max-stages").expect("a default number of stages"),
+            budget: matches.float("budget").expect("a default budget"),
+            security: matches.bits("security").expect("a default security target"),
+            pow_bits: matches.bits("pow-bits").expect("a default number of bits"),
+            max_pow_bits: matches.bits("max-pow-bits").expect("a default number of bits"),
+            johnson_slack: matches.float("johnson-slack").expect("a default slack"),
+            baseline: matches.flag("baseline"),
+        };
+        assert!((1..=40).contains(&search.num_variables) && search.max_pow_bits <= 40);
+        assert!(
+            (1..=8).contains(&search.max_stages)
+                && search.stages.is_none_or(|count| (1..=8).contains(&count))
+        );
+        search
+    }
 }
 
 /// Domain sizes are `j·2^t` with `GRID ≤ j < 2·GRID`.
@@ -355,6 +355,6 @@ pub fn search(arguments: &Search, field: FieldSize) -> Result<()> {
         analysis.costs.expected_argument_bytes / 1024.0,
         analysis.costs.iop_bytes as f64 / table_bytes,
     );
-    println!("{}", serde_json::to_string_pretty(&analysis.parameters)?);
+    println!("{}", analysis.parameters.to_json().to_string_pretty());
     Ok(())
 }

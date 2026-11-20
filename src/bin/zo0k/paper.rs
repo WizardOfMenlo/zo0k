@@ -12,28 +12,34 @@
 //!   schedule of the zero-knowledge configuration.
 
 use crate::Result;
-use clap::Args;
-use serde::Deserialize;
+use crate::args::Matches;
 use std::collections::BTreeMap;
 use std::fmt::Write;
 use std::fs;
 use std::path::PathBuf;
 use zo0k::costs::Costs;
+use zo0k::json::{self, FromJson, Shape, Unknown, Value, required};
 use zo0k::tuning::Analysis;
 use zo0k::{Field, FieldSize, Gf2_256, Layout, Parameters, Variant};
 
 /// The field of the paper's evaluation.
 const FIELD: FieldSize = Gf2_256::SIZE;
 
-#[derive(Args)]
 pub struct Paper {
-    /// Directory with `tables.json` and `frontiers.json`, the configurations
-    /// of the paper.
-    #[arg(long, default_value = "paper")]
     configurations: PathBuf,
-    /// Directory for `scaling-tables.tex` and `frontiers.csv`.
-    #[arg(long, default_value = "paper")]
     out: PathBuf,
+}
+
+impl Paper {
+    pub fn new(matches: &Matches) -> Self {
+        let paper = Self {
+            configurations: matches.path("configurations").expect("a default directory"),
+            out: matches.path("out").expect("a default directory"),
+        };
+        assert!(!paper.configurations.as_os_str().is_empty());
+        assert!(!paper.out.as_os_str().is_empty());
+        paper
+    }
 }
 
 /// The configurations of the rows of the tables.
@@ -41,7 +47,7 @@ const TABLES: &str = include_str!("../../../paper/tables.json");
 
 /// The selected configurations of the row `name`, such as `polylog-20`.
 pub fn table_row(name: &str) -> Result<Pair<Parameters>> {
-    let rows: Vec<Row> = serde_json::from_str(TABLES)?;
+    let rows: Vec<Row> = json::from_slice(TABLES.as_bytes())?;
     let names: Vec<String> =
         rows.iter().map(|row| format!("{}-{}", row.protocol, row.num_variables)).collect();
     let index = names
@@ -52,20 +58,45 @@ pub fn table_row(name: &str) -> Result<Pair<Parameters>> {
 }
 
 /// One row of a table.
-#[derive(Deserialize)]
 struct Row {
     /// `sublinear` (one stage) or `polylog` (several stages).
     protocol: String,
     num_variables: usize,
-    #[serde(flatten)]
     selected: Pair<Parameters>,
 }
 
+const ROW_FIELDS: [&str; 4] = ["protocol", "num_variables", "zero_knowledge", "baseline"];
+
+impl FromJson for Row {
+    fn from_json(value: &Value) -> json::Result<Self> {
+        let [protocol, num_variables, zero_knowledge, baseline] =
+            json::fields(value, ROW_FIELDS, Unknown::Ignore, Shape::Object)?;
+        let protocol = required(protocol, ROW_FIELDS[0])?;
+        let num_variables = required(num_variables, ROW_FIELDS[1])?;
+        let selected = Pair {
+            zero_knowledge: required(zero_knowledge, ROW_FIELDS[2])?,
+            baseline: required(baseline, ROW_FIELDS[3])?,
+        };
+        Ok(Self { protocol, num_variables, selected })
+    }
+}
+
 /// A value for each variant of the protocol.
-#[derive(Deserialize)]
 pub struct Pair<T> {
     pub zero_knowledge: T,
     pub baseline: T,
+}
+
+const PAIR_FIELDS: [&str; 2] = ["zero_knowledge", "baseline"];
+
+impl<T: FromJson> FromJson for Pair<T> {
+    fn from_json(value: &Value) -> json::Result<Self> {
+        let [zero_knowledge, baseline] =
+            json::fields(value, PAIR_FIELDS, Unknown::Ignore, Shape::ObjectOrArray)?;
+        let zero_knowledge = required(zero_knowledge, PAIR_FIELDS[0])?;
+        let baseline = required(baseline, PAIR_FIELDS[1])?;
+        Ok(Self { zero_knowledge, baseline })
+    }
 }
 
 /// The sizes that a row of a table reports, in bytes.
@@ -165,11 +196,10 @@ fn frontier(points: &mut Vec<(usize, f64, bool)>) {
 
 pub fn paper(arguments: &Paper) -> Result<()> {
     let read = |file: &str| fs::read(arguments.configurations.join(file));
-    let table_rows: Vec<Row> = serde_json::from_slice(&read("tables.json")?)?;
+    let table_rows: Vec<Row> = json::from_slice(&read("tables.json")?)?;
     // For each protocol, configurations for its largest table size, from
     // which the frontier of proof length against argument size is drawn.
-    let frontiers: BTreeMap<String, Pair<Vec<Parameters>>> =
-        serde_json::from_slice(&read("frontiers.json")?)?;
+    let frontiers: BTreeMap<String, Pair<Vec<Parameters>>> = json::from_slice(&read("frontiers.json")?)?;
     let rows = table_rows
         .iter()
         .map(|row| Ok((row.protocol.clone(), Sizes::new(row)?)))

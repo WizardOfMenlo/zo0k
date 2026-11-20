@@ -17,7 +17,6 @@ use crate::parameters::{
     JOHNSON_SLACK_RANGE, Layout, MAX_POW_BITS, Parameters, Round, StageParameters, Variant,
 };
 use crate::soundness::{CodeBounds, Soundness};
-use serde::Serialize;
 use std::cmp::Reverse;
 
 /// Largest number of bits that [`Parameters::standard`] gives a proof of
@@ -30,7 +29,7 @@ pub const STANDARD_MAX_POW_BITS: u32 = 24;
 pub const STANDARD_MAX_NUM_VARIABLES: usize = 33;
 
 /// Everything that follows from the parameters of a variant of the protocol.
-#[derive(Clone, Debug, Serialize)]
+#[derive(Clone, Debug)]
 pub struct Analysis {
     /// The analyzed parameters.
     pub parameters: Parameters,

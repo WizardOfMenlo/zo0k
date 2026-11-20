@@ -1,30 +1,38 @@
 //! Benchmarks of real proofs, and verification of saved ones.
 
+use crate::args::Matches;
 use crate::{FieldChoice, HashChoice, Result, Source, with_types};
-use clap::Args;
-use clap::ValueEnum;
-use serde::{Deserialize, Serialize};
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::time::Instant;
+use zo0k::json::{FromJson, Shape, ToJson, Unknown, Value, object};
 use zo0k::tuning::Analysis;
 use zo0k::{Commitment, Hasher, Parameters, Proof, Protocol, Rng, RsField, Variant};
 
-#[derive(Args)]
 pub struct Bench {
-    #[command(flatten)]
     source: Source,
-    /// Number of proofs to generate; the report has the median times.
-    #[arg(long, default_value_t = 3)]
     repeats: usize,
-    /// Save the statement and the last proof to this new directory.
-    #[arg(long)]
     out: Option<PathBuf>,
 }
 
+impl Bench {
+    pub fn new(matches: &Matches) -> Self {
+        let bench = Self {
+            source: Source::new(matches),
+            repeats: matches.count("repeats").expect("a default number of repeats"),
+            out: matches.path("out"),
+        };
+        assert!(bench.out.as_ref().is_none_or(|out| !out.as_os_str().is_empty()));
+        bench
+    }
+}
+
+const FIXTURE_SEED: [u8; 32] = [
+    85, 228, 50, 142, 68, 98, 107, 21, 202, 255, 35, 3, 56, 126, 157, 131, 236, 177, 17, 12, 28, 43, 23, 181,
+    178, 135, 143, 164, 242, 170, 236, 79,
+];
+
 /// A public statement, as saved next to a proof.
-#[derive(Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
 struct Statement {
     /// The names of the field and of the hash function.
     field: String,
@@ -35,6 +43,37 @@ struct Statement {
     commitment: String,
     point: Vec<String>,
     value: String,
+}
+
+const STATEMENT_FIELDS: [&str; 6] = ["field", "hash", "parameters", "commitment", "point", "value"];
+
+impl ToJson for Statement {
+    fn to_json(&self) -> Value {
+        object([
+            ("field", self.field.to_json()),
+            ("hash", self.hash.to_json()),
+            ("parameters", self.parameters.to_json()),
+            ("commitment", self.commitment.to_json()),
+            ("point", self.point.to_json()),
+            ("value", self.value.to_json()),
+        ])
+    }
+}
+
+impl FromJson for Statement {
+    fn from_json(value: &Value) -> zo0k::json::Result<Self> {
+        use zo0k::json::required;
+        let [field, hash, parameters, commitment, point, value] =
+            zo0k::json::fields(value, STATEMENT_FIELDS, Unknown::Deny, Shape::ObjectOrArray)?;
+        Ok(Self {
+            field: required(field, STATEMENT_FIELDS[0])?,
+            hash: required(hash, STATEMENT_FIELDS[1])?,
+            parameters: required(parameters, STATEMENT_FIELDS[2])?,
+            commitment: required(commitment, STATEMENT_FIELDS[3])?,
+            point: required(point, STATEMENT_FIELDS[4])?,
+            value: required(value, STATEMENT_FIELDS[5])?,
+        })
+    }
 }
 
 fn to_hex(bytes: &[u8]) -> String {
@@ -78,7 +117,7 @@ pub fn bench<F: RsField, H: Hasher>(arguments: &Bench) -> Result<()> {
 
     // A fixed table and point make runs comparable. The prover's randomness
     // is fresh.
-    let mut fixture = Rng::from_seed(*blake3::hash(b"zo0k benchmark fixture").as_bytes());
+    let mut fixture = Rng::from_seed(FIXTURE_SEED);
     let table: Vec<F> = fixture.fields(1 << parameters.num_variables);
     let point: Vec<F> = fixture.fields(parameters.num_variables);
     let mut rng = Rng::from_entropy();
@@ -112,25 +151,25 @@ pub fn bench<F: RsField, H: Hasher>(arguments: &Bench) -> Result<()> {
             value: field_to_hex(value),
         };
         fs::create_dir(directory).map_err(|error| format!("{}: {error}", directory.display()))?;
-        fs::write(directory.join("statement.json"), serde_json::to_string_pretty(&statement)?)?;
+        fs::write(directory.join("statement.json"), statement.to_json().to_string_pretty())?;
         fs::write(directory.join("proof.bin"), &proof.0)?;
     }
     let costs = &analysis.costs;
-    let report = serde_json::json!({
-        "field": F::NAME,
-        "hash": H::NAME,
-        "parameters": parameters,
-        "threads": rayon::current_num_threads(),
-        "repeats": arguments.repeats,
-        "commit_seconds": median(commit_times),
-        "prove_seconds": median(prove_times),
-        "verify_seconds": median(verify_times),
-        "argument_bytes": median(sizes),
-        "expected_argument_bytes": costs.expected_argument_bytes,
-        "iop_bytes": costs.iop_bytes,
-        "soundness_bits": analysis.soundness.total_bits,
-    });
-    println!("{}", serde_json::to_string_pretty(&report)?);
+    let report = object([
+        ("field", F::NAME.to_json()),
+        ("hash", H::NAME.to_json()),
+        ("parameters", parameters.to_json()),
+        ("threads", rayon::current_num_threads().to_json()),
+        ("repeats", arguments.repeats.to_json()),
+        ("commit_seconds", median(commit_times).to_json()),
+        ("prove_seconds", median(prove_times).to_json()),
+        ("verify_seconds", median(verify_times).to_json()),
+        ("argument_bytes", median(sizes).to_json()),
+        ("expected_argument_bytes", costs.expected_argument_bytes.to_json()),
+        ("iop_bytes", costs.iop_bytes.to_json()),
+        ("soundness_bits", analysis.soundness.total_bits.to_json()),
+    ]);
+    println!("{}", report.sorted().to_string_pretty());
     Ok(())
 }
 
@@ -139,12 +178,10 @@ pub fn verify(directory: &Path) -> Result<()> {
         let path = directory.join(file);
         fs::read(&path).map_err(|error| format!("{}: {error}", path.display()))
     };
-    let statement: Statement = serde_json::from_slice(&read("statement.json")?)?;
+    let statement: Statement = zo0k::json::from_slice(&read("statement.json")?)?;
     let proof = Proof(read("proof.bin")?);
-    let field =
-        FieldChoice::from_str(&statement.field, false).map_err(|_| "the statement has an unknown field")?;
-    let hash =
-        HashChoice::from_str(&statement.hash, false).map_err(|_| "the statement has an unknown hash")?;
+    let field = FieldChoice::from_name(&statement.field).ok_or("the statement has an unknown field")?;
+    let hash = HashChoice::from_name(&statement.hash).ok_or("the statement has an unknown hash")?;
     with_types!(field, hash, verify_statement, &statement, &proof)
 }
 

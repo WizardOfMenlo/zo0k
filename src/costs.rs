@@ -11,10 +11,9 @@
 use crate::hash::DIGEST_BYTES;
 use crate::parameters::{Layout, Parameters};
 use crate::transcript::NONCE_BYTES;
-use serde::Serialize;
 
 /// Sizes in bytes of the proofs of a layout.
-#[derive(Clone, Debug, Serialize)]
+#[derive(Clone, Debug)]
 pub struct Costs {
     /// All oracles.
     pub oracle_bytes: usize,
