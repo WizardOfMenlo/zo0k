@@ -33,6 +33,10 @@ name = "zo0k"
 path = "src/bin/zo0k/main.rs"
 required-features = ["cli"]
 
+[[bin]]
+name = "sim"
+path = "src/bin/sim/main.rs"
+
 # These tests run the command-line tool.
 [[test]]
 name = "cli"

@@ -1,0 +1,3 @@
+0x0000000000000001 initial
+0x878a3fc7ada0435c transcript_round_trip_gf2_128 (sim: positions carry little entropy)
+0x878a3fc7ada0442d transcript_round_trip_gf2_128 (sim: one position may repeat)
