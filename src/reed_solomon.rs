@@ -39,7 +39,7 @@
 //! `O(n·log c)` multiplications.
 
 use crate::field::{BinaryField, Field, Gf2_128};
-use rayon::prelude::*;
+use crate::parallel;
 use std::sync::OnceLock;
 
 /// The largest evaluation domain has `2^32` points.
@@ -163,11 +163,13 @@ fn encode<F: BinaryField>(coefficients: &[F], len: usize) -> Vec<F> {
     values[..count].copy_from_slice(coefficients);
     let (first, rest) = values.split_at_mut(block);
     to_novel_basis(first, count);
-    rest.par_chunks_mut(block).for_each(|coset| coset[..count].copy_from_slice(&first[..count]));
-    values
-        .par_chunks_mut(block)
-        .enumerate()
-        .for_each(|(coset, values)| evaluate(values, coset * block, count, len));
+    let first = &*first;
+    parallel::for_each_chunk_mut(rest, block, MIN_PIECE, |_, coset| {
+        coset[..count].copy_from_slice(&first[..count])
+    });
+    parallel::for_each_chunk_mut(&mut values, block, MIN_PIECE, |coset, values| {
+        evaluate(values, coset * block, count, len);
+    });
     values.truncate(len);
     values
 }
@@ -209,7 +211,9 @@ fn to_novel_basis<F: Field>(coefficients: &mut [F], count: usize) {
             if source.len() < 8 * PARALLEL_THRESHOLD {
                 target.iter_mut().zip(source).for_each(|(t, s)| *t += *s);
             } else {
-                target.par_iter_mut().zip(source).with_min_len(8 * MIN_PIECE).for_each(|(t, s)| *t += *s);
+                parallel::for_each_piece_mut(target, 8 * MIN_PIECE, |start, piece| {
+                    piece.iter_mut().zip(&source[start..]).for_each(|(t, s)| *t += *s);
+                });
             }
         }
         end = start;
@@ -219,7 +223,7 @@ fn to_novel_basis<F: Field>(coefficients: &mut [F], count: usize) {
         to_novel_basis(remainder, half);
         to_novel_basis(quotient, count - half);
     } else {
-        rayon::join(|| to_novel_basis(remainder, half), || to_novel_basis(quotient, count - half));
+        parallel::join(|| to_novel_basis(remainder, half), || to_novel_basis(quotient, count - half));
     }
 }
 
@@ -254,7 +258,9 @@ fn evaluate<F: BinaryField>(values: &mut [F], start: usize, count: usize, len: u
     if quotient_count < 2 * PARALLEL_THRESHOLD {
         pairs.0.iter_mut().zip(pairs.1).for_each(butterfly);
     } else {
-        pairs.0.par_iter_mut().zip(pairs.1).with_min_len(MIN_PIECE).for_each(butterfly);
+        parallel::for_each_pair_mut(pairs.0, pairs.1, MIN_PIECE, |low, high| {
+            low.iter_mut().zip(high).for_each(butterfly);
+        });
     }
     // Where Q has no coefficient, both halves hold R.
     let count = count.min(half);
@@ -268,7 +274,7 @@ fn evaluate<F: BinaryField>(values: &mut [F], start: usize, count: usize, len: u
             evaluate(high, start + half, count, len);
         }
     } else {
-        rayon::join(|| evaluate(low, start, count, len), || evaluate(high, start + half, count, len));
+        parallel::join(|| evaluate(low, start, count, len), || evaluate(high, start + half, count, len));
     }
 }
 

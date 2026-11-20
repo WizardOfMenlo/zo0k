@@ -59,6 +59,7 @@ pub mod hash;
 pub mod mask;
 pub mod merkle;
 pub mod oracle;
+pub mod parallel;
 pub mod parameters;
 pub mod polynomial;
 pub mod reed_solomon;

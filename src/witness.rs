@@ -5,10 +5,10 @@ use crate::field::Field;
 use crate::hash::Hasher;
 use crate::mask::Mask;
 use crate::oracle::Oracle;
+use crate::parallel;
 use crate::parameters::{MASK_LEN, Stage};
 use crate::reed_solomon::RsField;
 use crate::rng::Rng;
-use rayon::prelude::*;
 
 /// The message and the randomness of a single codeword: a main block, an
 /// auxiliary block, a mask and a seed. This is a witness of the relation on a
@@ -114,22 +114,19 @@ impl<F: RsField> Message<F> {
             let width = table.len() / rows;
             &table[row * width..(row + 1) * width]
         }
-        (0..rows + usize::from(extra_row.is_some()))
-            .into_par_iter()
-            .map(|row| {
-                let polynomial = if row < rows {
-                    let mut polynomial = Vec::with_capacity(stage.dimension());
-                    polynomial.extend_from_slice(of_row(&self.seeds, rows, row));
-                    polynomial.extend_from_slice(&masks[row]);
-                    polynomial.extend_from_slice(of_row(&self.main, rows, row));
-                    polynomial.extend_from_slice(of_row(&self.aux, rows, row));
-                    polynomial
-                } else {
-                    extra_row.unwrap().polynomial()
-                };
-                F::encode(&polynomial, stage.domain_size)
-            })
-            .collect()
+        parallel::map_range(rows + usize::from(extra_row.is_some()), 1, |row| {
+            let polynomial = if row < rows {
+                let mut polynomial = Vec::with_capacity(stage.dimension());
+                polynomial.extend_from_slice(of_row(&self.seeds, rows, row));
+                polynomial.extend_from_slice(&masks[row]);
+                polynomial.extend_from_slice(of_row(&self.main, rows, row));
+                polynomial.extend_from_slice(of_row(&self.aux, rows, row));
+                polynomial
+            } else {
+                extra_row.unwrap().polynomial()
+            };
+            F::encode(&polynomial, stage.domain_size)
+        })
     }
 }
 
