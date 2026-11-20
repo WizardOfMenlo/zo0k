@@ -174,8 +174,8 @@ fn the_statement_is_bound<F: RsField, H: Hasher>() {
 fn proofs_are_reproducible_from_the_seed_of_the_generator<F: RsField, H: Hasher>() {
     let protocol = Protocol::<F, H>::new(parameters::<F>(9, &[(2, 1100), (3, 300)], 6)).unwrap();
     let prove_with = |threads: usize| {
-        let pool = rayon::ThreadPoolBuilder::new().num_threads(threads).build().unwrap();
-        pool.install(|| prove(&protocol, &mut Rng::from_seed([7; 32])).proof)
+        zo0k::parallel::set_threads(threads);
+        prove(&protocol, &mut Rng::from_seed([7; 32])).proof
     };
     let proof = prove_with(1);
     assert_eq!(prove_with(2), proof);

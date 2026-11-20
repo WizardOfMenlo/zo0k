@@ -58,6 +58,8 @@ mod entropy;
 pub mod error;
 pub mod field;
 pub mod hash;
+#[allow(missing_docs)]
+pub mod json;
 pub mod keccak;
 pub mod mask;
 pub mod merkle;

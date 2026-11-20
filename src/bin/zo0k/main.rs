@@ -1,44 +1,37 @@
-//! Command-line interface: benchmarks, verification, parameter analysis and
-//! the tables of the paper.
-
+mod args;
 mod bench;
 mod paper;
 mod search;
 
-use clap::{Args, Parser, Subcommand, ValueEnum};
+use args::{Command, Invocation, Matches};
 use std::error::Error;
 use std::fs;
 use std::path::PathBuf;
+use zo0k::json::ToJson;
 use zo0k::tuning::{Analysis, optimize_queries};
 use zo0k::{Blake3, Field, FieldSize, Gf2_128, Gf2_256, Hasher, Keccak256, Parameters, Variant};
 
 type Result<T> = std::result::Result<T, Box<dyn Error>>;
 
-#[derive(Parser)]
-#[command(version, about = "Zero-knowledge IOPP for constrained interleaved Reed-Solomon codes")]
-struct Cli {
-    /// Number of worker threads (default: all cores).
-    #[arg(long, global = true)]
-    threads: Option<usize>,
-    /// The field of the protocol.
-    #[arg(long, global = true, value_enum, default_value_t = FieldChoice::Gf2_256)]
-    field: FieldChoice,
-    /// The hash function of Merkle trees and of the Fiat-Shamir transformation.
-    #[arg(long, global = true, value_enum, default_value_t = HashChoice::Blake3)]
-    hash: HashChoice,
-    #[command(subcommand)]
-    command: Command,
-}
-
-#[derive(Clone, Copy, PartialEq, ValueEnum)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum FieldChoice {
-    #[value(name = Gf2_256::NAME)]
     Gf2_256,
-    #[value(name = Gf2_128::NAME)]
     Gf2_128,
 }
 
 impl FieldChoice {
+    const NAMES: [&str; 2] = [Gf2_256::NAME, Gf2_128::NAME];
+
+    fn from_name(name: &str) -> Option<Self> {
+        let choice = match name {
+            Gf2_256::NAME => Self::Gf2_256,
+            Gf2_128::NAME => Self::Gf2_128,
+            _ => return None,
+        };
+        assert!(Self::NAMES.contains(&name));
+        Some(choice)
+    }
+
     fn size(self) -> FieldSize {
         match self {
             Self::Gf2_256 => Gf2_256::SIZE,
@@ -47,16 +40,26 @@ impl FieldChoice {
     }
 }
 
-#[derive(Clone, Copy, PartialEq, ValueEnum)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum HashChoice {
-    #[value(name = Blake3::NAME)]
     Blake3,
-    #[value(name = Keccak256::NAME)]
     Keccak256,
 }
 
-/// Call a function that is generic over the field and the hash function with
-/// the types of the given choices.
+impl HashChoice {
+    const NAMES: [&str; 2] = [Blake3::NAME, Keccak256::NAME];
+
+    fn from_name(name: &str) -> Option<Self> {
+        let choice = match name {
+            Blake3::NAME => Self::Blake3,
+            Keccak256::NAME => Self::Keccak256,
+            _ => return None,
+        };
+        assert!(Self::NAMES.contains(&name));
+        Some(choice)
+    }
+}
+
 macro_rules! with_types {
     ($field:expr, $hash:expr, $($function:ident)::+, $($argument:expr),*) => {
         match ($field, $hash) {
@@ -77,66 +80,31 @@ macro_rules! with_types {
 }
 use with_types;
 
-#[derive(Subcommand)]
-enum Command {
-    /// Commit to a random table, prove an evaluation, verify it, and report
-    /// times and sizes.
-    Bench(bench::Bench),
-    /// Verify a proof saved by `bench --out`.
-    Verify {
-        /// The directory that holds `statement.json` and `proof.bin`.
-        directory: PathBuf,
-    },
-    /// Print the layout, soundness errors and sizes of parameters as JSON.
-    /// Fails after printing if the soundness error is above the target.
-    Analyze {
-        #[command(flatten)]
-        source: Source,
-        /// Analyze the protocol without zero knowledge instead.
-        #[arg(long)]
-        baseline: bool,
-    },
-    /// Recompute the tables and the frontier data of the paper's evaluation
-    /// from its configurations.
-    Paper(paper::Paper),
-    /// Search for a schedule with a small argument within a limit on the
-    /// IOP proof length, and print its parameters.
-    Search(search::Search),
-}
-
-/// Parse an integer between `MIN` and `MAX`.
-fn in_range<const MIN: usize, const MAX: usize>(text: &str) -> std::result::Result<usize, String> {
-    match text.parse() {
-        Ok(value) if (MIN..=MAX).contains(&value) => Ok(value),
-        _ => Err(format!("expected an integer between {MIN} and {MAX}")),
-    }
-}
-
-/// Where parameters come from.
-#[derive(Args)]
 struct Source {
-    /// A JSON file with parameters.
-    #[arg(long, group = "source")]
     params: Option<PathBuf>,
-    /// The configuration of a row of the paper's tables, such as
-    /// `sublinear-16` or `polylog-24`.
-    #[arg(long, value_name = "ROW", group = "source")]
     paper: Option<String>,
-    /// Standard parameters for tables of 2^N entries.
-    #[arg(long, value_name = "N", group = "source", value_parser = in_range::<1, 33>)]
     num_variables: Option<usize>,
-    /// Security target of the standard parameters, in bits.
-    #[arg(long, default_value_t = 100, conflicts_with_all = ["params", "paper"])]
     security: u32,
-    /// Replace the query counts by optimized ones.
-    #[arg(long)]
     optimize_queries: bool,
 }
 
 impl Source {
+    fn new(matches: &Matches) -> Self {
+        let source = Self {
+            params: matches.path("params"),
+            paper: matches.text("paper"),
+            num_variables: matches.count("num-variables"),
+            security: matches.bits("security").expect("a default security target"),
+            optimize_queries: matches.flag("optimize-queries"),
+        };
+        let given = [source.params.is_some(), source.paper.is_some(), source.num_variables.is_some()];
+        assert!(given.iter().filter(|&&is_given| is_given).count() <= 1);
+        source
+    }
+
     fn parameters(&self, variant: Variant, field: FieldSize) -> Result<Parameters> {
         let mut parameters = match (&self.params, &self.paper, self.num_variables) {
-            (Some(path), _, _) => serde_json::from_slice(&fs::read(path)?)?,
+            (Some(path), _, _) => zo0k::json::from_slice(&fs::read(path)?)?,
             (_, Some(row), _) => {
                 let selected = paper::table_row(row)?;
                 match variant {
@@ -145,7 +113,6 @@ impl Source {
                 }
             }
             (_, _, Some(num_variables)) => {
-                // The standard schedule, with query counts for the variant.
                 let mut parameters = Parameters::standard(num_variables, self.security, field)?;
                 if variant == Variant::Baseline {
                     optimize_queries(&mut parameters, variant, field)?;
@@ -157,33 +124,59 @@ impl Source {
         if self.optimize_queries {
             optimize_queries(&mut parameters, variant, field)?;
         }
+        assert!(self.num_variables.is_none_or(|num_variables| parameters.num_variables == num_variables));
+        assert!(self.num_variables.is_none() || parameters.security_bits == self.security);
         Ok(parameters)
     }
 }
 
 fn main() {
-    if let Err(error) = run(Cli::parse()) {
+    let arguments: Vec<std::ffi::OsString> = std::env::args_os().skip(1).collect();
+    let invocation = match args::parse(&arguments) {
+        Ok(invocation) => invocation,
+        Err(exit) => {
+            assert!(exit.code == 0 || exit.code == 2);
+            assert!(!exit.text.is_empty());
+            if exit.code == 0 {
+                print!("{}", exit.text);
+            } else {
+                eprint!("{}", exit.text);
+            }
+            std::process::exit(exit.code);
+        }
+    };
+    if let Err(error) = run(&invocation) {
         eprintln!("error: {error}");
         std::process::exit(1);
     }
 }
 
-fn run(cli: Cli) -> Result<()> {
-    if let Some(threads) = cli.threads {
-        rayon::ThreadPoolBuilder::new().num_threads(threads).build_global()?;
+fn run(invocation: &Invocation) -> Result<()> {
+    if let Some(threads) = invocation.threads {
+        if threads > zo0k::parallel::THREADS_MAX {
+            return Err(format!("--threads is at most {}", zo0k::parallel::THREADS_MAX).into());
+        }
+        zo0k::parallel::set_threads(threads);
     }
-    let field = cli.field.size();
-    match &cli.command {
-        Command::Bench(arguments) => with_types!(cli.field, cli.hash, bench::bench, arguments),
-        Command::Verify { directory } => bench::verify(directory),
-        Command::Analyze { source, baseline } => {
-            let variant = if *baseline { Variant::Baseline } else { Variant::ZeroKnowledge };
+    let field = invocation.field.size();
+    let matches = &invocation.matches;
+    assert!(invocation.threads.is_none_or(|threads| threads <= usize::MAX / 2));
+    assert!(field.bits == 128 || field.bits == 256);
+    match invocation.command {
+        Command::Bench => {
+            let arguments = bench::Bench::new(matches);
+            with_types!(invocation.field, invocation.hash, bench::bench, &arguments)
+        }
+        Command::Verify => bench::verify(matches.positional.as_ref().expect("a directory")),
+        Command::Analyze => {
+            let source = Source::new(matches);
+            let variant = if matches.flag("baseline") { Variant::Baseline } else { Variant::ZeroKnowledge };
             let parameters = source.parameters(variant, field)?;
             let analysis = Analysis::ignoring_target(&parameters, variant, field)?;
-            println!("{}", serde_json::to_string_pretty(&analysis)?);
+            println!("{}", analysis.to_json().to_string_pretty());
             Ok(analysis.soundness.check(parameters.security_bits)?)
         }
-        Command::Paper(arguments) => paper::paper(arguments),
-        Command::Search(arguments) => search::search(arguments, field),
+        Command::Paper => paper::paper(&paper::Paper::new(matches)),
+        Command::Search => search::search(&search::Search::new(matches), field),
     }
 }

@@ -62,9 +62,8 @@ fn main() -> Result<(), zo0k::Error> {
 }
 ```
 
-A crate that uses the library alone can depend on it with
-`default-features = false`, which leaves out the command-line tool and its
-dependencies.
+The command-line tool adds no dependencies to those of the library: it parses
+its arguments by hand and reads and writes JSON with the module `zo0k::json`.
 
 A table lists the values of a multilinear polynomial on `{0,1}^n` in
 lexicographic order, and `prove` returns the value of that polynomial at the

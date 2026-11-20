@@ -28,7 +28,6 @@
 use crate::error::{Error, Result};
 pub use crate::parameters::Round;
 use crate::parameters::{Layout, Parameters, Variant};
-use serde::Serialize;
 
 /// Relative margin by which bounds are rounded up.
 const MARGIN: f64 = 1.0 + 1e-12;
@@ -38,7 +37,7 @@ const MARGIN: f64 = 1.0 + 1e-12;
 const MASKING_DEGREE: f64 = 3.0;
 
 /// Decoding bounds of the Reed–Solomon code of one stage.
-#[derive(Clone, Debug, Serialize)]
+#[derive(Clone, Debug)]
 pub struct CodeBounds {
     /// Dimension of the code.
     pub dimension: usize,
@@ -84,7 +83,7 @@ impl CodeBounds {
 /// The soundness error of one round divided by `2^pow_bits`, split into the
 /// part that decreases with the field size and the part that decreases with
 /// the number of queries.
-#[derive(Clone, Debug, Serialize)]
+#[derive(Clone, Debug)]
 pub struct RoundError {
     /// Index of the stage of the round.
     pub stage: usize,
@@ -99,7 +98,7 @@ pub struct RoundError {
 }
 
 /// The soundness analysis of a layout.
-#[derive(Clone, Debug, Serialize)]
+#[derive(Clone, Debug)]
 pub struct Soundness {
     /// The bounds of the code of every stage.
     pub codes: Vec<CodeBounds>,
