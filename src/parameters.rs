@@ -7,7 +7,6 @@
 
 use crate::error::{Error, Result};
 use crate::reed_solomon::MAX_DOMAIN_SIZE;
-use serde::{Deserialize, Serialize};
 
 /// Number of mask coordinates of a row. A mask has `D·(d - 1)` coordinates
 /// for a module with `D` generators and masking degree `d`; here the module
@@ -36,8 +35,7 @@ pub const MAX_NUM_VARIABLES: usize = 40;
 const MAX_ORACLE_LEN: u128 = 1 << 48;
 
 /// The parameters of the protocol for tables of `2^num_variables` entries.
-#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct Parameters {
     /// Base-two logarithm of the length of the committed table.
     pub num_variables: usize,
@@ -53,14 +51,9 @@ pub struct Parameters {
     pub pow_bits: u32,
     /// Bits of proof of work before the combination challenge of the base
     /// case.
-    #[serde(default, skip_serializing_if = "is_zero")]
     pub base_case_pow_bits: u32,
     /// Distance of every proximity parameter from the Johnson bound.
     pub johnson_slack: f64,
-}
-
-fn is_zero(bits: &u32) -> bool {
-    *bits == 0
 }
 
 impl Parameters {
@@ -92,8 +85,7 @@ impl Parameters {
 }
 
 /// The choices that are specific to one stage.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct StageParameters {
     /// Folding parameter `k`: the oracle of the stage has `2^k` rows.
     pub folding: usize,
@@ -103,11 +95,9 @@ pub struct StageParameters {
     pub queries: usize,
     /// Bits of proof of work before every folding challenge of the sumcheck
     /// of the stage.
-    #[serde(default, skip_serializing_if = "is_zero")]
     pub sumcheck_pow_bits: u32,
     /// Bits of proof of work before the out-of-domain sample of the code
     /// switch out of the stage. Zero in the last stage, which has none.
-    #[serde(default, skip_serializing_if = "is_zero")]
     pub ood_pow_bits: u32,
 }
 
@@ -120,8 +110,7 @@ impl StageParameters {
 
 /// A verifier message of a stage. Each has a round-by-round soundness error,
 /// and each but the first can be preceded by a proof of work.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
-#[serde(rename_all = "snake_case")]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Round {
     /// The challenge that batches the mask with the claim in a sumcheck.
     SumcheckBatching,
@@ -138,8 +127,7 @@ pub enum Round {
 }
 
 /// Which protocol a layout describes.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Variant {
     /// The protocol of the paper, which this crate implements.
     ZeroKnowledge,
@@ -153,7 +141,7 @@ pub enum Variant {
 /// The shape of the oracle of one stage. A row is the codeword of the
 /// polynomial whose coefficients are, from the constant term upwards, a seed,
 /// a mask, a main block and an auxiliary block.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Stage {
     /// Folding parameter `k`.
     pub folding: usize,
@@ -203,7 +191,7 @@ impl Stage {
 }
 
 /// The shapes of all oracles of a protocol.
-#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Layout {
     /// The variant of the protocol.
     pub variant: Variant,
@@ -507,9 +495,9 @@ mod tests {
             johnson_slack: 0.1,
         };
         assert!(Layout::new(&huge, Variant::ZeroKnowledge).is_err());
-        let json = serde_json::to_string(&parameters()).unwrap();
-        assert_eq!(serde_json::from_str::<Parameters>(&json).unwrap(), parameters());
-        assert!(serde_json::from_str::<Parameters>(&json.replace("pow_bits", "pow")).is_err());
+        let json = crate::json::to_string(&parameters());
+        assert_eq!(crate::json::from_slice::<Parameters>(json.as_bytes()).unwrap(), parameters());
+        assert!(crate::json::from_slice::<Parameters>(json.replace("pow_bits", "pow").as_bytes()).is_err());
     }
 
     #[test]
@@ -517,7 +505,7 @@ mod tests {
         // Without further proofs of work the encoding has the three numbers
         // of every stage and nothing else.
         let plain = parameters();
-        let json = serde_json::to_string(&plain).unwrap();
+        let json = crate::json::to_string(&plain);
         assert!(!json.contains("sumcheck_pow_bits") && !json.contains("base_case_pow_bits"));
         let edits: [fn(&mut Parameters); 3] = [
             |p| p.stages[0].sumcheck_pow_bits = 20,
@@ -529,8 +517,8 @@ mod tests {
             let mut parameters = parameters();
             edit(&mut parameters);
             Layout::new(&parameters, Variant::ZeroKnowledge).unwrap();
-            let json = serde_json::to_string(&parameters).unwrap();
-            assert_eq!(serde_json::from_str::<Parameters>(&json).unwrap(), parameters);
+            let json = crate::json::to_string(&parameters);
+            assert_eq!(crate::json::from_slice::<Parameters>(json.as_bytes()).unwrap(), parameters);
             encodings.push(parameters.to_bytes());
         }
         encodings.sort();

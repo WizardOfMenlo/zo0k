@@ -12,10 +12,10 @@
 //! [`MainCoefficients`], so the code that updates a claim is shared.
 
 use crate::field::Field;
+use crate::parallel;
 use crate::parameters::MASK_LEN;
 use crate::polynomial::{eq_table, inner_product};
 use crate::witness::Row;
-use rayon::prelude::*;
 
 /// The claim `target = <main, f> + <aux, v>` on the main message `f` and the
 /// auxiliary message `v` of an interleaved oracle. `M` is the representation
@@ -82,7 +82,7 @@ pub trait MainCoefficients<F> {
 impl<F: Field> MainCoefficients<F> for Vec<F> {
     fn add_power_rows(&mut self, rows: &[PowerRow<F>]) {
         const BLOCK: usize = 1 << 10;
-        self.par_chunks_mut(BLOCK).enumerate().for_each(|(block, entries)| {
+        parallel::for_each_chunk_mut(self, BLOCK, BLOCK, |block, entries| {
             // Each row advances by one power per entry of the block.
             let first = (block * BLOCK) as u64;
             let mut powers: Vec<F> = rows.iter().map(|row| row.scale * row.base.pow(first)).collect();

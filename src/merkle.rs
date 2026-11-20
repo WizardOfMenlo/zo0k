@@ -15,7 +15,7 @@
 use crate::error::{Error, Result};
 use crate::field::Field;
 use crate::hash::{Digest, Domain, Hasher};
-use rayon::prelude::*;
+use crate::parallel;
 
 /// Below this many digests, a level is hashed on one thread.
 const PARALLEL_THRESHOLD: usize = 1 << 10;
@@ -65,7 +65,7 @@ impl MerkleTree {
             let level = if below.len() < PARALLEL_THRESHOLD {
                 below.chunks(2).map(node_digest::<H>).collect()
             } else {
-                below.par_chunks(2).with_min_len(1 << 8).map(node_digest::<H>).collect()
+                parallel::map_chunks(below, 2, 1 << 9, node_digest::<H>)
             };
             levels.push(level);
         }

@@ -9,7 +9,7 @@
 //! `w = 1`.
 
 use crate::field::Field;
-use rayon::prelude::*;
+use crate::parallel;
 
 /// Tables shorter than this are processed on one thread, and longer ones in
 /// pieces of at least [`MIN_PIECE`] entries: a piece should take tens of
@@ -28,7 +28,10 @@ pub fn inner_product<F: Field>(a: &[F], b: &[F]) -> F {
     if a.len() < PARALLEL_THRESHOLD {
         a.iter().zip(b).map(|(&x, &y)| x * y).sum()
     } else {
-        a.par_iter().zip(b).with_min_len(MIN_PIECE).map(|(&x, &y)| x * y).reduce(|| F::ZERO, |x, y| x + y)
+        let piece_product = |range: std::ops::Range<usize>| {
+            a[range.clone()].iter().zip(&b[range]).map(|(&x, &y)| x * y).fold(F::ZERO, |x, y| x + y)
+        };
+        parallel::map_pieces(a.len(), MIN_PIECE, piece_product).into_iter().fold(F::ZERO, |x, y| x + y)
     }
 }
 
@@ -50,7 +53,10 @@ pub fn fold<F: Field>(values: &mut Vec<F>, challenge: F) {
     if half < PARALLEL_THRESHOLD {
         low.iter_mut().zip(&*high).for_each(fold_pair);
     } else {
-        low.par_iter_mut().zip(&*high).with_min_len(MIN_PIECE).for_each(fold_pair);
+        let high = &*high;
+        parallel::for_each_piece_mut(low, MIN_PIECE, |start, piece| {
+            piece.iter_mut().zip(&high[start..]).for_each(fold_pair);
+        });
     }
     values.truncate(half);
 }
@@ -73,7 +79,9 @@ pub fn eq_table<F: Field>(point: &[F]) -> Vec<F> {
         if half < PARALLEL_THRESHOLD {
             low.iter_mut().zip(high).for_each(extend);
         } else {
-            low.par_iter_mut().zip(high).with_min_len(MIN_PIECE).for_each(extend);
+            parallel::for_each_pair_mut(low, high, MIN_PIECE, |low, high| {
+                low.iter_mut().zip(high).for_each(extend);
+            });
         }
     }
     table
@@ -123,7 +131,8 @@ pub fn round_coefficients<F: Field>(a: &[F], b: &[F]) -> (F, F) {
     if half < PARALLEL_THRESHOLD {
         (0..half).map(term).fold(zero, add)
     } else {
-        (0..half).into_par_iter().with_min_len(MIN_PIECE).map(term).reduce(|| zero, add)
+        let pieces = parallel::map_pieces(half, MIN_PIECE, |range| range.map(term).fold(zero, add));
+        pieces.into_iter().fold(zero, add)
     }
 }
 

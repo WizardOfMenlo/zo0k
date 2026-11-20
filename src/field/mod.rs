@@ -14,7 +14,6 @@ mod vector;
 pub use gf2_128::Gf2_128;
 pub use gf2_256::Gf2_256;
 
-use serde::Serialize;
 use std::fmt::Debug;
 use std::iter::Sum;
 use std::ops::{Add, AddAssign, Mul, MulAssign, Neg, Sub, SubAssign};
@@ -92,7 +91,7 @@ pub trait Field:
 
 /// The sizes of a field that determine the soundness error and the
 /// communication of the protocol over it.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct FieldSize {
     /// Base-two logarithm of the number of elements.
     pub bits: u32,

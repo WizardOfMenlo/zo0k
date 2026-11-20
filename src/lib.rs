@@ -50,15 +50,21 @@
 compile_error!("zo0k supports 64-bit targets only");
 
 pub mod base_case;
+pub mod blake3;
 pub mod claim;
 pub mod code_switch;
 pub mod costs;
+mod entropy;
 pub mod error;
 pub mod field;
 pub mod hash;
+#[allow(missing_docs)]
+pub mod json;
+pub mod keccak;
 pub mod mask;
 pub mod merkle;
 pub mod oracle;
+pub mod parallel;
 pub mod parameters;
 pub mod polynomial;
 pub mod reed_solomon;

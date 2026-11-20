@@ -18,7 +18,7 @@
 use crate::error::{Error, Result};
 use crate::field::Field;
 use crate::hash::{DIGEST_BYTES, Digest, Domain, Hasher};
-use rayon::prelude::*;
+use crate::parallel;
 use std::marker::PhantomData;
 
 /// Number of bytes of a proof-of-work nonce.
@@ -158,10 +158,9 @@ fn search_nonce<H: Hasher>(seed: &Digest, bits: u32) -> u64 {
     (0..)
         .map(|window| window * WINDOW)
         .find_map(|start| {
-            (start..start + WINDOW)
-                .into_par_iter()
-                .with_min_len(1 << 10)
-                .find_first(|&nonce| proof_of_work_bits::<H>(seed, nonce as u64) >= bits)
+            parallel::find_first(start..start + WINDOW, 1 << 10, |nonce| {
+                proof_of_work_bits::<H>(seed, nonce as u64) >= bits
+            })
         })
         .expect("some nonce meets the difficulty") as u64
 }

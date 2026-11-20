@@ -4,8 +4,6 @@
 //! for the Fiat–Shamir transformation and for the proof of work. This crate
 //! provides [`Blake3`] and [`Keccak256`].
 
-use sha3::Digest as _;
-
 /// The output of a hash function.
 pub type Digest = [u8; DIGEST_BYTES];
 
@@ -73,13 +71,13 @@ pub trait Hasher: Clone + Send + Sync + 'static {
 
 /// BLAKE3, keyed by the domain.
 #[derive(Clone)]
-pub struct Blake3(blake3::Hasher);
+pub struct Blake3(crate::blake3::Hasher);
 
 impl Hasher for Blake3 {
     const NAME: &'static str = "blake3";
 
     fn new(domain: Domain) -> Self {
-        Self(blake3::Hasher::new_keyed(&domain.key()))
+        Self(crate::blake3::Hasher::new_keyed(&domain.key()))
     }
 
     fn update(&mut self, bytes: &[u8]) {
@@ -87,24 +85,24 @@ impl Hasher for Blake3 {
     }
 
     fn finalize(self) -> Digest {
-        *self.0.finalize().as_bytes()
+        self.0.finalize()
     }
 
     fn hash(domain: Domain, bytes: &[u8]) -> Digest {
-        *blake3::keyed_hash(&domain.key(), bytes).as_bytes()
+        crate::blake3::keyed_hash(&domain.key(), bytes)
     }
 }
 
 /// Keccak-256 as used by Ethereum, with the key of the domain as a prefix.
 #[derive(Clone)]
-pub struct Keccak256(sha3::Keccak256);
+pub struct Keccak256(crate::keccak::Keccak256);
 
 impl Hasher for Keccak256 {
     const NAME: &'static str = "keccak256";
 
     fn new(domain: Domain) -> Self {
-        let mut hasher = sha3::Keccak256::new();
-        hasher.update(domain.key());
+        let mut hasher = crate::keccak::Keccak256::new();
+        hasher.update(&domain.key());
         Self(hasher)
     }
 
@@ -113,7 +111,7 @@ impl Hasher for Keccak256 {
     }
 
     fn finalize(self) -> Digest {
-        self.0.finalize().into()
+        self.0.finalize()
     }
 }
 
@@ -154,14 +152,21 @@ mod tests {
 
     #[test]
     fn keccak_is_the_ethereum_hash_of_the_prefixed_input() {
-        // Keccak-256 of the empty string, a well-known constant.
-        let empty: [u8; 32] = sha3::Keccak256::new().finalize().into();
+        let empty = crate::keccak::keccak256(b"");
         assert_eq!(empty[..4], [0xc5, 0xd2, 0x46, 0x01]);
-        let mut plain = sha3::Keccak256::new();
-        plain.update(Domain::MerkleNode.key());
+        assert_eq!(empty[28..], [0x5d, 0x85, 0xa4, 0x70]);
+        let mut plain = crate::keccak::Keccak256::new();
+        plain.update(&Domain::MerkleNode.key());
         plain.update(b"xyz");
-        let expected: [u8; 32] = plain.finalize().into();
-        assert_eq!(Keccak256::hash(Domain::MerkleNode, b"xyz"), expected);
+        assert_eq!(Keccak256::hash(Domain::MerkleNode, b"xyz"), plain.finalize());
+    }
+
+    #[test]
+    fn blake3_is_keyed_by_the_domain() {
+        let empty = crate::blake3::hash(b"");
+        assert_eq!(empty[..4], [0xaf, 0x13, 0x49, 0xb9]);
+        let expected = crate::blake3::keyed_hash(&Domain::Transcript.key(), b"xyz");
+        assert_eq!(Blake3::hash(Domain::Transcript, b"xyz"), expected);
     }
 
     #[test]

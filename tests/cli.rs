@@ -20,7 +20,7 @@ fn a_saved_proof_verifies_and_an_altered_one_does_not() {
     let out = directory.to_str().unwrap();
     let bench = zo0k(&["bench", "--num-variables", "8", "--security", "30", "--repeats", "2", "--out", out]);
     assert!(bench.status.success(), "{}", String::from_utf8_lossy(&bench.stderr));
-    let report: serde_json::Value = serde_json::from_slice(&bench.stdout).unwrap();
+    let report: zo0k::json::Value = zo0k::json::parse(&bench.stdout).unwrap();
     assert!(report["soundness_bits"].as_f64().unwrap() >= 30.0);
     assert!(report["argument_bytes"].as_f64().unwrap() > 0.0);
     let verify = zo0k(&["verify", out]);
@@ -77,7 +77,7 @@ fn a_searched_schedule_is_admissible_and_within_its_budget() {
         arguments.extend(variant);
         let analyze = zo0k(&arguments);
         assert!(analyze.status.success(), "{}", String::from_utf8_lossy(&analyze.stderr));
-        let analysis: serde_json::Value = serde_json::from_slice(&analyze.stdout).unwrap();
+        let analysis: zo0k::json::Value = zo0k::json::parse(&analyze.stdout).unwrap();
         assert_eq!(analysis["layout"]["stages"].as_array().unwrap().len(), stages.parse::<usize>().unwrap());
         assert!(analysis["soundness"]["total_bits"].as_f64().unwrap() >= 40.0);
         // Five times a table of 2^12 elements of 32 bytes.
@@ -90,7 +90,7 @@ fn a_searched_schedule_is_admissible_and_within_its_budget() {
 fn rows_of_the_paper_are_available_by_name() {
     let analyze = zo0k(&["analyze", "--paper", "polylog-26"]);
     assert!(analyze.status.success());
-    let analysis: serde_json::Value = serde_json::from_slice(&analyze.stdout).unwrap();
+    let analysis: zo0k::json::Value = zo0k::json::parse(&analyze.stdout).unwrap();
     assert_eq!(analysis["costs"]["iop_bytes"].as_u64().unwrap(), 10_737_129_704);
     assert!(!zo0k(&["analyze", "--paper", "polylog-27"]).status.success());
     assert!(!zo0k(&["analyze"]).status.success());
@@ -120,7 +120,7 @@ fn a_search_over_the_smaller_field_uses_proofs_of_work() {
     assert!(found.status.success(), "{}", String::from_utf8_lossy(&found.stderr));
     let file = directory.join("parameters.json");
     fs::write(&file, &found.stdout).unwrap();
-    let parameters: serde_json::Value = serde_json::from_slice(&found.stdout).unwrap();
+    let parameters: zo0k::json::Value = zo0k::json::parse(&found.stdout).unwrap();
     assert!(parameters["johnson_slack"].as_f64().unwrap() > 0.0002);
     let bits = parameters["stages"][0]["sumcheck_pow_bits"].as_u64().unwrap();
     assert!((1..=16).contains(&bits));
@@ -128,7 +128,7 @@ fn a_search_over_the_smaller_field_uses_proofs_of_work() {
     let file = file.to_str().unwrap();
     let analyze = zo0k(&[&["analyze", "--params", file][..], &field].concat());
     assert!(analyze.status.success(), "{}", String::from_utf8_lossy(&analyze.stderr));
-    let analysis: serde_json::Value = serde_json::from_slice(&analyze.stdout).unwrap();
+    let analysis: zo0k::json::Value = zo0k::json::parse(&analyze.stdout).unwrap();
     assert!(analysis["soundness"]["total_bits"].as_f64().unwrap() >= 100.0);
     let bench = zo0k(&[&["bench", "--params", file, "--repeats", "1"][..], &field].concat());
     assert!(bench.status.success(), "{}", String::from_utf8_lossy(&bench.stderr));
@@ -145,7 +145,7 @@ fn a_smaller_field_misses_the_target_of_a_row_of_the_paper() {
     let analyze = zo0k(&["analyze", "--paper", "polylog-20", "--field", "gf2_128"]);
     assert!(!analyze.status.success());
     assert!(String::from_utf8_lossy(&analyze.stderr).contains("above the target 2^-100"));
-    let analysis: serde_json::Value = serde_json::from_slice(&analyze.stdout).unwrap();
+    let analysis: zo0k::json::Value = zo0k::json::parse(&analyze.stdout).unwrap();
     let bits = analysis["soundness"]["total_bits"].as_f64().unwrap();
     assert!((47.0..48.0).contains(&bits));
     // A proof needs parameters that meet their target.
