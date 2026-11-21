@@ -1,15 +1,7 @@
-//! Commit to a random table, prove an evaluation of its multilinear
-//! polynomial, and verify the proof.
-//!
-//! ```sh
-//! cargo run --release --example evaluation
-//! ```
-
 use std::time::Instant;
 use zo0k::{Blake3, Field, Gf2_128, Parameters, Protocol, Rng};
 
 fn main() -> Result<(), zo0k::Error> {
-    // Tables of 2^18 entries over GF(2^128), with 100 bits of security.
     type F = Gf2_128;
     let num_variables = 18;
     let parameters = Parameters::standard(num_variables, 100, F::SIZE)?;

@@ -1,5 +1,3 @@
-#![allow(missing_docs)]
-
 use std::any::Any;
 use std::mem::MaybeUninit;
 use std::ops::Range;

@@ -1,5 +1,3 @@
-//! Benchmarks of real proofs, and verification of saved ones.
-
 use crate::args::Matches;
 use crate::{FieldChoice, HashChoice, Result, Source, with_types};
 use std::fs;
@@ -32,14 +30,10 @@ const FIXTURE_SEED: [u8; 32] = [
     178, 135, 143, 164, 242, 170, 236, 79,
 ];
 
-/// A public statement, as saved next to a proof.
 struct Statement {
-    /// The names of the field and of the hash function.
     field: String,
     hash: String,
     parameters: Parameters,
-    /// Hexadecimal encodings of the commitment, the coordinates of the
-    /// evaluation point, and the claimed value.
     commitment: String,
     point: Vec<String>,
     value: String,
@@ -115,8 +109,6 @@ pub fn bench<F: RsField, H: Hasher>(arguments: &Bench) -> Result<()> {
         return Err(format!("{} exists already", directory.display()).into());
     }
 
-    // A fixed table and point make runs comparable. The prover's randomness
-    // is fresh.
     let mut fixture = Rng::from_seed(FIXTURE_SEED);
     let table: Vec<F> = fixture.fields(1 << parameters.num_variables);
     let point: Vec<F> = fixture.fields(parameters.num_variables);
@@ -135,7 +127,6 @@ pub fn bench<F: RsField, H: Hasher>(arguments: &Bench) -> Result<()> {
         let start = Instant::now();
         protocol.verify(&commitment, &point, value, &proof)?;
         verify_times.push(start.elapsed().as_secs_f64());
-        // The argument consists of the commitment and the proof.
         sizes.push((proof.0.len() + commitment.0.len()) as f64);
         last = Some((commitment, value, proof));
     }
@@ -192,7 +183,6 @@ fn verify_statement<F: RsField, H: Hasher>(statement: &Statement, proof: &Proof)
     let commitment = Commitment(from_hex(&statement.commitment, 32)?.try_into().unwrap());
     let protocol = Protocol::<F, H>::new(statement.parameters.clone())?;
     protocol.verify(&commitment, &point, value, proof)?;
-    // The parameters come from the statement, so say what they guarantee.
     let soundness = Analysis::new(&statement.parameters, Variant::ZeroKnowledge, F::SIZE)?.soundness;
     println!(
         "The proof is valid. The parameters of the statement have a soundness error of 2^-{:.1} over {} with {}.",

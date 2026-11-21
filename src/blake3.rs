@@ -1,5 +1,3 @@
-#![allow(missing_docs)]
-
 pub const KEY_LEN: usize = 32;
 pub const OUT_LEN: usize = 32;
 pub const BLOCK_LEN: usize = 64;

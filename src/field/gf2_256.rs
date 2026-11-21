@@ -1,17 +1,11 @@
-//! The binary field `GF(2^256)`.
-
 use super::{BinaryField, Field, binary_inverse, impl_binary_field_operators, vector};
 use std::fmt;
 use std::ops::{Add, Mul};
 
-/// An element of `K[u] / (u^2 + u + x^121)` over `K`, the field of
-/// [`super::Gf2_128`]. The element `a + b·u` is stored as the limbs of `a`
-/// and `b`.
 #[derive(Clone, Copy, Default, PartialEq, Eq, Hash)]
 pub struct Gf2_256(u128, u128);
 
 impl Gf2_256 {
-    /// The element `a + b·u`.
     pub const fn new(a: u128, b: u128) -> Self {
         Self(a, b)
     }
@@ -51,7 +45,6 @@ impl Field for Gf2_256 {
 
     #[inline(always)]
     fn square(self) -> Self {
-        // (a + b·u)^2 = a^2 + b^2·(u + x^121).
         use vector::{load, store, xor};
         let (a, b) = (vector::square(self.0), vector::square(self.1));
         Self(store(xor(load(a), vector::mul_x121(load(b)))), b)
@@ -63,7 +56,6 @@ impl BinaryField for Gf2_256 {
         Self(limb, 0)
     }
 
-    /// Two thirds of the cost of a general product.
     #[inline(always)]
     fn mul_base(self, w: u128) -> Self {
         Self(vector::mul(self.0, w), vector::mul(self.1, w))
@@ -89,7 +81,6 @@ impl Mul for Gf2_256 {
     type Output = Self;
     #[inline(always)]
     fn mul(self, rhs: Self) -> Self {
-        // (a + b·u)(c + d·u) = (ac + bd·x^121) + (ac + (a + b)(c + d))·u.
         use vector::{load, mul_wide, mul_x121, reduce, store, xor};
         let (a, b, c, d) = (load(self.0), load(self.1), load(rhs.0), load(rhs.1));
         let ac = mul_wide(a, c);
@@ -103,39 +94,3 @@ impl Mul for Gf2_256 {
 }
 
 impl_binary_field_operators!(Gf2_256);
-
-#[cfg(test)]
-mod tests {
-    use super::super::gf2_128::tests::mul_reference as m;
-    use super::*;
-    use crate::rng::Rng;
-
-    /// Schoolbook product on top of the reference product in `K`.
-    fn mul_reference(p: Gf2_256, q: Gf2_256) -> Gf2_256 {
-        let bd = m(p.1, q.1);
-        Gf2_256(m(p.0, q.0) ^ m(bd, 1 << 121), m(p.0, q.1) ^ m(p.1, q.0) ^ bd)
-    }
-
-    #[test]
-    fn products_match_the_reference() {
-        let mut rng = Rng::from_seed([2; 32]);
-        for _ in 0..500 {
-            let (p, q): (Gf2_256, Gf2_256) = (rng.field(), rng.field());
-            assert_eq!(p * q, mul_reference(p, q));
-            assert_eq!(p.square(), mul_reference(p, p));
-            assert_eq!(p.mul_base(q.0), mul_reference(p, Gf2_256(q.0, 0)));
-        }
-    }
-
-    #[test]
-    fn the_extension_modulus_is_irreducible() {
-        // u^2 + u + c is irreducible over K exactly when c has trace one.
-        let mut conjugate = 1u128 << 121;
-        let mut trace = conjugate;
-        for _ in 1..128 {
-            conjugate = m(conjugate, conjugate);
-            trace ^= conjugate;
-        }
-        assert_eq!(trace, 1);
-    }
-}

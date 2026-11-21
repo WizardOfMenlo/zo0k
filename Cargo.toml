@@ -20,10 +20,10 @@ path = "src/bin/zo0k/main.rs"
 name = "sim"
 path = "src/bin/sim/main.rs"
 
+[[bin]]
+name = "lint"
+path = "src/bin/lint/main.rs"
+
 [profile.release]
 codegen-units = 1
 lto = "thin"
-
-# The tests compute proofs, which is slow without optimization.
-[profile.test]
-opt-level = 2
