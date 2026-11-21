@@ -16,8 +16,6 @@ import sys
 from reportlab.lib.colors import HexColor
 from reportlab.pdfgen import canvas
 
-# Protocol, panel title, unit of the proof length and its size in bytes,
-# and the horizontal grid lines.
 PANELS = [
     ("sublinear", "Sublinear", "MiB", 2**20, [64, 128, 512, 2048, 8192]),
     ("polylog", "Polylogarithmic verifier", "GiB", 2**30, [4, 8, 16]),
@@ -27,7 +25,6 @@ GRID, AXIS, TEXT = "#e1e3e5", "#55585b", "#202329"
 
 
 def main(source, target):
-    # points[protocol][variant] = [(argument KiB, IOP bytes, selected)], by proof length.
     points = {}
     with open(source, newline="") as stream:
         for row in csv.DictReader(stream):
@@ -52,7 +49,7 @@ def main(source, target):
         page.drawCentredString((left + right) / 2, 214, title)
         page.setLineWidth(0.35)
         page.setFont("Helvetica", 8)
-        label_end = float("-inf")  # a tick label that would touch its neighbour is omitted
+        label_end = float("-inf")
         for x in [200, 500, 1000, 2000, 5000, 10000, 20000]:
             if xmin <= x <= xmax:
                 px, _ = position(x, ymin)
@@ -91,7 +88,6 @@ def main(source, target):
                     page.rect(x - 1.6, y - 1.6, 3.2, 3.2, stroke=0, fill=1)
                 else:
                     page.circle(x, y, 1.7, stroke=0, fill=1)
-            # Legend.
             ly, lx = top - 12 - 13 * row, right - 65
             page.setDash(dash)
             page.line(lx, ly, lx + 18, ly)

@@ -1,31 +1,13 @@
-//! Merkle trees with batched openings.
-//!
-//! A tree commits to `n` leaf digests. Every node has two children, except
-//! that the last node of a level has one when the level below has an odd
-//! number of nodes. An opening of a set of leaves consists of the
-//! digests that are needed to recompute the root and cannot be computed from
-//! the opened leaves themselves: level by level from the leaves upwards, and
-//! within a level by increasing position, every sibling of a computable node
-//! that is not itself computable.
-//!
-//! Leaves are not salted. A leaf digest binds the position of the leaf, and
-//! hides its content if the content is unpredictable (see the paper's
-//! appendix "Hiding Merkle commitments without salts").
-
 use crate::error::{Error, Result};
 use crate::field::Field;
 use crate::hash::{Digest, Domain, Hasher};
 use crate::parallel;
 
-/// Below this many digests, a level is hashed on one thread.
 const PARALLEL_THRESHOLD: usize = 1 << 10;
 
-/// The digest of the leaf at `position` whose content is a column of field
-/// elements.
 pub fn leaf_digest<H: Hasher, F: Field>(position: usize, column: impl IntoIterator<Item = F>) -> Digest {
     let mut hasher = H::new(Domain::MerkleLeaf);
     hasher.update(&(position as u64).to_le_bytes());
-    // Hash about one kibibyte at a time.
     let mut buffer = [0u8; 1024];
     let capacity = buffer.len() / F::BYTES * F::BYTES;
     let mut filled = 0;
@@ -41,22 +23,15 @@ pub fn leaf_digest<H: Hasher, F: Field>(position: usize, column: impl IntoIterat
     hasher.finalize()
 }
 
-/// The digest of a node with one or two children.
 fn node_digest<H: Hasher>(children: &[Digest]) -> Digest {
     H::hash(Domain::MerkleNode, children.as_flattened())
 }
 
-/// A Merkle tree, kept by the prover to answer openings.
 pub struct MerkleTree {
-    /// `levels[0]` are the leaf digests and the last level is the root.
     levels: Vec<Vec<Digest>>,
 }
 
 impl MerkleTree {
-    /// The tree over the given leaf digests.
-    ///
-    /// # Panics
-    /// Panics if there are no leaves.
     pub fn new<H: Hasher>(leaves: Vec<Digest>) -> Self {
         assert!(!leaves.is_empty());
         let mut levels = vec![leaves];
@@ -72,12 +47,10 @@ impl MerkleTree {
         Self { levels }
     }
 
-    /// The digest at the root.
     pub fn root(&self) -> Digest {
         self.levels.last().unwrap()[0]
     }
 
-    /// The opening of the leaves at `positions`, which must be increasing.
     pub fn open(&self, positions: &[usize]) -> Vec<Digest> {
         let mut opening = Vec::new();
         let mut known = positions.to_vec();
@@ -92,11 +65,6 @@ impl MerkleTree {
     }
 }
 
-/// The root of the tree with `num_leaves` leaves that is consistent with the
-/// given leaves and with an opening, whose digests are requested one at a
-/// time from `next_digest`.
-///
-/// The leaves are pairs of a position and a digest, by increasing position.
 pub fn root_from_opening<H: Hasher>(
     num_leaves: usize,
     leaves: &[(usize, Digest)],
@@ -124,7 +92,6 @@ pub fn root_from_opening<H: Hasher>(
                 Ok(digest) => children.push(digest),
                 Err(error) => failure = Some(error),
             }
-            // The last child of a node is odd, or the last node of the level.
             if child % 2 == 1 || child + 1 == width {
                 above.push(node_digest::<H>(&children));
                 children.clear();
@@ -139,9 +106,6 @@ pub fn root_from_opening<H: Hasher>(
     Ok(digests[0])
 }
 
-/// The parents of the `known` nodes of a level of `width` nodes, in
-/// increasing order. Every child of each of these parents is reported to
-/// `visit`, in increasing order, together with whether it is known.
 fn parents(known: &[usize], width: usize, mut visit: impl FnMut(usize, bool)) -> Vec<usize> {
     let mut parents: Vec<usize> = known.iter().map(|node| node / 2).collect();
     parents.dedup();

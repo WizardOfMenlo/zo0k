@@ -1,6 +1,3 @@
-//! What the prover knows about an oracle: the messages and the randomness of
-//! its rows.
-
 use crate::field::Field;
 use crate::hash::Hasher;
 use crate::mask::Mask;
@@ -10,24 +7,15 @@ use crate::parameters::{MASK_LEN, Stage};
 use crate::reed_solomon::RsField;
 use crate::rng::Rng;
 
-/// The message and the randomness of a single codeword: a main block, an
-/// auxiliary block, a mask and a seed. This is a witness of the relation on a
-/// folded oracle, and the form of the mask and of the disclosed row of the
-/// base case.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Row<F> {
-    /// The main block.
     pub main: Vec<F>,
-    /// The auxiliary block.
     pub aux: Vec<F>,
-    /// The mask.
     pub mask: [F; MASK_LEN],
-    /// The seed.
     pub seed: Vec<F>,
 }
 
 impl<F: Field> Row<F> {
-    /// A row of the shape of the given stage with uniform entries.
     pub fn sample(stage: &Stage, rng: &mut Rng) -> Self {
         Self {
             main: rng.fields(stage.main_len),
@@ -37,7 +25,6 @@ impl<F: Field> Row<F> {
         }
     }
 
-    /// The row `self + other·scale`.
     pub fn add_scaled(&self, other: &Self, scale: F) -> Self {
         let combine =
             |a: &[F], b: &[F]| -> Vec<F> { a.iter().zip(b).map(|(&x, &y)| x + y * scale).collect() };
@@ -49,24 +36,14 @@ impl<F: Field> Row<F> {
         }
     }
 
-    /// The coefficients of the polynomial that the row encodes, from the
-    /// constant term upwards: the seed, the mask, the main block and the
-    /// auxiliary block.
     pub fn polynomial(&self) -> Vec<F> {
         [&self.seed[..], &self.mask, &self.main, &self.aux].concat()
     }
 
-    /// The entries in the order in which the base case sends them: the main
-    /// block, the auxiliary block, the mask and the seed.
     pub fn to_fields(&self) -> Vec<F> {
         [&self.main[..], &self.aux, &self.mask, &self.seed].concat()
     }
 
-    /// The inverse of [`Row::to_fields`] for a row of the given stage.
-    ///
-    /// # Panics
-    /// Panics unless there are as many fields as the code of the stage has
-    /// dimensions.
     pub fn from_fields(stage: &Stage, fields: &[F]) -> Self {
         assert_eq!(fields.len(), stage.dimension());
         let (main, rest) = fields.split_at(stage.main_len);
@@ -76,24 +53,15 @@ impl<F: Field> Row<F> {
     }
 }
 
-/// The messages and the randomness of the `2^k` rows of an interleaved
-/// oracle. The three tables are stored row by row, as in
-/// [`crate::polynomial`].
 #[derive(Clone, Debug)]
 pub struct Message<F> {
-    /// The main message, of `2^k·ℓ` entries.
     pub main: Vec<F>,
-    /// The auxiliary message, of `2^k·a` entries.
     pub aux: Vec<F>,
-    /// The mask, which determines the masks of all rows.
     pub mask: Mask<F>,
-    /// The seeds of the rows, `2^k·r` entries in total.
     pub seeds: Vec<F>,
 }
 
 impl<F: RsField> Message<F> {
-    /// A message with the given main and auxiliary parts and with fresh
-    /// uniform randomness.
     pub fn new(stage: &Stage, main: Vec<F>, aux: Vec<F>, rng: &mut Rng) -> Self {
         assert_eq!(main.len(), stage.rows() * stage.main_len);
         assert_eq!(aux.len(), stage.rows() * stage.aux_len);
@@ -105,8 +73,6 @@ impl<F: RsField> Message<F> {
         }
     }
 
-    /// The codewords of the rows, followed by the codeword of `extra_row` if
-    /// there is one.
     pub fn encode(&self, stage: &Stage, extra_row: Option<&Row<F>>) -> Vec<Vec<F>> {
         let rows = stage.rows();
         let masks = self.mask.rows();
@@ -130,18 +96,13 @@ impl<F: RsField> Message<F> {
     }
 }
 
-/// What the prover knows about a committed oracle: its message and
-/// randomness, and its codewords.
 pub struct Witness<F> {
     pub(crate) message: Message<F>,
     pub(crate) oracle: Oracle<F>,
-    /// The mask of the base case: a uniform row whose codeword is committed
-    /// together with the oracle of the last stage.
     pub(crate) base_case_mask: Option<Row<F>>,
 }
 
 impl<F: RsField> Witness<F> {
-    /// Whether this is a witness for an oracle of the given stage.
     pub(crate) fn fits(&self, stage: &Stage, is_last: bool) -> bool {
         let rows = stage.rows();
         self.message.mask.folding() == stage.folding
@@ -152,7 +113,6 @@ impl<F: RsField> Witness<F> {
             && self.oracle.shape() == (rows + usize::from(is_last), stage.domain_size)
     }
 
-    /// Encode and commit to the oracle of a stage with the given message.
     pub(crate) fn commit<H: Hasher>(
         stage: &Stage,
         message: Message<F>,

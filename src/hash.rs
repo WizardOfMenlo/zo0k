@@ -1,33 +1,17 @@
-//! Hash functions.
-//!
-//! The protocol is generic over a [`Hasher`], which it uses for Merkle trees,
-//! for the Fiat–Shamir transformation and for the proof of work. This crate
-//! provides [`Blake3`] and [`Keccak256`].
-
-/// The output of a hash function.
 pub type Digest = [u8; DIGEST_BYTES];
 
-/// Number of bytes of a digest.
 pub const DIGEST_BYTES: usize = 32;
 
-/// What a hash is used for. A [`Hasher`] is an independent function in every
-/// domain, so that hashes made for different purposes cannot be confused.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Domain {
-    /// A leaf of a Merkle tree: a position and a column of an oracle.
     MerkleLeaf,
-    /// An inner node of a Merkle tree: its children.
     MerkleNode,
-    /// The messages of a transcript.
     Transcript,
-    /// The verifier's challenges, derived from a transcript.
     Challenge,
-    /// A proof-of-work nonce.
     ProofOfWork,
 }
 
 impl Domain {
-    /// A key for the domain: a label, padded to 32 bytes.
     const fn key(self) -> [u8; 32] {
         let label = match self {
             Self::MerkleLeaf => "zo0k/merkle-leaf",
@@ -47,21 +31,15 @@ impl Domain {
     }
 }
 
-/// A hash function with 32-byte digests, modelled as a random oracle.
 pub trait Hasher: Clone + Send + Sync + 'static {
-    /// A name of the hash function, which transcripts bind.
     const NAME: &'static str;
 
-    /// A hasher for the given domain.
     fn new(domain: Domain) -> Self;
 
-    /// Absorb bytes. Only the concatenation of all absorbed bytes matters.
     fn update(&mut self, bytes: &[u8]);
 
-    /// The digest of the absorbed bytes.
     fn finalize(self) -> Digest;
 
-    /// The digest of `bytes` in the given domain.
     fn hash(domain: Domain, bytes: &[u8]) -> Digest {
         let mut hasher = Self::new(domain);
         hasher.update(bytes);
@@ -69,7 +47,6 @@ pub trait Hasher: Clone + Send + Sync + 'static {
     }
 }
 
-/// BLAKE3, keyed by the domain.
 #[derive(Clone)]
 pub struct Blake3(crate::blake3::Hasher);
 
@@ -93,7 +70,6 @@ impl Hasher for Blake3 {
     }
 }
 
-/// Keccak-256 as used by Ethereum, with the key of the domain as a prefix.
 #[derive(Clone)]
 pub struct Keccak256(crate::keccak::Keccak256);
 

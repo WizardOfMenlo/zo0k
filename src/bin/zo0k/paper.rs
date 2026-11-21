@@ -1,16 +1,3 @@
-//! The tables and the frontier data of the paper's section "Practical
-//! evaluation", recomputed from the configurations that its parameter search
-//! selected.
-//!
-//! Every row of a table compares, for tables of `2^n` field elements and an
-//! IOP proof length of at most five times the input:
-//!
-//! * the selected zero-knowledge configuration;
-//! * for the argument size, the selected configuration of the protocol
-//!   without zero knowledge (the best one found under the same budget);
-//! * for the IOP proof length, the protocol without zero knowledge on the
-//!   schedule of the zero-knowledge configuration.
-
 use crate::Result;
 use crate::args::Matches;
 use std::collections::BTreeMap;
@@ -22,7 +9,6 @@ use zo0k::json::{self, FromJson, Shape, Unknown, Value, required};
 use zo0k::tuning::Analysis;
 use zo0k::{Field, FieldSize, Gf2_256, Layout, Parameters, Variant};
 
-/// The field of the paper's evaluation.
 const FIELD: FieldSize = Gf2_256::SIZE;
 
 pub struct Paper {
@@ -42,10 +28,8 @@ impl Paper {
     }
 }
 
-/// The configurations of the rows of the tables.
 const TABLES: &str = include_str!("../../../paper/tables.json");
 
-/// The selected configurations of the row `name`, such as `polylog-20`.
 pub fn table_row(name: &str) -> Result<Pair<Parameters>> {
     let rows: Vec<Row> = json::from_slice(TABLES.as_bytes())?;
     let names: Vec<String> =
@@ -57,9 +41,7 @@ pub fn table_row(name: &str) -> Result<Pair<Parameters>> {
     Ok(rows.into_iter().nth(index).unwrap().selected)
 }
 
-/// One row of a table.
 struct Row {
-    /// `sublinear` (one stage) or `polylog` (several stages).
     protocol: String,
     num_variables: usize,
     selected: Pair<Parameters>,
@@ -81,7 +63,6 @@ impl FromJson for Row {
     }
 }
 
-/// A value for each variant of the protocol.
 pub struct Pair<T> {
     pub zero_knowledge: T,
     pub baseline: T,
@@ -99,12 +80,10 @@ impl<T: FromJson> FromJson for Pair<T> {
     }
 }
 
-/// The sizes that a row of a table reports, in bytes.
 struct Sizes {
     num_variables: usize,
     zero_knowledge: Costs,
     baseline: Costs,
-    /// IOP proof length of the baseline on the zero-knowledge schedule.
     baseline_iop_same_schedule: usize,
 }
 
@@ -113,7 +92,6 @@ impl Sizes {
         let zero_knowledge =
             Analysis::new(&row.selected.zero_knowledge, Variant::ZeroKnowledge, FIELD)?.costs;
         let baseline = Analysis::new(&row.selected.baseline, Variant::Baseline, FIELD)?.costs;
-        // The proof length of the baseline does not depend on query counts.
         let same_schedule = Layout::new(&row.selected.zero_knowledge, Variant::Baseline)?;
         let baseline_iop_same_schedule =
             Costs::new(&same_schedule, &row.selected.zero_knowledge, FIELD.bytes).iop_bytes;
@@ -142,7 +120,6 @@ const CAPTION: &str = "under a $5\\times$ input IOP budget. Argument overhead is
 non-ZK configuration under the same budget; the non-ZK IOP proof length and the IOP overhead are for the \
 non-ZK protocol on the same schedule.";
 
-/// The two tables, as one LaTeX float.
 fn tables(rows: &[(String, Sizes)]) -> String {
     const SETUP: &str =
         "\\centering\n\\small\n\\setlength{\\tabcolsep}{7pt}\n\\renewcommand{\\arraystretch}{1.05}\n";
@@ -181,9 +158,6 @@ fn tables(rows: &[(String, Sizes)]) -> String {
     tex + "\\end{table}\n"
 }
 
-/// The configurations that no other one beats in both proof length and
-/// argument size, by increasing proof length. `selected` marks the
-/// configuration of the table.
 fn frontier(points: &mut Vec<(usize, f64, bool)>) {
     points.sort_by(|a, b| a.0.cmp(&b.0).then(a.1.total_cmp(&b.1)));
     let mut smallest = f64::INFINITY;
@@ -197,8 +171,6 @@ fn frontier(points: &mut Vec<(usize, f64, bool)>) {
 pub fn paper(arguments: &Paper) -> Result<()> {
     let read = |file: &str| fs::read(arguments.configurations.join(file));
     let table_rows: Vec<Row> = json::from_slice(&read("tables.json")?)?;
-    // For each protocol, configurations for its largest table size, from
-    // which the frontier of proof length against argument size is drawn.
     let frontiers: BTreeMap<String, Pair<Vec<Parameters>>> = json::from_slice(&read("frontiers.json")?)?;
     let rows = table_rows
         .iter()
@@ -208,7 +180,6 @@ pub fn paper(arguments: &Paper) -> Result<()> {
     let mut csv = String::from("protocol,variant,iop_bytes,expected_argument_bytes,selected\n");
     for (protocol, ..) in PROTOCOLS {
         let candidates = frontiers.get(protocol).ok_or("a frontier is missing")?;
-        // The frontier is for the largest table size, and includes its row.
         let (_, selected) =
             rows.iter().rfind(|(row_protocol, _)| row_protocol == protocol).ok_or("no row")?;
         for (variant, name, candidates, selected) in [
@@ -231,8 +202,6 @@ pub fn paper(arguments: &Paper) -> Result<()> {
                 );
             }
             for (iop_bytes, argument_bytes, selected) in points {
-                // Three decimals: the elementary functions behind an expected
-                // size differ in their last bits between platforms.
                 writeln!(csv, "{protocol},{name},{iop_bytes},{argument_bytes:.3},{selected}").unwrap();
             }
         }

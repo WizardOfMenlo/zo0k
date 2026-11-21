@@ -1,15 +1,3 @@
-//! Choice of the query counts and of the proofs of work of a schedule.
-//!
-//! The security target bounds the sum of all round-by-round errors, so the
-//! stages can trade queries with one another. [`optimize_queries`] searches
-//! for the allocation with the smallest expected argument size.
-//!
-//! The errors of the other rounds do not depend on the query counts but on
-//! the size of the field. Over a field that is too small for the security
-//! target, [`assign_pow_bits`] gives those rounds proofs of work, and
-//! [`assign_pow_bits_and_slack`] also enlarges the Johnson slack, which
-//! lowers their errors and raises the query counts.
-
 use crate::costs::Costs;
 use crate::error::{Error, Result};
 use crate::field::FieldSize;
@@ -19,41 +7,26 @@ use crate::parameters::{
 use crate::soundness::{CodeBounds, Soundness};
 use std::cmp::Reverse;
 
-/// Largest number of bits that [`Parameters::standard`] gives a proof of
-/// work.
 pub const STANDARD_MAX_POW_BITS: u32 = 24;
 
-/// Largest number of variables of [`Parameters::standard`]. Its first code
-/// has length `2^(n - 1)` for `n` variables, and a code has length at most
-/// `2^32`.
 pub const STANDARD_MAX_NUM_VARIABLES: usize = 33;
 
-/// Everything that follows from the parameters of a variant of the protocol.
 #[derive(Clone, Debug)]
 pub struct Analysis {
-    /// The analyzed parameters.
     pub parameters: Parameters,
-    /// The size of the field.
     pub field: FieldSize,
-    /// The shapes of the oracles.
     pub layout: Layout,
-    /// The round-by-round soundness errors.
     pub soundness: Soundness,
-    /// The proof sizes.
     pub costs: Costs,
 }
 
 impl Analysis {
-    /// Analyze the given variant over a field of the given size. Fails if the
-    /// parameters are invalid or the soundness error is above their target.
     pub fn new(parameters: &Parameters, variant: Variant, field: FieldSize) -> Result<Self> {
         let analysis = Self::ignoring_target(parameters, variant, field)?;
         analysis.soundness.check(parameters.security_bits)?;
         Ok(analysis)
     }
 
-    /// As [`Analysis::new`], but the soundness error may be above the target
-    /// of the parameters.
     pub fn ignoring_target(parameters: &Parameters, variant: Variant, field: FieldSize) -> Result<Self> {
         let layout = Layout::new(parameters, variant)?;
         let soundness = Soundness::new(&layout, parameters, field.bits)?;
@@ -62,14 +35,7 @@ impl Analysis {
     }
 }
 
-/// The smallest query counts for which the query error of every stage, after
-/// the proof of work, is at most the security target divided by
-/// `8·2^⌊log2(2s - 1)⌋`, for `s` stages. This leaves room for the algebraic
-/// errors, and is the starting point of [`optimize_queries`].
-///
-/// The query counts of `parameters` are ignored.
 pub fn uniform_queries(parameters: &Parameters, variant: Variant) -> Result<Vec<usize>> {
-    // Check the parameters before computing with them.
     let mut trial = parameters.clone();
     for stage in &mut trial.stages {
         stage.queries = 1;
@@ -80,9 +46,6 @@ pub fn uniform_queries(parameters: &Parameters, variant: Variant) -> Result<Vec<
         + (2 * count as u32 - 1).ilog2()
         + 3) as f64;
     for index in 0..count {
-        // With zero knowledge the dimension of the code grows with the query
-        // count, which lowers the proximity parameter: iterate to the least
-        // fixed point.
         let mut converged = false;
         for _ in 0..150 {
             let stage = Layout::new(&trial, variant)?.stages[index];
@@ -108,7 +71,6 @@ pub fn uniform_queries(parameters: &Parameters, variant: Variant) -> Result<Vec<
     Ok(trial.stages.iter().map(|stage| stage.queries).collect())
 }
 
-/// The analysis of `parameters` with the given query counts.
 fn with_queries(
     parameters: &Parameters,
     queries: &[usize],
@@ -122,37 +84,20 @@ fn with_queries(
     Analysis::new(&trial, variant, field)
 }
 
-/// The proofs of work that [`assign_pow_bits`] sets: one parameter serves all
-/// rounds of a slot.
 #[derive(PartialEq)]
 enum Slot {
-    /// The folding challenges of the sumcheck of a stage.
     Sumcheck(usize),
-    /// The out-of-domain sample of the code switch out of a stage.
     OutOfDomain(usize),
-    /// The combination challenge of the base case.
     BaseCase,
 }
 
 struct SlotError {
     slot: Slot,
-    /// Sum of the errors of the rounds of the slot, without proof of work.
     error: f64,
     rounds: usize,
     bits: u32,
 }
 
-/// Set the proofs of work before the sumcheck challenges, the out-of-domain
-/// samples and the combination challenge of the base case to few bits, at
-/// most `max_bits` each, for which the errors of all rounds other than the
-/// queries sum to at most half of the security target. The other half is
-/// left to the queries. Fails if `max_bits` do not suffice.
-///
-/// The errors are those for the query counts of [`uniform_queries`], from
-/// which [`optimize_queries`] starts. The query counts of `parameters` are
-/// ignored and kept, and its proofs of work for these rounds are replaced.
-/// Over a field that is large enough for the security target, all of them
-/// become zero.
 pub fn assign_pow_bits(
     parameters: &mut Parameters,
     variant: Variant,
@@ -170,8 +115,6 @@ pub fn assign_pow_bits(
     }
     let soundness = Soundness::new(&Layout::new(&trial, variant)?, &trial, field.bits)?;
 
-    // The errors that no proof of work of a slot lowers, and those of the
-    // slots. The rounds of a slot are consecutive.
     let mut fixed = 0.0;
     let mut slots: Vec<SlotError> = Vec::new();
     for round in &soundness.rounds {
@@ -194,8 +137,6 @@ pub fn assign_pow_bits(
         fixed + slots.iter().map(|slot| slot.error * 2f64.powi(-(slot.bits as i32))).sum::<f64>()
     };
 
-    // The expected work of a slot is `rounds·2^bits` hashes. Add one bit at a
-    // time where it removes the most error per hash that it adds.
     while total(&slots) > budget {
         let gain = |slot: &SlotError| slot.error * 4f64.powi(-(slot.bits as i32)) / slot.rounds as f64;
         let open = slots.iter_mut().filter(|slot| slot.bits < max_bits);
@@ -207,8 +148,6 @@ pub fn assign_pow_bits(
         };
         next.bits += 1;
     }
-    // Remove the bits that later ones made unnecessary, the most expensive
-    // first.
     let mut order: Vec<usize> = (0..slots.len()).collect();
     order.sort_by_key(|&index| Reverse((slots[index].rounds as u64) << slots[index].bits));
     for index in order {
@@ -235,9 +174,6 @@ pub fn assign_pow_bits(
     Ok(())
 }
 
-/// The Johnson slacks that [`assign_pow_bits_and_slack`] moves through, in
-/// increasing order: the admissible ones among 1, 1.2, 1.5, 2, 2.5, 3, 4, 5,
-/// 6 and 8 times a power of ten.
 fn slack_grid() -> Vec<f64> {
     let mantissas = [10, 12, 15, 20, 25, 30, 40, 50, 60, 80];
     let scales = [1e6, 1e5, 1e4, 1e3, 1e2];
@@ -245,12 +181,6 @@ fn slack_grid() -> Vec<f64> {
     values.filter(|slack| JOHNSON_SLACK_RANGE.contains(slack)).collect()
 }
 
-/// [`assign_pow_bits`] with the smallest Johnson slack for which it
-/// succeeds, among the slack of `parameters` and the larger values of a
-/// fixed grid. A larger slack lowers the errors that the proofs of work have
-/// to cover, and raises the query counts.
-///
-/// Fails, and leaves `parameters` unchanged, if no slack succeeds.
 pub fn assign_pow_bits_and_slack(
     parameters: &mut Parameters,
     variant: Variant,
@@ -269,8 +199,6 @@ pub fn assign_pow_bits_and_slack(
         (Ok(found), _) => Ok(found),
         (Err(error), None) => Err(error),
         (Err(error), Some(&largest)) => match attempt(largest) {
-            // The errors decrease as the slack grows: bisect for the first
-            // slack that succeeds.
             Ok(mut found) => {
                 let (mut failing, mut succeeding) = (0, larger.len() - 1);
                 while failing < succeeding {
@@ -282,8 +210,6 @@ pub fn assign_pow_bits_and_slack(
                 }
                 Ok(found)
             }
-            // A slack this large can leave a code of high rate without a
-            // proximity parameter. Try all slacks in order.
             Err(_) => larger.iter().find_map(|&slack| attempt(slack).ok()).ok_or(error),
         },
     };
@@ -291,14 +217,6 @@ pub fn assign_pow_bits_and_slack(
     Ok(())
 }
 
-/// Replace the query counts of `parameters` by counts that meet the security
-/// target with a small expected argument size, and return the analysis. The
-/// proofs of work of `parameters` are kept.
-///
-/// The search is deterministic. It starts from [`uniform_queries`] and moves
-/// to the best neighbouring allocation as long as one is smaller: first among
-/// those with one query fewer in one stage, and when none is admissible,
-/// among those that exchange queries between stages.
 pub fn optimize_queries(parameters: &mut Parameters, variant: Variant, field: FieldSize) -> Result<Analysis> {
     let mut queries = uniform_queries(parameters, variant)?;
     let mut best = with_queries(parameters, &queries, variant, field)?;
@@ -327,11 +245,6 @@ pub fn optimize_queries(parameters: &mut Parameters, variant: Variant, field: Fi
     Ok(best)
 }
 
-/// Replace the query counts of `parameters` by the cheapest admissible counts
-/// within two queries of each of them, among those whose IOP proof length is
-/// at most `iop_limit` bytes. The window has `5^stages` allocations.
-///
-/// Fails if the given counts are not admissible themselves.
 pub fn polish_queries(
     parameters: &mut Parameters,
     variant: Variant,
@@ -350,7 +263,6 @@ pub fn polish_queries(
         {
             best = analysis;
         }
-        // The next vector of changes in {-2, …, 2}^stages, last stage fastest.
         let Some(position) = change.iter().rposition(|&delta| delta < 2) else { break };
         change[position] += 1;
         change[position + 1..].fill(-2);
@@ -359,7 +271,6 @@ pub fn polish_queries(
     Ok(best)
 }
 
-/// The query counts after a change, unless a count would not be positive.
 fn apply(queries: &[usize], change: &[isize]) -> Option<Vec<usize>> {
     queries
         .iter()
@@ -376,14 +287,10 @@ fn change(count: usize, entries: &[(usize, isize)]) -> Vec<isize> {
     change
 }
 
-/// One query fewer in one stage.
 fn removals(count: usize) -> Vec<Vec<isize>> {
     (0..count).map(|stage| change(count, &[(stage, -1)])).collect()
 }
 
-/// Moves that shift error between stages: one query fewer in a stage for one
-/// or two more in another; one fewer in each of two stages for one or two
-/// more in a third; two fewer in a stage for one more in another.
 fn exchanges(count: usize) -> Vec<Vec<isize>> {
     let others = |excluded: &[usize]| {
         let excluded = excluded.to_vec();
@@ -415,27 +322,12 @@ fn exchanges(count: usize) -> Vec<Vec<isize>> {
 }
 
 impl Parameters {
-    /// Parameters for tables of `2^num_variables` entries with the given
-    /// security target, for at most [`STANDARD_MAX_NUM_VARIABLES`] variables:
-    /// stages that fold four times, codes of rate about one quarter, and
-    /// optimized query counts.
-    ///
-    /// There is no proof of work before the queries. Over a field that is
-    /// large enough for the security target there is none at all, and the
-    /// Johnson slack is 0.02. Over a smaller field the other rounds get
-    /// proofs of work of at most [`STANDARD_MAX_POW_BITS`] bits, and the
-    /// slack is as large as these need; see [`assign_pow_bits_and_slack`].
-    ///
-    /// These are convenient defaults, not the configurations of the paper's
-    /// evaluation, which trade proof length against argument size.
     pub fn standard(num_variables: usize, security_bits: u32, field: FieldSize) -> Result<Self> {
         if !(1..=STANDARD_MAX_NUM_VARIABLES).contains(&num_variables) {
             return Err(Error::InvalidParameters(
                 "standard parameters exist for 1 to 33 variables: choose a schedule for more".into(),
             ));
         }
-        // The last stage leaves a main block of at least two entries when
-        // there are at least two variables.
         let mut foldings = Vec::new();
         let mut remaining = num_variables;
         while remaining > 6 {
@@ -448,7 +340,6 @@ impl Parameters {
             .iter()
             .map(|&folding| {
                 main_variables = main_variables.saturating_sub(folding);
-                // Room for the seed and the auxiliary block next to the main block.
                 let domain_size = (4 * ((1usize << main_variables) + 256)).next_power_of_two();
                 StageParameters::new(folding, domain_size, 0)
             })

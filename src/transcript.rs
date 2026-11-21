@@ -1,32 +1,13 @@
-//! The Fiat–Shamir transformation.
-//!
-//! The prover writes its messages into the proof with a [`ProverTranscript`]
-//! and the verifier reads them back with a [`VerifierTranscript`]. Both absorb
-//! every message into the same hash state, from which the verifier's
-//! challenges are derived, so the two parties obtain the same challenges
-//! exactly when they have seen the same messages.
-//!
-//! The hash state is a [`Hasher`] that absorbs every message with its length.
-//! A batch of challenges is a stream of digests of a seed and a counter, where
-//! the seed is the digest of the state. The state then starts afresh from the
-//! seed.
-//!
-//! A proof of work is a nonce whose digest together with such a seed has a
-//! given number of leading zero bits. The nonce is a message of the prover:
-//! the challenges that follow depend on it.
-
 use crate::error::{Error, Result};
 use crate::field::Field;
 use crate::hash::{DIGEST_BYTES, Digest, Domain, Hasher};
 use crate::parallel;
 use std::marker::PhantomData;
 
-/// Number of bytes of a proof-of-work nonce.
 pub const NONCE_BYTES: usize = 8;
 
 const PROTOCOL_TAG: &[u8] = b"zo0k/v1";
 
-/// The hash state shared by the prover and the verifier.
 struct Sponge<H>(H);
 
 impl<H: Hasher> Sponge<H> {
@@ -56,18 +37,15 @@ impl<H: Hasher> Sponge<H> {
     }
 }
 
-/// A stream of uniform bytes: the digests of a seed followed by 0, 1, 2, ….
 pub struct ChallengeStream<H> {
     seed: Digest,
     counter: u64,
-    /// The current digest, and how many of its bytes are used up.
     block: Digest,
     used: usize,
     hasher: PhantomData<H>,
 }
 
 impl<H: Hasher> ChallengeStream<H> {
-    /// Fill `bytes` with the next bytes of the stream.
     pub fn fill(&mut self, bytes: &mut [u8]) {
         for byte in bytes {
             if self.used == DIGEST_BYTES {
@@ -84,27 +62,20 @@ impl<H: Hasher> ChallengeStream<H> {
     }
 }
 
-/// The verifier's random choices, available to both parties.
 pub trait Challenges {
-    /// The hash function of the transcript.
     type Hasher: Hasher;
 
-    /// A stream of uniform bytes that depends on all messages so far. Each
-    /// call returns an independent stream.
     fn challenge_stream(&mut self) -> ChallengeStream<Self::Hasher>;
 
-    /// A uniform field element.
     fn challenge_field<F: Field>(&mut self) -> F {
         self.challenge_fields(1)[0]
     }
 
-    /// Independent uniform field elements.
     fn challenge_fields<F: Field>(&mut self, count: usize) -> Vec<F> {
         let mut stream = self.challenge_stream();
         (0..count).map(|_| F::sample(|bytes| stream.fill(bytes))).collect()
     }
 
-    /// A uniform vector of `count` field elements that is not zero.
     fn challenge_nonzero_vector<F: Field>(&mut self, count: usize) -> Vec<F> {
         assert!(count > 0);
         let mut stream = self.challenge_stream();
@@ -116,11 +87,8 @@ pub trait Challenges {
         }
     }
 
-    /// Independent uniform positions below `bound`, possibly repeated.
     fn challenge_positions(&mut self, bound: usize, count: usize) -> Vec<usize> {
         assert!(bound > 0);
-        // Draw as many bits as the largest position has and reject draws
-        // outside the range, which leaves the accepted ones uniform.
         let mask = (bound as u64).next_power_of_two() - 1;
         let mut stream = self.challenge_stream();
         (0..count)
@@ -138,8 +106,6 @@ pub trait Challenges {
     }
 }
 
-/// Leading zero bits of the proof-of-work hash of a nonce: the hash of a
-/// seed, which the transcript supplies, and the nonce.
 fn proof_of_work_bits<H: Hasher>(seed: &Digest, nonce: u64) -> u32 {
     let mut input = [0; DIGEST_BYTES + NONCE_BYTES];
     input[..DIGEST_BYTES].copy_from_slice(seed);
@@ -148,12 +114,8 @@ fn proof_of_work_bits<H: Hasher>(seed: &Digest, nonce: u64) -> u32 {
     u64::from_be_bytes(digest[..8].try_into().unwrap()).leading_zeros()
 }
 
-/// The smallest nonce whose proof-of-work hash has at least `bits` leading
-/// zero bits.
 fn search_nonce<H: Hasher>(seed: &Digest, bits: u32) -> u64 {
     assert!(bits <= 64, "a proof-of-work hash has 64 bits");
-    // Search one window of nonces after another, each in parallel. The result
-    // does not depend on the number of threads.
     const WINDOW: usize = 1 << 18;
     (0..)
         .map(|window| window * WINDOW)
@@ -165,35 +127,29 @@ fn search_nonce<H: Hasher>(seed: &Digest, bits: u32) -> u64 {
         .expect("some nonce meets the difficulty") as u64
 }
 
-/// The prover's side: messages are appended to the proof.
 pub struct ProverTranscript<H> {
     sponge: Sponge<H>,
     proof: Vec<u8>,
 }
 
 impl<H: Hasher> ProverTranscript<H> {
-    /// A transcript for the given public statement.
     pub fn new(statement: &[u8]) -> Self {
         Self { sponge: Sponge::new(statement), proof: Vec::new() }
     }
 
-    /// Send a message.
     pub fn send_bytes(&mut self, message: &[u8]) {
         self.sponge.absorb(message);
         self.proof.extend_from_slice(message);
     }
 
-    /// Send a digest.
     pub fn send_digest(&mut self, digest: &Digest) {
         self.send_bytes(digest);
     }
 
-    /// Send a field element.
     pub fn send_field<F: Field>(&mut self, element: F) {
         self.send_fields(&[element]);
     }
 
-    /// Send field elements as one message.
     pub fn send_fields<F: Field>(&mut self, elements: &[F]) {
         let mut bytes = vec![0; elements.len() * F::BYTES];
         for (chunk, element) in bytes.chunks_exact_mut(F::BYTES).zip(elements) {
@@ -202,11 +158,6 @@ impl<H: Hasher> ProverTranscript<H> {
         self.send_bytes(&bytes);
     }
 
-    /// Find and send a nonce whose hash with the current state has `bits`
-    /// leading zero bits. Nothing is sent for zero bits.
-    ///
-    /// # Panics
-    /// Panics if `bits` is above 64.
     pub fn prove_work(&mut self, bits: u32) {
         if bits == 0 {
             return;
@@ -216,7 +167,6 @@ impl<H: Hasher> ProverTranscript<H> {
         self.send_bytes(&search_nonce::<H>(&seed, bits).to_le_bytes());
     }
 
-    /// The proof: all messages in the order in which they were sent.
     pub fn finish(self) -> Vec<u8> {
         self.proof
     }
@@ -230,19 +180,16 @@ impl<H: Hasher> Challenges for ProverTranscript<H> {
     }
 }
 
-/// The verifier's side: messages are read from the proof.
 pub struct VerifierTranscript<'a, H> {
     sponge: Sponge<H>,
     proof: &'a [u8],
 }
 
 impl<'a, H: Hasher> VerifierTranscript<'a, H> {
-    /// A transcript for the given public statement and proof.
     pub fn new(statement: &[u8], proof: &'a [u8]) -> Self {
         Self { sponge: Sponge::new(statement), proof }
     }
 
-    /// Read the next message of the prover, of `len` bytes.
     pub fn read_bytes(&mut self, len: usize) -> Result<&'a [u8]> {
         let (message, rest) =
             self.proof.split_at_checked(len).ok_or(Error::InvalidProof("the proof is too short"))?;
@@ -251,18 +198,14 @@ impl<'a, H: Hasher> VerifierTranscript<'a, H> {
         Ok(message)
     }
 
-    /// Read a digest.
     pub fn read_digest(&mut self) -> Result<Digest> {
         Ok(self.read_bytes(DIGEST_BYTES)?.try_into().unwrap())
     }
 
-    /// Read a field element. Fails if the encoding is not canonical.
     pub fn read_field<F: Field>(&mut self) -> Result<F> {
         Ok(self.read_fields(1)?[0])
     }
 
-    /// Read a message of `count` field elements. Fails if an encoding is not
-    /// canonical.
     pub fn read_fields<F: Field>(&mut self, count: usize) -> Result<Vec<F>> {
         let len = count.checked_mul(F::BYTES).ok_or(Error::InvalidProof("the proof is too short"))?;
         self.read_bytes(len)?
@@ -273,7 +216,6 @@ impl<'a, H: Hasher> VerifierTranscript<'a, H> {
             .collect()
     }
 
-    /// Read and check the nonce of [`ProverTranscript::prove_work`].
     pub fn check_work(&mut self, bits: u32) -> Result<()> {
         if bits == 0 {
             return Ok(());
@@ -287,7 +229,6 @@ impl<'a, H: Hasher> VerifierTranscript<'a, H> {
         Ok(())
     }
 
-    /// Check that the whole proof was read.
     pub fn finish(self) -> Result<()> {
         if self.proof.is_empty() { Ok(()) } else { Err(Error::InvalidProof("the proof is too long")) }
     }

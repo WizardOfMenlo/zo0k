@@ -1,22 +1,15 @@
-//! The binary field `GF(2^128)`.
-
 use super::{BinaryField, Field, binary_inverse, impl_binary_field_operators, vector};
 use std::fmt;
 use std::ops::{Add, Mul};
 
-/// An element of `K = GF(2)[x] / (x^128 + x^7 + x^2 + x + 1)`: a polynomial
-/// in `x` of degree below 128, stored in one limb with the constant term in
-/// the lowest bit.
 #[derive(Clone, Copy, Default, PartialEq, Eq, Hash)]
 pub struct Gf2_128(u128);
 
 impl Gf2_128 {
-    /// The element with the given limb.
     pub const fn new(limb: u128) -> Self {
         Self(limb)
     }
 
-    /// The limb of the element.
     pub const fn limb(self) -> u128 {
         self.0
     }

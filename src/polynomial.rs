@@ -1,28 +1,13 @@
-//! Univariate and multilinear polynomials over the field.
-//!
-//! A table of `2^k` rows of `w` entries each is stored row by row: entry
-//! `b·w + j` is entry `j` of row `b`. A row index `b` in `{0,1}^k` is read
-//! with its first variable in the highest bit, so that tables are in
-//! lexicographic order of `(X_1, …, X_k)`. Folding a table at a challenge
-//! fixes `X_1`, which combines its two halves, so folding `k` times leaves
-//! one row. An evaluation table of a multilinear polynomial is the case
-//! `w = 1`.
-
 use crate::field::Field;
 use crate::parallel;
 
-/// Tables shorter than this are processed on one thread, and longer ones in
-/// pieces of at least [`MIN_PIECE`] entries: a piece should take tens of
-/// microseconds, well above the cost of handing it to another thread.
 const PARALLEL_THRESHOLD: usize = 1 << 15;
 const MIN_PIECE: usize = 1 << 13;
 
-/// `Σ_j coefficients[j]·x^j`.
 pub fn evaluate<F: Field>(coefficients: &[F], x: F) -> F {
     coefficients.iter().rev().fold(F::ZERO, |value, &coefficient| value * x + coefficient)
 }
 
-/// `Σ_j a[j]·b[j]`.
 pub fn inner_product<F: Field>(a: &[F], b: &[F]) -> F {
     assert_eq!(a.len(), b.len());
     if a.len() < PARALLEL_THRESHOLD {
@@ -35,7 +20,6 @@ pub fn inner_product<F: Field>(a: &[F], b: &[F]) -> F {
     }
 }
 
-/// Add `scale·x^j` to `target[j]` for every `j`.
 pub fn add_powers<F: Field>(target: &mut [F], x: F, mut scale: F) {
     for entry in target {
         *entry += scale;
@@ -43,8 +27,6 @@ pub fn add_powers<F: Field>(target: &mut [F], x: F, mut scale: F) {
     }
 }
 
-/// Fix the first variable of a table to `challenge`: the result is
-/// `(1 - challenge)·low + challenge·high` for the two halves of the table.
 pub fn fold<F: Field>(values: &mut Vec<F>, challenge: F) {
     assert!(values.len().is_multiple_of(2));
     let half = values.len() / 2;
@@ -61,13 +43,9 @@ pub fn fold<F: Field>(values: &mut Vec<F>, challenge: F) {
     values.truncate(half);
 }
 
-/// The table of `eq(b, point) = Π_i (b_i·point_i + (1 - b_i)(1 - point_i))`
-/// over `b` in `{0,1}^k`, where `k` is the length of `point`.
 pub fn eq_table<F: Field>(point: &[F]) -> Vec<F> {
     let mut table = Vec::with_capacity(1 << point.len());
     table.push(F::ONE);
-    // Each coordinate doubles the table and becomes the highest bit so far,
-    // so the first coordinate has to come last.
     for &coordinate in point.iter().rev() {
         let half = table.len();
         table.resize(2 * half, F::ZERO);
@@ -87,8 +65,6 @@ pub fn eq_table<F: Field>(point: &[F]) -> Vec<F> {
     table
 }
 
-/// Fix all row variables of a table at once: with `weights = eq_table(γ)`,
-/// the result is the combination `Σ_b weights[b]·row_b` of the rows.
 pub fn fold_rows<F: Field>(table: &[F], weights: &[F]) -> Vec<F> {
     assert!(table.len().is_multiple_of(weights.len()));
     let width = table.len() / weights.len();
@@ -101,11 +77,6 @@ pub fn fold_rows<F: Field>(table: &[F], weights: &[F]) -> Vec<F> {
     folded
 }
 
-/// The value at `point` of the multilinear polynomial with evaluation table
-/// `table`: `Σ_b table[b]·eq(b, point)`.
-///
-/// # Panics
-/// Panics unless the table has `2^k` entries for `k` the length of `point`.
 pub fn evaluate_multilinear<F: Field>(table: &[F], point: &[F]) -> F {
     assert_eq!(table.len(), 1 << point.len());
     let mut values = table.to_vec();
@@ -115,10 +86,6 @@ pub fn evaluate_multilinear<F: Field>(table: &[F], point: &[F]) -> F {
     values[0]
 }
 
-/// The constant and quadratic coefficients of `Σ_i a_i(X)·b_i(X)`, where
-/// `a_i(X) = a_low[i] + (a_high[i] - a_low[i])·X` for the two halves of `a`,
-/// and likewise for `b`: the round polynomial of a sumcheck for the inner
-/// product of two tables.
 pub fn round_coefficients<F: Field>(a: &[F], b: &[F]) -> (F, F) {
     assert_eq!(a.len(), b.len());
     assert!(a.len().is_multiple_of(2));
