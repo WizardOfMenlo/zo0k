@@ -246,6 +246,44 @@ fn reproducible<F: RsField, H: Hasher>(
     verify(protocol, &other).map_err(|e| format!("a proof with another seed fails: {e}"))
 }
 
+fn reproducible_across_threads<F: RsField, H: Hasher>(
+    prng: &mut Prng,
+    protocol: &Protocol<F, H>,
+    input: &Input<F>,
+    seed: [u8; 32],
+    instance: &Instance<F>,
+) -> Result<(), String> {
+    let threads = prng.pick(&crate::threads::THREAD_CHOICES[..4]);
+    let _guard = crate::threads::ThreadsGuard::set(threads);
+    let again = prove(protocol, input.table.clone(), &input.point, seed).map_err(|e| e.to_string())?;
+    ensure(again.commitment == instance.commitment, || format!("{threads} threads give another commitment"))?;
+    ensure(again.proof == instance.proof, || format!("{threads} threads give another proof"))?;
+    verify(protocol, instance).map_err(|e| format!("verifying with {threads} threads: {e}"))
+}
+
+fn new_agrees_with_analysis<F: RsField, H: Hasher>(prng: &mut Prng, base: &Parameters) -> Result<(), String> {
+    for _ in 0..4 {
+        let mut parameters = base.clone();
+        let stage = prng.below(parameters.stages.len());
+        let queries = parameters.stages[stage].queries;
+        parameters.stages[stage].queries = prng.range(1, queries);
+        if prng.chance(30) {
+            parameters.security_bits += prng.range(1, 8) as u32;
+        }
+        let analysis = Analysis::new(&parameters, Variant::ZeroKnowledge, F::SIZE);
+        let created = Protocol::<F, H>::new(parameters.clone());
+        let agree = created.is_ok() == analysis.is_ok();
+        ensure(agree, || {
+            format!(
+                "Protocol::new is {} but the analysis is {} for {parameters:?}",
+                created.is_ok(),
+                analysis.is_ok()
+            )
+        })?;
+    }
+    Ok(())
+}
+
 fn rejects_wrong_statement<F: RsField, H: Hasher>(
     prng: &mut Prng,
     protocol: &Protocol<F, H>,
@@ -693,6 +731,12 @@ fn run<F: RsField + BinaryField, H: Hasher>(ctx: &mut Ctx) -> Result<(), Failure
     ctx.check("value_matches_naive_evaluation", |_| value_matches(&input, &instance))?;
     ctx.check("proof_size_matches_cost_model", |_| proof_size(&protocol, &instance))?;
     ctx.check("reproducible_from_prover_seed", |_| reproducible(&protocol, &input, seed, &instance))?;
+    ctx.check("reproducible_across_threads", |prng| {
+        reproducible_across_threads(prng, &protocol, &input, seed, &instance)
+    })?;
+    ctx.check("protocol_new_agrees_with_analysis", |prng| {
+        new_agrees_with_analysis::<F, H>(prng, &parameters)
+    })?;
     ctx.check("rejects_wrong_value_point_commitment", |prng| {
         rejects_wrong_statement(prng, &protocol, &instance)
     })?;

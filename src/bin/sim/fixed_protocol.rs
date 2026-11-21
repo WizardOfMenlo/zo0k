@@ -4,6 +4,7 @@ use crate::fields::uniforms;
 use crate::prng::Prng;
 use crate::protocol::{Instance, prove, rejected, verify};
 use crate::report::ensure;
+use crate::threads::{THREAD_CHOICES, ThreadsGuard};
 use zo0k::parameters::{Parameters, StageParameters, Variant};
 use zo0k::tuning::{Analysis, optimize_queries};
 use zo0k::{Blake3, Error, Field, Gf2_128, Gf2_256, Hasher, Keccak256, Proof, Protocol, RsField};
@@ -310,8 +311,6 @@ pub fn fields_and_hashes_bind() -> Result<(), String> {
     })
 }
 
-pub const THREADS_ENV: &str = "RAYON_NUM_THREADS";
-
 pub fn reference_proof() -> Result<Vec<u8>, String> {
     let parameters = parameters::<Gf2_256>(9, &[(2, 1100), (3, 300)], 6)?;
     let protocol = Protocol::<Gf2_256, Blake3>::new(parameters).map_err(|e| e.to_string())?;
@@ -324,40 +323,21 @@ pub fn reference_proof() -> Result<Vec<u8>, String> {
     Ok(bytes)
 }
 
-pub fn fingerprint(bytes: &[u8]) -> String {
-    let mut state = 0xcbf2_9ce4_8422_2325u64;
-    for &byte in bytes {
-        state = (state ^ u64::from(byte)).wrapping_mul(0x0100_0000_01b3);
-    }
-    let text = format!("{}:{state:016x}", bytes.len());
-    assert!(text.len() > 17);
-    text
-}
-
 pub fn threads_agree() -> Result<(), String> {
-    let expected = fingerprint(&reference_proof()?);
-    let concurrent: Vec<Result<Vec<u8>, String>> = std::thread::scope(|scope| {
-        let handles: Vec<_> = (0..4).map(|_| scope.spawn(reference_proof)).collect();
-        handles
-            .into_iter()
-            .map(|handle| handle.join().unwrap_or_else(|_| Err("a prover thread panics".into())))
-            .collect()
-    });
-    for proof in concurrent {
-        ensure(fingerprint(&proof?) == expected, || "concurrent provers give other proofs".into())?;
-    }
-    let current = std::env::current_exe().map_err(|e| e.to_string())?;
-    for threads in ["1", "2", "5"] {
-        let output = std::process::Command::new(&current)
-            .arg("--proof-fingerprint")
-            .env(THREADS_ENV, threads)
-            .output()
-            .map_err(|e| format!("cannot run {}: {e}", current.display()))?;
-        let printed = String::from_utf8_lossy(&output.stdout);
-        ensure(output.status.success(), || format!("the fingerprint run with {threads} threads fails"))?;
-        ensure(printed.trim() == expected, || {
-            format!("{threads} threads give proof {} instead of {expected}", printed.trim())
-        })?;
+    let expected = reference_proof()?;
+    for threads in THREAD_CHOICES {
+        let _guard = ThreadsGuard::set(threads);
+        ensure(reference_proof()? == expected, || format!("{threads} threads give another proof"))?;
+        let concurrent: Vec<Result<Vec<u8>, String>> = std::thread::scope(|scope| {
+            let handles: Vec<_> = (0..3).map(|_| scope.spawn(reference_proof)).collect();
+            let joined = handles.into_iter().map(|handle| handle.join());
+            joined.map(|result| result.unwrap_or_else(|_| Err("a prover thread panics".into()))).collect()
+        });
+        for proof in concurrent {
+            ensure(proof? == expected, || {
+                format!("concurrent provers with {threads} threads give other proofs")
+            })?;
+        }
     }
     Ok(())
 }

@@ -5,12 +5,15 @@ mod composed;
 mod fields;
 mod fixed;
 mod fixed_protocol;
+mod hashes;
 mod json;
 mod primitives;
 mod prng;
 mod protocol;
 mod report;
 mod rounds;
+mod threads;
+mod vectors;
 mod zk;
 
 use prng::mix;
@@ -31,6 +34,7 @@ type OneOff = (&'static str, fn() -> Result<(), String>);
 fn one_off_checks() -> Vec<OneOff> {
     vec![
         ("json_reader", json::self_test),
+        ("hash_known_answer_vectors", vectors::check),
         ("field_moduli_irreducible", fields::moduli_are_irreducible),
         ("field_edge_products", fields::edge_products),
         ("transcript_malformed_proofs", primitives::malformed_transcripts),
@@ -67,7 +71,6 @@ fn one_off_checks() -> Vec<OneOff> {
 }
 
 enum Mode {
-    Fingerprint,
     Gate { fresh: usize },
     Seed(u64),
     Hunt { seconds: u64 },
@@ -87,7 +90,6 @@ fn parse_mode(arguments: &[String]) -> Result<Mode, String> {
     match words.as_slice() {
         [] => Ok(Mode::Gate { fresh: GATE_FRESH_SEEDS }),
         ["--fresh", count] => Ok(Mode::Gate { fresh: number(count)? as usize }),
-        ["--proof-fingerprint"] => Ok(Mode::Fingerprint),
         ["--seed", seed] => Ok(Mode::Seed(parse_seed(seed)?)),
         ["--hunt"] => Ok(Mode::Hunt { seconds: HUNT_SECONDS_DEFAULT }),
         ["--hunt", "--seconds", seconds] => Ok(Mode::Hunt { seconds: number(seconds)? }),
@@ -108,7 +110,7 @@ fn entropy_seed() -> u64 {
 
 pub fn run_scenario(seed: u64, verbose: bool) -> Result<usize, Failure> {
     type Module = fn(&mut Ctx) -> Result<(), Failure>;
-    let modules: [(u64, Module); 7] = [
+    let modules: [(u64, Module); 9] = [
         (1, fields::scenario),
         (2, primitives::scenario),
         (3, algebra::scenario),
@@ -116,6 +118,8 @@ pub fn run_scenario(seed: u64, verbose: bool) -> Result<usize, Failure> {
         (5, analysis::scenario),
         (6, zk::scenario),
         (7, protocol::scenario),
+        (8, threads::scenario),
+        (9, hashes::scenario),
     ];
     let mut checks = 0;
     for (stream, module) in modules {
@@ -259,19 +263,6 @@ fn run_hunt(seconds: u64) -> usize {
     0
 }
 
-fn run_fingerprint() -> usize {
-    match fixed_protocol::reference_proof() {
-        Ok(bytes) => {
-            println!("{}", fixed_protocol::fingerprint(&bytes));
-            0
-        }
-        Err(error) => {
-            println!("FAIL fingerprint: {error}");
-            1
-        }
-    }
-}
-
 fn main() -> ExitCode {
     report::install_panic_hook();
     let arguments: Vec<String> = std::env::args().skip(1).collect();
@@ -283,7 +274,6 @@ fn main() -> ExitCode {
         }
     };
     let failures = match mode {
-        Mode::Fingerprint => run_fingerprint(),
         Mode::Gate { fresh } => run_gate(fresh),
         Mode::Seed(seed) => run_single(seed),
         Mode::Hunt { seconds } => run_hunt(seconds),

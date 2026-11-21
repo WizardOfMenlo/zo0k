@@ -280,7 +280,7 @@ fn random_steps(prng: &mut Prng) -> Vec<Step> {
             4 => Step::Work(prng.range(0, 8) as u32),
             5 => Step::Challenge,
             6 => Step::Challenges(prng.range(1, 4)),
-            7 => Step::Positions(prng.range(1, 1000), prng.range(0, 40)),
+            7 => Step::Positions(prng.range(1, 1000), prng.range(0, 80)),
             _ => Step::Nonzero(prng.range(1, 4)),
         })
         .collect();
@@ -398,6 +398,10 @@ pub fn transcripts<F: Field, H: Hasher>(prng: &mut Prng) -> Result<(), String> {
         .zip(&seen)
     {
         if let Step::Positions(bound, count) = *step {
+            let upper = values.iter().filter(|&&p| 2 * p as usize >= bound).count();
+            ensure(count < 64 || bound < 16 || (count / 8..=count - count / 8).contains(&upper), || {
+                format!("{upper} of {count} positions below {bound} are in the upper half")
+            })?;
             ensure(values.len() == count && values.iter().all(|&p| (p as usize) < bound), || {
                 format!("positions out of range {bound}")
             })?;
