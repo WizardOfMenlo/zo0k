@@ -19,7 +19,8 @@ not constant time, and the encoding of its proofs can change between versions.
 ## Quick start
 
 ```sh
-cargo test --release
+./check.sh                                             # lint, simulator, portable arithmetic, MSRV
+cargo build --release --bins && target/release/sim    # the deterministic simulator alone
 cargo run --release -- bench --num-variables 20        # standard parameters
 cargo run --release -- bench --paper polylog-20        # a row of the paper's tables
 cargo run --release -- bench --num-variables 20 --field gf2_128
@@ -200,11 +201,22 @@ work account for the remaining 24 bits.
 | Fiat–Shamir transformation, proof of work | `transcript` |
 | Choice of query counts and proofs of work | `tuning` |
 | Fields: the `Field` trait, `GF(2^128)`, `GF(2^256)` | `field` |
-| Hash functions: the `Hasher` trait, BLAKE3, Keccak-256 | `hash` |
+| Hash functions: the `Hasher` trait, BLAKE3, Keccak-256 | `hash`, `blake3`, `keccak` |
+| Threads, JSON, operating-system entropy | `parallel`, `json`, `entropy` |
 
 `lib.rs` composes the stages into `Protocol::commit`, `prove` and `verify`.
 Each of `sumcheck`, `code_switch` and `base_case` holds the prover and the
 verifier of one reduction side by side.
+
+## Testing
+
+The crate has no unit tests. `src/bin/sim` is a deterministic simulator. Each
+seed generates random fields, hashes, schedules, tables, points and
+adversarial inputs, and checks the protocol, its components, the analysis and
+the command-line tool against independent references. A failing seed
+reproduces with `cargo run --release --bin sim -- --seed <seed>`.
+`sim/seeds.txt` collects the seeds that once failed, and every run replays
+them. `AGENTS.md` has the rules for changes.
 
 ## What the paper leaves to the implementation
 
