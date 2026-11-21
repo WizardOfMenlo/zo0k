@@ -1,5 +1,3 @@
-#![allow(missing_docs)]
-
 pub const OUT_LEN: usize = 32;
 pub const RATE_BYTES: usize = 136;
 

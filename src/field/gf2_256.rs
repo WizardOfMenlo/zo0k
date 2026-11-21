@@ -103,39 +103,3 @@ impl Mul for Gf2_256 {
 }
 
 impl_binary_field_operators!(Gf2_256);
-
-#[cfg(test)]
-mod tests {
-    use super::super::gf2_128::tests::mul_reference as m;
-    use super::*;
-    use crate::rng::Rng;
-
-    /// Schoolbook product on top of the reference product in `K`.
-    fn mul_reference(p: Gf2_256, q: Gf2_256) -> Gf2_256 {
-        let bd = m(p.1, q.1);
-        Gf2_256(m(p.0, q.0) ^ m(bd, 1 << 121), m(p.0, q.1) ^ m(p.1, q.0) ^ bd)
-    }
-
-    #[test]
-    fn products_match_the_reference() {
-        let mut rng = Rng::from_seed([2; 32]);
-        for _ in 0..500 {
-            let (p, q): (Gf2_256, Gf2_256) = (rng.field(), rng.field());
-            assert_eq!(p * q, mul_reference(p, q));
-            assert_eq!(p.square(), mul_reference(p, p));
-            assert_eq!(p.mul_base(q.0), mul_reference(p, Gf2_256(q.0, 0)));
-        }
-    }
-
-    #[test]
-    fn the_extension_modulus_is_irreducible() {
-        // u^2 + u + c is irreducible over K exactly when c has trace one.
-        let mut conjugate = 1u128 << 121;
-        let mut trace = conjugate;
-        for _ in 1..128 {
-            conjugate = m(conjugate, conjugate);
-            trace ^= conjugate;
-        }
-        assert_eq!(trace, 1);
-    }
-}

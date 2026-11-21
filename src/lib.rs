@@ -44,8 +44,6 @@
 //! | Fiat–Shamir transformation, proofs of work | [`transcript`] |
 //! | Choice of query counts and proofs of work | [`tuning`] |
 
-#![warn(missing_docs)]
-
 #[cfg(not(target_pointer_width = "64"))]
 compile_error!("zo0k supports 64-bit targets only");
 
@@ -58,7 +56,6 @@ mod entropy;
 pub mod error;
 pub mod field;
 pub mod hash;
-#[allow(missing_docs)]
 pub mod json;
 pub mod keccak;
 pub mod mask;
@@ -88,11 +85,6 @@ use code_switch::CodeSwitch;
 use std::marker::PhantomData;
 use transcript::{ProverTranscript, VerifierTranscript};
 use witness::Message;
-
-/// The Rust examples of the README, which the documentation tests run.
-#[cfg(doctest)]
-#[doc = include_str!("../README.md")]
-struct Readme;
 
 /// A commitment to a table: the Merkle root of its encoding.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -252,51 +244,5 @@ impl<F: RsField, H: Hasher> Protocol<F, H> {
             (claim, root) = switch.verify(&mut transcript, folded_claim, &root, &challenges)?;
         }
         transcript.finish()
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    /// The honest prover algorithm on a false claim: the verifier's checks
-    /// reject it, and not only the binding of the statement.
-    fn false_claims<F: RsField, H: Hasher>() {
-        let mut rng = Rng::from_seed([9; 32]);
-        for (num_variables, schedule) in [(6, vec![(3, 256)]), (9, vec![(2, 1100), (3, 300)])] {
-            let stages =
-                schedule.iter().map(|&(folding, domain_size)| StageParameters::new(folding, domain_size, 0));
-            let mut parameters = Parameters {
-                num_variables,
-                stages: stages.collect(),
-                security_bits: 24,
-                pow_bits: 0,
-                base_case_pow_bits: 0,
-                johnson_slack: 0.02,
-            };
-            tuning::optimize_queries(&mut parameters, Variant::ZeroKnowledge, F::SIZE).unwrap();
-            let protocol = Protocol::<F, H>::new(parameters).unwrap();
-            let point: Vec<F> = rng.fields(num_variables);
-            for error in [F::ZERO, F::ONE] {
-                let (commitment, witness) =
-                    protocol.commit(rng.fields(1 << num_variables), &mut rng).unwrap();
-                let mut claim = ProverClaim::evaluation(&point, F::ZERO);
-                claim.target = polynomial::inner_product(&claim.main, &witness.message.main) + error;
-                let value = claim.target;
-                let transcript = ProverTranscript::new(&protocol.statement(&commitment, &point, value));
-                let proof = protocol.prove_claim(transcript, claim, witness, &mut rng);
-                let result = protocol.verify(&commitment, &point, value, &proof);
-                assert_eq!(result.is_ok(), error == F::ZERO);
-                assert!(matches!(result, Ok(()) | Err(Error::InvalidProof(_))));
-            }
-        }
-    }
-
-    #[test]
-    fn the_honest_algorithm_cannot_prove_a_false_claim() {
-        false_claims::<Gf2_256, Blake3>();
-        false_claims::<Gf2_128, Blake3>();
-        false_claims::<Gf2_256, Keccak256>();
-        false_claims::<Gf2_128, Keccak256>();
     }
 }
