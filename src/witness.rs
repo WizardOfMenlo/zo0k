@@ -2,7 +2,6 @@ use crate::field::Field;
 use crate::hash::Hasher;
 use crate::mask::Mask;
 use crate::oracle::Oracle;
-use crate::parallel;
 use crate::parameters::{MASK_LEN, Stage};
 use crate::reed_solomon::RsField;
 use crate::rng::Rng;
@@ -26,8 +25,14 @@ impl<F: Field> Row<F> {
     }
 
     pub fn add_scaled(&self, other: &Self, scale: F) -> Self {
-        let combine =
-            |a: &[F], b: &[F]| -> Vec<F> { a.iter().zip(b).map(|(&x, &y)| x + y * scale).collect() };
+        assert_eq!(self.main.len(), other.main.len());
+        assert_eq!(self.aux.len(), other.aux.len());
+        assert_eq!(self.seed.len(), other.seed.len());
+        let combine = |a: &[F], b: &[F]| -> Vec<F> {
+            let mut out = a.to_vec();
+            F::add_scaled_slice(&mut out, b, scale);
+            out
+        };
         Self {
             main: combine(&self.main, &other.main),
             aux: combine(&self.aux, &other.aux),
@@ -72,27 +77,30 @@ impl<F: RsField> Message<F> {
             seeds: rng.fields(stage.rows() * stage.seed_len),
         }
     }
-
     pub fn encode(&self, stage: &Stage, extra_row: Option<&Row<F>>) -> Vec<Vec<F>> {
         let rows = stage.rows();
+        let total_rows = rows + usize::from(extra_row.is_some());
+        assert!(rows >= 1 && total_rows >= rows);
         let masks = self.mask.rows();
         fn of_row<F>(table: &[F], rows: usize, row: usize) -> &[F] {
             let width = table.len() / rows;
             &table[row * width..(row + 1) * width]
         }
-        parallel::map_range(rows + usize::from(extra_row.is_some()), 1, |row| {
-            let polynomial = if row < rows {
-                let mut polynomial = Vec::with_capacity(stage.dimension());
-                polynomial.extend_from_slice(of_row(&self.seeds, rows, row));
-                polynomial.extend_from_slice(&masks[row]);
-                polynomial.extend_from_slice(of_row(&self.main, rows, row));
-                polynomial.extend_from_slice(of_row(&self.aux, rows, row));
-                polynomial
-            } else {
-                extra_row.unwrap().polynomial()
-            };
-            F::encode(&polynomial, stage.domain_size)
-        })
+        let mut row_parts: Vec<[&[F]; 4]> = Vec::with_capacity(total_rows);
+        for (row, mask) in masks.iter().enumerate() {
+            row_parts.push([
+                of_row(&self.seeds, rows, row),
+                &mask[..],
+                of_row(&self.main, rows, row),
+                of_row(&self.aux, rows, row),
+            ]);
+        }
+        if let Some(extra) = extra_row {
+            row_parts.push([&extra.seed[..], &extra.mask[..], &extra.main[..], &extra.aux[..]]);
+        }
+        let encoded = F::encode_batch(&row_parts, stage.domain_size);
+        assert_eq!(encoded.len(), total_rows);
+        encoded
     }
 }
 
