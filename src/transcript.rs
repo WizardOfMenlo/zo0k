@@ -7,26 +7,49 @@ use std::marker::PhantomData;
 pub const NONCE_BYTES: usize = 8;
 
 const PROTOCOL_TAG: &[u8] = b"zo0k/v1";
+const SPONGE_FLUSH_BYTES: usize = 64 * 1024 + 64;
+const POW_BATCH: usize = 256;
+const POW_SEQUENTIAL_BITS_MAX: u32 = 10;
+const POW_SEQUENTIAL_PREFIX: usize = 1024;
 
-struct Sponge<H>(H);
+struct Sponge<H> {
+    hasher: H,
+    buffer: Vec<u8>,
+}
 
 impl<H: Hasher> Sponge<H> {
     fn new(statement: &[u8]) -> Self {
-        let mut sponge = Self(H::new(Domain::Transcript));
+        let mut sponge = Self { hasher: H::new(Domain::Transcript), buffer: Vec::new() };
         sponge.absorb(PROTOCOL_TAG);
         sponge.absorb(statement);
         sponge
     }
 
+    fn flush(&mut self) {
+        if !self.buffer.is_empty() {
+            self.hasher.update(&self.buffer);
+            self.buffer.clear();
+        }
+        assert!(self.buffer.is_empty());
+    }
+
     fn absorb(&mut self, message: &[u8]) {
-        self.0.update(&(message.len() as u64).to_le_bytes());
-        self.0.update(message);
+        self.buffer.extend_from_slice(&(message.len() as u64).to_le_bytes());
+        if self.buffer.len() + message.len() >= SPONGE_FLUSH_BYTES {
+            self.flush();
+            if message.len() >= SPONGE_FLUSH_BYTES {
+                self.hasher.update(message);
+                return;
+            }
+        }
+        self.buffer.extend_from_slice(message);
     }
 
     fn squeeze(&mut self) -> ChallengeStream<H> {
-        let seed = self.0.clone().finalize();
-        self.0 = H::new(Domain::Transcript);
-        self.0.update(&seed);
+        self.flush();
+        let seed = self.hasher.clone().finalize();
+        self.hasher = H::new(Domain::Transcript);
+        self.buffer.extend_from_slice(&seed);
         ChallengeStream {
             seed,
             counter: 0,
@@ -47,7 +70,8 @@ pub struct ChallengeStream<H> {
 
 impl<H: Hasher> ChallengeStream<H> {
     pub fn fill(&mut self, bytes: &mut [u8]) {
-        for byte in bytes {
+        let mut filled = 0;
+        while filled < bytes.len() {
             if self.used == DIGEST_BYTES {
                 let mut input = [0; DIGEST_BYTES + 8];
                 input[..DIGEST_BYTES].copy_from_slice(&self.seed);
@@ -56,9 +80,13 @@ impl<H: Hasher> ChallengeStream<H> {
                 self.counter += 1;
                 self.used = 0;
             }
-            *byte = self.block[self.used];
-            self.used += 1;
+            let take = (DIGEST_BYTES - self.used).min(bytes.len() - filled);
+            bytes[filled..filled + take].copy_from_slice(&self.block[self.used..self.used + take]);
+            self.used += take;
+            filled += take;
         }
+        assert!(filled == bytes.len());
+        assert!(self.used <= DIGEST_BYTES);
     }
 }
 
@@ -68,7 +96,8 @@ pub trait Challenges {
     fn challenge_stream(&mut self) -> ChallengeStream<Self::Hasher>;
 
     fn challenge_field<F: Field>(&mut self) -> F {
-        self.challenge_fields(1)[0]
+        let mut stream = self.challenge_stream();
+        F::sample(|bytes| stream.fill(bytes))
     }
 
     fn challenge_fields<F: Field>(&mut self, count: usize) -> Vec<F> {
@@ -106,25 +135,37 @@ pub trait Challenges {
     }
 }
 
-fn proof_of_work_bits<H: Hasher>(seed: &Digest, nonce: u64) -> u32 {
-    let mut input = [0; DIGEST_BYTES + NONCE_BYTES];
-    input[..DIGEST_BYTES].copy_from_slice(seed);
-    input[DIGEST_BYTES..].copy_from_slice(&nonce.to_le_bytes());
-    let digest = H::hash(Domain::ProofOfWork, &input);
-    u64::from_be_bytes(digest[..8].try_into().unwrap()).leading_zeros()
-}
-
 fn search_nonce<H: Hasher>(seed: &Digest, bits: u32) -> u64 {
     assert!(bits <= 64, "a proof-of-work hash has 64 bits");
-    const WINDOW: usize = 1 << 18;
-    (0..)
-        .map(|window| window * WINDOW)
-        .find_map(|start| {
-            parallel::find_first(start..start + WINDOW, 1 << 10, |nonce| {
-                proof_of_work_bits::<H>(seed, nonce as u64) >= bits
-            })
-        })
-        .expect("some nonce meets the difficulty") as u64
+    if bits == 0 {
+        return 0;
+    }
+    let mut start = 0u64;
+    if bits <= POW_SEQUENTIAL_BITS_MAX {
+        if let Some(nonce) = H::find_pow_nonce(seed, bits, 0, POW_SEQUENTIAL_PREFIX) {
+            return nonce;
+        }
+        start = POW_SEQUENTIAL_PREFIX as u64;
+    }
+    let window_nonces: usize = if bits <= 16 { 1 << 16 } else { 1 << 20 };
+    let window_batches = window_nonces / POW_BATCH;
+    assert!(window_batches >= 4);
+    let max_windows = u64::MAX / window_nonces as u64;
+    for _ in 0..max_windows {
+        let found = parallel::find_first(0..window_batches, 4, |batch| {
+            let batch_start = start + (batch as u64) * (POW_BATCH as u64);
+            H::find_pow_nonce(seed, bits, batch_start, POW_BATCH).is_some()
+        });
+        if let Some(batch) = found {
+            let batch_start = start + (batch as u64) * (POW_BATCH as u64);
+            let nonce = H::find_pow_nonce(seed, bits, batch_start, POW_BATCH)
+                .expect("the winning batch contains a valid nonce");
+            assert!(H::pow_bits(seed, nonce) >= bits);
+            return nonce;
+        }
+        start += window_nonces as u64;
+    }
+    panic!("some nonce meets the difficulty")
 }
 
 pub struct ProverTranscript<H> {
@@ -151,11 +192,14 @@ impl<H: Hasher> ProverTranscript<H> {
     }
 
     pub fn send_fields<F: Field>(&mut self, elements: &[F]) {
-        let mut bytes = vec![0; elements.len() * F::BYTES];
-        for (chunk, element) in bytes.chunks_exact_mut(F::BYTES).zip(elements) {
+        let start = self.proof.len();
+        let len_bytes = elements.len().checked_mul(F::BYTES).expect("encoded fields fit in memory");
+        self.proof.resize(start + len_bytes, 0);
+        for (chunk, element) in self.proof[start..].chunks_exact_mut(F::BYTES).zip(elements) {
             element.write_bytes(chunk);
         }
-        self.send_bytes(&bytes);
+        self.sponge.absorb(&self.proof[start..]);
+        assert!(self.proof.len() == start + len_bytes);
     }
 
     pub fn prove_work(&mut self, bits: u32) {
@@ -203,7 +247,8 @@ impl<'a, H: Hasher> VerifierTranscript<'a, H> {
     }
 
     pub fn read_field<F: Field>(&mut self) -> Result<F> {
-        Ok(self.read_fields(1)?[0])
+        let bytes = self.read_bytes(F::BYTES)?;
+        F::from_bytes(bytes).ok_or(Error::InvalidProof("a field element is not encoded canonically"))
     }
 
     pub fn read_fields<F: Field>(&mut self, count: usize) -> Result<Vec<F>> {
@@ -223,7 +268,7 @@ impl<'a, H: Hasher> VerifierTranscript<'a, H> {
         let mut seed = [0; DIGEST_BYTES];
         self.sponge.squeeze().fill(&mut seed);
         let nonce = u64::from_le_bytes(self.read_bytes(NONCE_BYTES)?.try_into().unwrap());
-        if proof_of_work_bits::<H>(&seed, nonce) < bits {
+        if H::pow_bits(&seed, nonce) < bits {
             return Err(Error::InvalidProof("the proof of work is invalid"));
         }
         Ok(())
