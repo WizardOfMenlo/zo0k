@@ -41,8 +41,10 @@ pub fn verify<F: RsField, H: Hasher>(
     let disclosed = Row::from_fields(stage, &transcript.read_fields(stage.dimension())?);
 
     let FoldedClaim { main, aux, mask, target } = claim;
-    let claim = FoldedClaim { main: main.to_dense(), aux, mask, target };
-    if claim.evaluate(&disclosed) != mask_target + target * combination {
+    let evaluated = main.evaluate(&disclosed.main)
+        + inner_product(&aux, &disclosed.aux)
+        + inner_product(&mask, &disclosed.mask);
+    if evaluated != mask_target + target * combination {
         return Err(Error::InvalidProof("the disclosed row does not satisfy the claim"));
     }
 

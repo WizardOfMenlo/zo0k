@@ -1,4 +1,5 @@
 use std::any::Any;
+use std::cell::UnsafeCell;
 use std::mem::MaybeUninit;
 use std::ops::Range;
 use std::panic::{self, AssertUnwindSafe};
@@ -8,11 +9,63 @@ use std::thread;
 
 pub const THREADS_MAX: usize = 512;
 const PIECES_PER_THREAD: usize = 8;
-const SPIN_ROUNDS: usize = 64;
+const SPIN_PAUSE_ROUNDS: usize = 2048;
+const SPIN_YIELD_ROUNDS: usize = 8;
 const WORKER_STACK_BYTES: usize = 8 << 20;
 
 static THREADS_CHOSEN: AtomicUsize = AtomicUsize::new(0);
 static POOL: OnceLock<Pool> = OnceLock::new();
+
+#[repr(align(128))]
+struct CachePadded<T>(T);
+
+struct SliceMut<T> {
+    ptr: *mut T,
+    len: usize,
+}
+
+unsafe impl<T: Send> Sync for SliceMut<T> {}
+
+impl<T> SliceMut<T> {
+    fn new(slice: &mut [T]) -> Self {
+        assert!(slice.len() <= isize::MAX as usize);
+        let ptr = slice.as_mut_ptr();
+        assert!(!ptr.is_null());
+        Self { ptr, len: slice.len() }
+    }
+
+    #[allow(clippy::mut_from_ref)]
+    unsafe fn range_mut(&self, range: Range<usize>) -> &mut [T] {
+        assert!(range.start <= range.end && range.end <= self.len);
+        let len = range.len();
+        assert!(len <= self.len);
+        unsafe { std::slice::from_raw_parts_mut(self.ptr.add(range.start), len) }
+    }
+}
+
+struct CellSlot<T>(UnsafeCell<Option<T>>);
+
+unsafe impl<T: Send> Sync for CellSlot<T> {}
+
+impl<T> CellSlot<T> {
+    fn new(value: Option<T>) -> Self {
+        Self(UnsafeCell::new(value))
+    }
+
+    unsafe fn take(&self) -> Option<T> {
+        unsafe { (*self.0.get()).take() }
+    }
+
+    unsafe fn set(&self, value: T) {
+        unsafe {
+            *self.0.get() = Some(value);
+        }
+    }
+
+    fn into_inner(self) -> Option<T> {
+        self.0.into_inner()
+    }
+}
 
 pub fn set_threads(threads: usize) {
     assert!(threads <= THREADS_MAX, "at most {THREADS_MAX} threads");
@@ -62,15 +115,15 @@ pub fn map_range<R: Send>(len: usize, piece_len_min: usize, f: impl Fn(usize) ->
     }
     assert!((2..=len).contains(&pieces));
     let mut results: Vec<R> = Vec::with_capacity(len);
-    let slots = split(&mut results.spare_capacity_mut()[..len], 1, pieces);
+    let slots = SliceMut::new(&mut results.spare_capacity_mut()[..len]);
     run(pieces, &|piece| {
-        let start = piece_range(len, pieces, piece).start;
-        let slot: &mut [MaybeUninit<R>] = take(&slots, piece);
+        let range = piece_range(len, pieces, piece);
+        let start = range.start;
+        let slot: &mut [MaybeUninit<R>] = unsafe { slots.range_mut(range) };
         for (offset, result) in slot.iter_mut().enumerate() {
             result.write(f(start + offset));
         }
     });
-    drop(slots);
     assert!(results.capacity() >= len);
     unsafe { results.set_len(len) };
     results
@@ -111,9 +164,12 @@ pub fn for_each_piece_mut<T: Send>(
     if pieces == 1 {
         return f(0, items);
     }
-    let slots = split(items, 1, pieces);
-    assert_eq!(slots.len(), pieces);
-    run(pieces, &|piece| f(piece_range(len, pieces, piece).start, take(&slots, piece)));
+    let slots = SliceMut::new(items);
+    assert!(pieces >= 2);
+    run(pieces, &|piece| {
+        let range = piece_range(len, pieces, piece);
+        f(range.start, unsafe { slots.range_mut(range) });
+    });
 }
 
 pub fn for_each_chunk_mut<T: Send>(
@@ -123,7 +179,8 @@ pub fn for_each_chunk_mut<T: Send>(
     f: impl Fn(usize, &mut [T]) + Sync,
 ) {
     assert!(chunk_len >= 1);
-    let chunks_len = items.len().div_ceil(chunk_len);
+    let len = items.len();
+    let chunks_len = len.div_ceil(chunk_len);
     let pieces = pieces_len(chunks_len, piece_len_min.div_ceil(chunk_len).max(1));
     let visit = |chunk_first: usize, piece: &mut [T]| {
         for (offset, chunk) in piece.chunks_mut(chunk_len).enumerate() {
@@ -133,9 +190,14 @@ pub fn for_each_chunk_mut<T: Send>(
     if pieces == 1 {
         return visit(0, items);
     }
-    let slots = split(items, chunk_len, pieces);
-    assert_eq!(slots.len(), pieces);
-    run(pieces, &|piece| visit(piece_range(chunks_len, pieces, piece).start, take(&slots, piece)));
+    let slots = SliceMut::new(items);
+    assert!(pieces <= chunks_len);
+    run(pieces, &|piece| {
+        let units = piece_range(chunks_len, pieces, piece);
+        let start = units.start.saturating_mul(chunk_len).min(len);
+        let end = units.end.saturating_mul(chunk_len).min(len);
+        visit(units.start, unsafe { slots.range_mut(start..end) });
+    });
 }
 
 pub fn for_each_pair_mut<A: Send, B: Send>(
@@ -144,16 +206,66 @@ pub fn for_each_pair_mut<A: Send, B: Send>(
     piece_len_min: usize,
     f: impl Fn(&mut [A], &mut [B]) + Sync,
 ) {
+    for_each_pair_indexed_mut(a, b, piece_len_min, |_, slice_a, slice_b| f(slice_a, slice_b));
+}
+
+pub(crate) fn for_each_pair_indexed_mut<A: Send, B: Send>(
+    a: &mut [A],
+    b: &mut [B],
+    piece_len_min: usize,
+    f: impl Fn(usize, &mut [A], &mut [B]) + Sync,
+) {
     assert_eq!(a.len(), b.len());
-    let pieces = pieces_len(a.len(), piece_len_min);
+    let len = a.len();
+    let pieces = pieces_len(len, piece_len_min);
     assert!(pieces >= 1);
     if pieces == 1 {
-        return f(a, b);
+        return f(0, a, b);
     }
-    let slots_a = split(a, 1, pieces);
-    let slots_b = split(b, 1, pieces);
-    assert_eq!(slots_a.len(), slots_b.len());
-    run(pieces, &|piece| f(take(&slots_a, piece), take(&slots_b, piece)));
+    let slots_a = SliceMut::new(a);
+    let slots_b = SliceMut::new(b);
+    run(pieces, &|piece| {
+        let range = piece_range(len, pieces, piece);
+        let start = range.start;
+        f(start, unsafe { slots_a.range_mut(range.clone()) }, unsafe { slots_b.range_mut(range) });
+    });
+}
+
+pub(crate) fn map_four_mut<T: Send, R: Send>(
+    a: &mut [T],
+    b: &mut [T],
+    c: &mut [T],
+    d: &mut [T],
+    piece_len_min: usize,
+    f: impl Fn(usize, &mut [T], &mut [T], &mut [T], &mut [T]) -> R + Sync,
+) -> Vec<R> {
+    let len = a.len();
+    assert!(b.len() == len && c.len() == len && d.len() == len);
+    let pieces = pieces_len(len, piece_len_min);
+    assert!(pieces >= 1);
+    if pieces == 1 {
+        return vec![f(0, a, b, c, d)];
+    }
+    let slots_a = SliceMut::new(a);
+    let slots_b = SliceMut::new(b);
+    let slots_c = SliceMut::new(c);
+    let slots_d = SliceMut::new(d);
+    let mut results: Vec<R> = Vec::with_capacity(pieces);
+    let out = SliceMut::new(&mut results.spare_capacity_mut()[..pieces]);
+    run(pieces, &|piece| {
+        let range = piece_range(len, pieces, piece);
+        let value = f(
+            range.start,
+            unsafe { slots_a.range_mut(range.clone()) },
+            unsafe { slots_b.range_mut(range.clone()) },
+            unsafe { slots_c.range_mut(range.clone()) },
+            unsafe { slots_d.range_mut(range) },
+        );
+        unsafe { out.range_mut(piece..piece + 1)[0].write(value) };
+    });
+    assert!(results.capacity() >= pieces);
+    unsafe { results.set_len(pieces) };
+    results
 }
 
 pub fn join<RA: Send, RB: Send>(a: impl FnOnce() -> RA + Send, b: impl FnOnce() -> RB + Send) -> (RA, RB) {
@@ -162,21 +274,21 @@ pub fn join<RA: Send, RB: Send>(a: impl FnOnce() -> RA + Send, b: impl FnOnce() 
     if threads == 1 {
         return (a(), b());
     }
-    let tasks = (Mutex::new(Some(a)), Mutex::new(Some(b)));
-    let results = (Mutex::new(None), Mutex::new(None));
+    let tasks = (CellSlot::new(Some(a)), CellSlot::new(Some(b)));
+    let results = (CellSlot::new(None), CellSlot::new(None));
     run(2, &|index| {
         assert!(index < 2);
         if index == 0 {
-            let task = lock(&tasks.0).take().expect("the first task runs once");
-            *lock(&results.0) = Some(task());
+            let task = unsafe { tasks.0.take() }.expect("the first task runs once");
+            unsafe { results.0.set(task()) };
         } else {
-            let task = lock(&tasks.1).take().expect("the second task runs once");
-            *lock(&results.1) = Some(task());
+            let task = unsafe { tasks.1.take() }.expect("the second task runs once");
+            unsafe { results.1.set(task()) };
         }
     });
-    let first = results.0.into_inner().unwrap_or_else(PoisonError::into_inner);
-    let second = results.1.into_inner().unwrap_or_else(PoisonError::into_inner);
-    (first.expect("the first task ran"), second.expect("the second task ran"))
+    let first = results.0.into_inner().expect("the first task ran");
+    let second = results.1.into_inner().expect("the second task ran");
+    (first, second)
 }
 
 pub fn find_first(
@@ -186,20 +298,24 @@ pub fn find_first(
 ) -> Option<usize> {
     let len = range.len();
     let pieces = pieces_len(len, piece_len_min);
-    let found = AtomicUsize::new(usize::MAX);
+    let found = CachePadded(AtomicUsize::new(usize::MAX));
     let search = |piece: usize| {
-        for offset in piece_range(len, pieces, piece) {
-            if offset >= found.load(Ordering::Relaxed) {
+        let sub = piece_range(len, pieces, piece);
+        if sub.start >= found.0.load(Ordering::Relaxed) {
+            return;
+        }
+        for offset in sub {
+            if offset >= found.0.load(Ordering::Relaxed) {
                 return;
             }
             if predicate(range.start + offset) {
-                found.fetch_min(offset, Ordering::Relaxed);
+                found.0.fetch_min(offset, Ordering::Relaxed);
                 return;
             }
         }
     };
     run(pieces, &search);
-    let offset = found.into_inner();
+    let offset = found.0.into_inner();
     assert!(offset == usize::MAX || offset < len);
     (offset < len).then(|| range.start + offset)
 }
@@ -223,30 +339,6 @@ fn piece_range(len: usize, pieces: usize, piece: usize) -> Range<usize> {
     let end = (piece + 1) * len / pieces;
     assert!(start <= end && end <= len);
     start..end
-}
-
-type Slots<'a, T> = Vec<Mutex<Option<&'a mut [T]>>>;
-
-fn split<T>(items: &mut [T], unit_len: usize, pieces: usize) -> Slots<'_, T> {
-    assert!(unit_len >= 1 && pieces >= 1);
-    let units_len = items.len().div_ceil(unit_len);
-    let mut slots = Vec::with_capacity(pieces);
-    let mut rest = items;
-    for piece in 0..pieces {
-        let piece_len = (piece_range(units_len, pieces, piece).len() * unit_len).min(rest.len());
-        let (head, tail) = std::mem::take(&mut rest).split_at_mut(piece_len);
-        slots.push(Mutex::new(Some(head)));
-        rest = tail;
-    }
-    assert!(rest.is_empty());
-    assert_eq!(slots.len(), pieces);
-    slots
-}
-
-fn take<'a, T>(slots: &[Mutex<Option<&'a mut [T]>>], piece: usize) -> &'a mut [T] {
-    assert!(piece < slots.len());
-    let slice = lock(&slots[piece]).take();
-    slice.expect("every piece is taken once")
 }
 
 fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
@@ -273,19 +365,22 @@ fn run(tasks_len: usize, task: &(dyn Fn(usize) + Sync)) {
     pool.prune();
     pool.help_until_finished(&job);
     assert!(job.is_finished());
-    let payload = lock(&job.panic).take();
-    if let Some(payload) = payload {
-        panic::resume_unwind(payload);
+    if job.panicked.load(Ordering::Acquire) {
+        let payload = lock(&job.panic).take();
+        if let Some(payload) = payload {
+            panic::resume_unwind(payload);
+        }
     }
 }
 
 struct Job {
     task: *const (dyn Fn(usize) + Sync + 'static),
     tasks_len: usize,
-    claimed: AtomicUsize,
-    finished: AtomicUsize,
-    waiter_sleeping: AtomicBool,
+    panicked: AtomicBool,
     panic: Mutex<Option<Box<dyn Any + Send>>>,
+    claimed: CachePadded<AtomicUsize>,
+    finished: CachePadded<AtomicUsize>,
+    waiter_sleeping: CachePadded<AtomicBool>,
 }
 
 unsafe impl Send for Job {}
@@ -304,19 +399,20 @@ impl Job {
         Self {
             task,
             tasks_len,
-            claimed: AtomicUsize::new(0),
-            finished: AtomicUsize::new(0),
-            waiter_sleeping: AtomicBool::new(false),
+            panicked: AtomicBool::new(false),
             panic: Mutex::new(None),
+            claimed: CachePadded(AtomicUsize::new(0)),
+            finished: CachePadded(AtomicUsize::new(0)),
+            waiter_sleeping: CachePadded(AtomicBool::new(false)),
         }
     }
 
     fn is_exhausted(&self) -> bool {
-        self.claimed.load(Ordering::Relaxed) >= self.tasks_len
+        self.claimed.0.load(Ordering::Relaxed) >= self.tasks_len
     }
 
     fn is_finished(&self) -> bool {
-        let finished = self.finished.load(Ordering::SeqCst);
+        let finished = self.finished.0.load(Ordering::SeqCst);
         assert!(finished <= self.tasks_len);
         finished == self.tasks_len
     }
@@ -332,7 +428,7 @@ struct Pool {
     queue: Mutex<Queue>,
     wake: Condvar,
     parked: Condvar,
-    jobs_len: AtomicUsize,
+    jobs_len: CachePadded<AtomicUsize>,
     workers_len: AtomicUsize,
 }
 
@@ -341,7 +437,7 @@ fn pool() -> &'static Pool {
         queue: Mutex::new(Queue { jobs: Vec::new(), sleepers: 0, workers_len: 0 }),
         wake: Condvar::new(),
         parked: Condvar::new(),
-        jobs_len: AtomicUsize::new(0),
+        jobs_len: CachePadded(AtomicUsize::new(0)),
         workers_len: AtomicUsize::new(0),
     });
     let workers_needed = threads() - 1;
@@ -379,34 +475,44 @@ impl Pool {
 
     fn push(&self, job: &Arc<Job>) {
         assert!(!job.is_exhausted());
-        let wakes = {
+        let (wakes, notify_all) = {
             let mut queue = lock(&self.queue);
             queue.jobs.push(Arc::clone(job));
-            self.jobs_len.store(queue.jobs.len(), Ordering::Release);
-            queue.sleepers.min(job.tasks_len - 1)
+            self.jobs_len.0.store(queue.jobs.len(), Ordering::Release);
+            let wakes = queue.sleepers.min(job.tasks_len - 1);
+            (wakes, wakes > 1 && wakes == queue.sleepers)
         };
         assert!(wakes < THREADS_MAX);
-        for _ in 0..wakes {
-            self.wake.notify_one();
+        if notify_all {
+            self.wake.notify_all();
+        } else {
+            for _ in 0..wakes {
+                self.wake.notify_one();
+            }
         }
     }
 
     fn take_job(&self, queue: &mut Queue) -> Option<Arc<Job>> {
-        queue.jobs.retain(|job| !job.is_exhausted());
-        self.jobs_len.store(queue.jobs.len(), Ordering::Release);
+        if queue.jobs.first().is_some_and(|job| job.is_exhausted()) {
+            queue.jobs.retain(|job| !job.is_exhausted());
+            self.jobs_len.0.store(queue.jobs.len(), Ordering::Release);
+        }
         let job = queue.jobs.first().cloned();
         assert!(job.as_ref().is_none_or(|job| job.tasks_len >= 2));
         job
     }
 
     fn prune(&self) {
+        if self.jobs_len.0.load(Ordering::Acquire) == 0 {
+            return;
+        }
         let mut queue = lock(&self.queue);
         queue.jobs.retain(|job| !job.is_exhausted());
-        self.jobs_len.store(queue.jobs.len(), Ordering::Release);
+        self.jobs_len.0.store(queue.jobs.len(), Ordering::Release);
     }
 
     fn try_take_job(&self) -> Option<Arc<Job>> {
-        if self.jobs_len.load(Ordering::Acquire) == 0 {
+        if self.jobs_len.0.load(Ordering::Acquire) == 0 {
             return None;
         }
         self.take_job(&mut lock(&self.queue))
@@ -414,21 +520,26 @@ impl Pool {
 
     fn execute(&self, job: &Job) {
         assert!(job.tasks_len >= 2);
+        let mut completed = 0usize;
         for _ in 0..job.tasks_len {
-            let index = job.claimed.fetch_add(1, Ordering::Relaxed);
+            let index = job.claimed.0.fetch_add(1, Ordering::Relaxed);
             if index >= job.tasks_len {
-                return;
+                break;
             }
             let task = unsafe { &*job.task };
             if let Err(payload) = panic::catch_unwind(AssertUnwindSafe(|| task(index))) {
                 let mut slot = lock(&job.panic);
                 if slot.is_none() {
                     *slot = Some(payload);
+                    job.panicked.store(true, Ordering::Release);
                 }
             }
-            let finished = job.finished.fetch_add(1, Ordering::SeqCst) + 1;
+            completed += 1;
+        }
+        if completed > 0 {
+            let finished = job.finished.0.fetch_add(completed, Ordering::SeqCst) + completed;
             assert!(finished <= job.tasks_len);
-            if finished == job.tasks_len && job.waiter_sleeping.load(Ordering::SeqCst) {
+            if finished == job.tasks_len && job.waiter_sleeping.0.load(Ordering::SeqCst) {
                 let _queue = lock(&self.queue);
                 self.wake.notify_all();
             }
@@ -443,15 +554,34 @@ impl Pool {
         }
     }
 
-    fn next_job(&self, worker: usize) -> Arc<Job> {
+    fn spin_for_job(&self, worker: usize) -> Option<Arc<Job>> {
         assert!(worker < THREADS_MAX);
-        for _ in 0..SPIN_ROUNDS {
-            if is_active(worker)
-                && let Some(job) = self.try_take_job()
-            {
-                return job;
+        if !is_active(worker) {
+            return None;
+        }
+        for _ in 0..SPIN_PAUSE_ROUNDS {
+            if let Some(job) = self.try_take_job() {
+                return Some(job);
+            }
+            std::hint::spin_loop();
+        }
+        for _ in 0..SPIN_YIELD_ROUNDS {
+            if !is_active(worker) {
+                return None;
+            }
+            if let Some(job) = self.try_take_job() {
+                return Some(job);
             }
             thread::yield_now();
+        }
+        assert!(worker < THREADS_MAX);
+        None
+    }
+
+    fn next_job(&self, worker: usize) -> Arc<Job> {
+        assert!(worker < THREADS_MAX);
+        if let Some(job) = self.spin_for_job(worker) {
+            return job;
         }
         let mut queue = lock(&self.queue);
         loop {
@@ -477,7 +607,10 @@ impl Pool {
             if let Some(other) = self.try_take_job() {
                 self.execute(&other);
                 idle_rounds = 0;
-            } else if idle_rounds < SPIN_ROUNDS {
+            } else if idle_rounds < SPIN_PAUSE_ROUNDS {
+                idle_rounds += 1;
+                std::hint::spin_loop();
+            } else if idle_rounds < SPIN_PAUSE_ROUNDS + SPIN_YIELD_ROUNDS {
                 idle_rounds += 1;
                 thread::yield_now();
             } else {
@@ -493,7 +626,7 @@ impl Pool {
         if self.take_job(&mut queue).is_some() {
             return;
         }
-        job.waiter_sleeping.store(true, Ordering::SeqCst);
+        job.waiter_sleeping.0.store(true, Ordering::SeqCst);
         if job.is_finished() {
             return;
         }
