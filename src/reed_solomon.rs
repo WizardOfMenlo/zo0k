@@ -57,7 +57,37 @@ const BASIS_SIZE: usize = 32;
 const PARALLEL_THRESHOLD: usize = 1 << 14;
 const MIN_PIECE: usize = 1 << 13;
 const L1_BLOCK: usize = 2048;
+const RADIX8_OUTER_MIN: usize = 1 << 17;
+const NOVEL_SMALL: usize = 256;
 const NOVEL_TILE: usize = 1024;
+
+const fn build_novel_offsets() -> [([usize; BASIS_SIZE], usize); BASIS_SIZE] {
+    let mut table = [([0usize; BASIS_SIZE], 0usize); BASIS_SIZE];
+    let mut m = 0usize;
+    while m < BASIS_SIZE {
+        let mut len = 0usize;
+        let mut j = 0usize;
+        while j < m {
+            if j & m == j {
+                table[m].0[len] = 1usize << j;
+                len += 1;
+            }
+            j += 1;
+        }
+        table[m].1 = len;
+        m += 1;
+    }
+    table
+}
+
+const NOVEL_OFFSETS: [([usize; BASIS_SIZE], usize); BASIS_SIZE] = build_novel_offsets();
+
+#[inline(always)]
+fn novel_offsets(m: usize) -> &'static [usize] {
+    debug_assert!(m < BASIS_SIZE);
+    let (ref arr, len) = NOVEL_OFFSETS[m];
+    &arr[..len]
+}
 
 struct Domain {
     byte_tables: Box<[[u128; 256]; BASIS_SIZE / 8]>,
@@ -126,6 +156,32 @@ fn copy_to_uninit<T: Copy>(dst: &mut [MaybeUninit<T>], src: &[T]) {
     assert_eq!(dst.len(), src.len());
 }
 
+fn evaluate_octants<F: BinaryField>(full: &mut [F], start: usize, len: usize, allow_parallel: bool) {
+    let size = full.len();
+    assert!(size >= 8 && size.is_power_of_two() && start + size <= len);
+    let e = size / 8;
+    if !allow_parallel || size < 4 * PARALLEL_THRESHOLD {
+        for (k, chunk) in full.chunks_exact_mut(e).enumerate() {
+            evaluate_full(chunk, start + k * e, len, allow_parallel);
+        }
+        return;
+    }
+    let half = size / 2;
+    let (lo, hi) = full.split_at_mut(half);
+    parallel::join(
+        || {
+            for (k, chunk) in lo.chunks_exact_mut(e).enumerate() {
+                evaluate_full(chunk, start + k * e, len, true);
+            }
+        },
+        || {
+            for (k, chunk) in hi.chunks_exact_mut(e).enumerate() {
+                evaluate_full(chunk, start + half + k * e, len, true);
+            }
+        },
+    );
+}
+
 fn evaluate_half_from_novel<F: BinaryField>(
     novel_low: &[F],
     novel_high: &[F],
@@ -140,38 +196,92 @@ fn evaluate_half_from_novel<F: BinaryField>(
     assert!(novel_low.len() == half && novel_high.len() <= half);
     let domain = Domain::get();
     let w_eff = domain.point(half_index);
+    let p2 = domain.byte_tables[0][2];
+    let p4 = domain.byte_tables[0][4];
+    if half >= RADIX8_OUTER_MIN && start + half <= len && (!allow_parallel || half < 8 * PARALLEL_THRESHOLD) {
+        let w4 = domain.point(2 * half_index);
+        let w2_0 = domain.point(4 * half_index);
+        let w1_0 = domain.point(8 * half_index);
+        let w1 = [w1_0, w1_0 ^ p2, w1_0 ^ p4, w1_0 ^ p2 ^ p4];
+        F::copy_half_radix8_uninit(novel_low, novel_high, dst, w_eff, w4, [w2_0, w2_0 ^ p2], w1);
+        let full = unsafe { slice::from_raw_parts_mut(dst.as_mut_ptr().cast::<F>(), half) };
+        evaluate_octants(full, start, len, allow_parallel);
+        return;
+    }
     if half >= 4 && start + half <= len && (!allow_parallel || half < 4 * PARALLEL_THRESHOLD) {
         let q = half / 4;
         let w = domain.point(2 * half_index);
         let w0 = domain.point(4 * half_index);
-        let w1 = w0 ^ domain.byte_tables[0][2];
-        F::copy_half_radix4_uninit(novel_low, novel_high, dst, w_eff, w, w0, w1);
+        F::copy_half_radix4_uninit(novel_low, novel_high, dst, w_eff, w, w0, w0 ^ p2);
         let full = unsafe { slice::from_raw_parts_mut(dst.as_mut_ptr().cast::<F>(), half) };
-        let (low, high) = full.split_at_mut(2 * q);
-        let (v0, v1) = low.split_at_mut(q);
-        let (v2, v3) = high.split_at_mut(q);
-        if !allow_parallel || 2 * q < PARALLEL_THRESHOLD {
-            evaluate_full(v0, start, len, allow_parallel);
-            evaluate_full(v1, start + q, len, allow_parallel);
-            evaluate_full(v2, start + 2 * q, len, allow_parallel);
-            evaluate_full(v3, start + 3 * q, len, allow_parallel);
-        } else {
-            parallel::join(
-                || {
-                    evaluate_full(v0, start, len, true);
-                    evaluate_full(v1, start + q, len, true);
-                },
-                || {
-                    evaluate_full(v2, start + 2 * q, len, true);
-                    evaluate_full(v3, start + 3 * q, len, true);
-                },
-            );
+        for (k, chunk) in full.chunks_exact_mut(q).enumerate() {
+            evaluate_full(chunk, start + k * q, len, allow_parallel);
         }
         return;
     }
     F::copy_half_uninit(novel_low, novel_high, dst, w_eff);
     let full = unsafe { slice::from_raw_parts_mut(dst.as_mut_ptr().cast::<F>(), half) };
     evaluate_full(full, start, len, allow_parallel);
+}
+
+fn prepare_novel_top<F: BinaryField>(
+    parts: &[&[F]],
+    count: usize,
+    block: usize,
+    padded: usize,
+) -> (Vec<F>, Vec<F>) {
+    assert!(count >= 2 && block >= 4 && padded >= block);
+    let half = block / 2;
+    let mut values: Vec<F> = Vec::with_capacity(padded);
+    let spare = &mut values.spare_capacity_mut()[..padded];
+    let mut offset = 0;
+    for part in parts {
+        copy_to_uninit(&mut spare[offset..offset + part.len()], part);
+        offset += part.len();
+    }
+    assert_eq!(offset, count);
+    let first_init = unsafe { slice::from_raw_parts_mut(spare.as_mut_ptr().cast::<F>(), count) };
+    novel_top_step(first_init, half, false);
+    let mut quotient = first_init[half..count].to_vec();
+    to_novel_basis_slice(&mut quotient, half, false);
+    novel_top_step(&mut first_init[..half], half / 2, false);
+    (values, quotient)
+}
+
+fn finish_batch_novel<F: BinaryField>(buffers: &mut [Vec<F>], half: usize) {
+    assert!(!buffers.is_empty() && half >= 4 && half.is_power_of_two());
+    let quarter = half / 2;
+    let mut tasks: Vec<&mut [F]> = Vec::with_capacity(buffers.len() * 2);
+    for buf in buffers.iter_mut() {
+        let h0 = unsafe { slice::from_raw_parts_mut(buf.as_mut_ptr(), half) };
+        let (lo, hi) = h0.split_at_mut(quarter);
+        tasks.push(lo);
+        tasks.push(hi);
+    }
+    assert_eq!(tasks.len(), buffers.len() * 2);
+    parallel::for_each_piece_mut(&mut tasks, 1, |_, piece| {
+        for slice in piece {
+            to_novel_basis_slice(slice, quarter, false);
+        }
+    });
+}
+
+fn novel_top_step<F: Field>(coefficients: &mut [F], half: usize, allow_parallel: bool) {
+    let count = coefficients.len();
+    assert!(half >= 1 && half.is_power_of_two() && count > half && count <= 2 * half);
+    let offsets = novel_offsets(half.trailing_zeros() as usize);
+    let gap = half - offsets.last().copied().unwrap_or(0);
+    assert!(gap >= 1);
+    let mut end = count;
+    for _ in 0..count {
+        if end <= half {
+            break;
+        }
+        let start = half.max(end.saturating_sub(gap));
+        xor_offsets_range(coefficients, start, end, half, offsets, allow_parallel);
+        end = start;
+    }
+    assert_eq!(end, half);
 }
 
 fn prepare_novel_buffer<F: BinaryField>(
@@ -276,12 +386,20 @@ fn encode_batch<F: BinaryField, const P: usize>(rows: &[[&[F]; P]], len: usize) 
         return parallel::map_range(rows.len(), 1, |row| encode_parts(&rows[row], len, allow_inner));
     }
     let padded = num_halves * half;
+    let split_novel = half >= 2 * PARALLEL_THRESHOLD;
     let prepared: Vec<(Vec<F>, Vec<F>)> = parallel::map_range(rows.len(), 1, |row| {
         let row_count: usize = rows[row].iter().map(|part| part.len()).sum();
         assert_eq!(row_count, count);
-        prepare_novel_buffer(&rows[row], count, block, padded, false)
+        if split_novel {
+            prepare_novel_top(&rows[row], count, block, padded)
+        } else {
+            prepare_novel_buffer(&rows[row], count, block, padded, false)
+        }
     });
     let (mut buffers, quotients): (Vec<Vec<F>>, Vec<Vec<F>>) = prepared.into_iter().unzip();
+    if split_novel {
+        finish_batch_novel(&mut buffers, half);
+    }
     {
         let mut novel_lows: Vec<&[F]> = Vec::with_capacity(buffers.len());
         let mut half_tasks: Vec<(usize, usize, &mut [MaybeUninit<F>])> =
@@ -317,20 +435,6 @@ fn encode_batch<F: BinaryField, const P: usize>(rows: &[[&[F]; P]], len: usize) 
     }
     assert_eq!(buffers.len(), rows.len());
     buffers
-}
-
-fn compute_offsets(m: usize) -> ([usize; BASIS_SIZE], usize) {
-    assert!(m < BASIS_SIZE);
-    let mut offsets = [0usize; BASIS_SIZE];
-    let mut len = 0usize;
-    for j in 0..m {
-        if j & m == j {
-            offsets[len] = 1 << j;
-            len += 1;
-        }
-    }
-    assert!(len <= m);
-    (offsets, len)
 }
 
 fn xor_offsets_range<F: Field>(
@@ -370,35 +474,74 @@ fn xor_offsets_range<F: Field>(
     assert!(tiles * NOVEL_TILE >= span);
 }
 
+#[inline(always)]
+fn to_novel_8<F: Field>(c: &mut [F; 8]) {
+    let (lo, hi) = c.split_at_mut(5);
+    F::xor_slice(&mut lo[2..5], hi);
+    c[1] += c[4];
+    c[2] += c[3];
+    c[1] += c[2];
+    c[6] += c[7];
+    c[5] += c[6];
+}
+
+fn to_novel_basis_small<F: Field>(coefficients: &mut [F]) {
+    let total = coefficients.len();
+    assert!((4..=NOVEL_SMALL).contains(&total) && total.is_power_of_two());
+    if total == 4 {
+        coefficients[2] += coefficients[3];
+        coefficients[1] += coefficients[2];
+        return;
+    }
+    let mut size = total;
+    for _ in 0..10 {
+        if size <= 8 {
+            break;
+        }
+        let half = size / 2;
+        let offsets = novel_offsets(half.trailing_zeros() as usize);
+        let gap = half - offsets.last().copied().unwrap_or(0);
+        for chunk in coefficients.chunks_exact_mut(size) {
+            let mut end = size;
+            for _ in 0..size {
+                if end <= half {
+                    break;
+                }
+                let start = half.max(end.saturating_sub(gap));
+                let span = end - start;
+                let (target_all, source_all) = chunk.split_at_mut(start);
+                let src = &source_all[..span];
+                let base = start - half;
+                for &offset in offsets {
+                    F::xor_slice(&mut target_all[base + offset..base + offset + span], src);
+                }
+                end = start;
+            }
+        }
+        size = half;
+    }
+    assert_eq!(size, 8);
+    let (blocks, remainder) = coefficients.as_chunks_mut::<8>();
+    assert!(remainder.is_empty());
+    for block in blocks {
+        to_novel_8(block);
+    }
+}
+
 fn to_novel_basis_slice<F: Field>(coefficients: &mut [F], block: usize, allow_parallel: bool) {
     let count = coefficients.len();
     assert!(block.is_power_of_two() && count <= block);
     if block <= 2 || count <= 2 {
         return;
     }
-    if block == 4 && count == 4 {
-        coefficients[2] += coefficients[3];
-        coefficients[1] += coefficients[2];
-        return;
-    }
-    if block == 8 && count == 8 {
-        coefficients[2] += coefficients[5];
-        coefficients[3] += coefficients[6];
-        coefficients[4] += coefficients[7];
-        coefficients[1] += coefficients[4];
-        coefficients[2] += coefficients[3];
-        coefficients[1] += coefficients[2];
-        coefficients[6] += coefficients[7];
-        coefficients[5] += coefficients[6];
-        return;
+    if count == block && block <= NOVEL_SMALL {
+        return to_novel_basis_small(coefficients);
     }
     let half = block / 2;
     if count <= half {
         return to_novel_basis_slice(coefficients, half, allow_parallel);
     }
-    let m = half.trailing_zeros() as usize;
-    let (offsets, offsets_len) = compute_offsets(m);
-    let offsets = &offsets[..offsets_len];
+    let offsets = novel_offsets(half.trailing_zeros() as usize);
     let gap = half - offsets.last().copied().unwrap_or(0);
     assert!(gap >= 1);
     let mut end = count;
@@ -423,6 +566,31 @@ fn to_novel_basis_slice<F: Field>(coefficients: &mut [F], block: usize, allow_pa
     }
 }
 
+fn evaluate_quarters<F: BinaryField>(full: &mut [F], start: usize, len: usize, allow_parallel: bool) {
+    let size = full.len();
+    assert!(size >= 4 && size.is_power_of_two() && start + size <= len);
+    let q = size / 4;
+    if !allow_parallel || 2 * q < PARALLEL_THRESHOLD {
+        for (k, chunk) in full.chunks_exact_mut(q).enumerate() {
+            evaluate_full(chunk, start + k * q, len, allow_parallel);
+        }
+        return;
+    }
+    let (lo, hi) = full.split_at_mut(2 * q);
+    let (v0, v1) = lo.split_at_mut(q);
+    let (v2, v3) = hi.split_at_mut(q);
+    parallel::join(
+        || {
+            evaluate_full(v0, start, len, true);
+            evaluate_full(v1, start + q, len, true);
+        },
+        || {
+            evaluate_full(v2, start + 2 * q, len, true);
+            evaluate_full(v3, start + 3 * q, len, true);
+        },
+    );
+}
+
 fn evaluate_full<F: BinaryField>(values: &mut [F], start: usize, len: usize, allow_parallel: bool) {
     let size = values.len();
     assert!(size.is_power_of_two() && start < len);
@@ -431,6 +599,19 @@ fn evaluate_full<F: BinaryField>(values: &mut [F], start: usize, len: usize, all
     }
     if size <= L1_BLOCK && start + size <= len {
         return evaluate_l1(values, start);
+    }
+    if start + size <= len && size >= RADIX8_OUTER_MIN && (!allow_parallel || size < 8 * PARALLEL_THRESHOLD) {
+        let e = size / 8;
+        let domain = Domain::get();
+        let p2 = domain.byte_tables[0][2];
+        let p4 = domain.byte_tables[0][4];
+        let w4 = domain.point(start / (4 * e));
+        let w2_0 = domain.point(start / (2 * e));
+        let w1_0 = domain.point(start / e);
+        let w1 = [w1_0, w1_0 ^ p2, w1_0 ^ p4, w1_0 ^ p2 ^ p4];
+        F::butterfly_radix8_outer(values, w4, w2_0, w2_0 ^ p2, w1);
+        evaluate_octants(values, start, len, allow_parallel);
+        return;
     }
     if start + size <= len && size >= 4 && (!allow_parallel || size < 4 * PARALLEL_THRESHOLD) {
         let quarter = size / 4;
@@ -442,23 +623,7 @@ fn evaluate_full<F: BinaryField>(values: &mut [F], start: usize, len: usize, all
         let (v0, v1) = low.split_at_mut(quarter);
         let (v2, v3) = high.split_at_mut(quarter);
         F::butterfly_radix4(v0, v1, v2, v3, w, w0, w1);
-        if !allow_parallel || 2 * quarter < PARALLEL_THRESHOLD {
-            evaluate_full(v0, start, len, allow_parallel);
-            evaluate_full(v1, start + quarter, len, allow_parallel);
-            evaluate_full(v2, start + 2 * quarter, len, allow_parallel);
-            evaluate_full(v3, start + 3 * quarter, len, allow_parallel);
-        } else {
-            parallel::join(
-                || {
-                    evaluate_full(v0, start, len, true);
-                    evaluate_full(v1, start + quarter, len, true);
-                },
-                || {
-                    evaluate_full(v2, start + 2 * quarter, len, true);
-                    evaluate_full(v3, start + 3 * quarter, len, true);
-                },
-            );
-        }
+        evaluate_quarters(values, start, len, allow_parallel);
         return;
     }
     let half = size / 2;
@@ -483,11 +648,28 @@ fn evaluate_full<F: BinaryField>(values: &mut [F], start: usize, len: usize, all
     }
 }
 
+fn evaluate_l1_radix4<F: BinaryField>(values: &mut [F], start: usize, half: usize) {
+    assert!(half >= 2 && half.is_power_of_two() && values.len().is_multiple_of(2 * half));
+    let domain = Domain::get();
+    let p2 = domain.byte_tables[0][2];
+    let quarter = half / 2;
+    let base_w = domain.point(start / half);
+    let base_w0 = domain.point(start / quarter);
+    for (i, block) in values.chunks_exact_mut(2 * half).enumerate() {
+        let w = base_w ^ domain.point_small(2 * i);
+        let w0 = base_w0 ^ domain.point_small(4 * i);
+        let (low, high) = block.split_at_mut(half);
+        let (v0, v1) = low.split_at_mut(quarter);
+        let (v2, v3) = high.split_at_mut(quarter);
+        F::butterfly_radix4(v0, v1, v2, v3, w, w0, w0 ^ p2);
+    }
+    assert!(quarter >= 1);
+}
+
 fn evaluate_l1<F: BinaryField>(values: &mut [F], start: usize) {
     let size = values.len();
     assert!((2..=L1_BLOCK).contains(&size) && size.is_power_of_two());
     let domain = Domain::get();
-    let p2 = domain.byte_tables[0][2];
     let mut half = size / 2;
     if half == 1 {
         let (low, high) = values.split_at_mut(1);
@@ -495,20 +677,14 @@ fn evaluate_l1<F: BinaryField>(values: &mut [F], start: usize) {
         return;
     }
     if half == 2 {
-        let w = domain.point(start / 2);
-        let w0 = domain.point(start);
-        let (low, high) = values.split_at_mut(2);
-        let (v0, v1) = low.split_at_mut(1);
-        let (v2, v3) = high.split_at_mut(1);
-        F::butterfly_radix4(v0, v1, v2, v3, w, w0, w0 ^ p2);
+        evaluate_l1_radix4(values, start, 2);
         return;
     }
     if half >= 8 && !half.trailing_zeros().is_multiple_of(2) {
         let base = domain.point(start / half);
         for (i, block) in values.chunks_exact_mut(2 * half).enumerate() {
-            let twiddle = base ^ domain.point_small(2 * i);
             let (low, high) = block.split_at_mut(half);
-            F::butterfly_slice(low, high, twiddle);
+            F::butterfly_slice(low, high, base ^ domain.point_small(2 * i));
         }
         half /= 2;
     }
@@ -516,17 +692,7 @@ fn evaluate_l1<F: BinaryField>(values: &mut [F], start: usize) {
         if half < 8 {
             break;
         }
-        let quarter = half / 2;
-        let base_w = domain.point(start / half);
-        let base_w0 = domain.point(start / quarter);
-        for (i, block) in values.chunks_exact_mut(2 * half).enumerate() {
-            let w = base_w ^ domain.point_small(2 * i);
-            let w0 = base_w0 ^ domain.point_small(4 * i);
-            let (low, high) = block.split_at_mut(half);
-            let (v0, v1) = low.split_at_mut(quarter);
-            let (v2, v3) = high.split_at_mut(quarter);
-            F::butterfly_radix4(v0, v1, v2, v3, w, w0, w0 ^ p2);
-        }
+        evaluate_l1_radix4(values, start, half);
         half /= 4;
     }
     assert_eq!(half, 4);

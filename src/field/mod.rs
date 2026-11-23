@@ -206,6 +206,45 @@ pub trait BinaryField: Field {
         unreachable!("implemented for concrete binary fields");
     }
 
+    fn butterfly_radix8_outer(values: &mut [Self], w4: u128, w2_0: u128, w2_1: u128, w1: [u128; 4]) {
+        let len = values.len();
+        assert!(len >= 8 && len.is_multiple_of(8));
+        let half = len / 2;
+        let q = len / 4;
+        let e = len / 8;
+        let (lo, hi) = values.split_at_mut(half);
+        Self::butterfly_slice(lo, hi, w4);
+        let (v01, v23) = lo.split_at_mut(q);
+        let (v45, v67) = hi.split_at_mut(q);
+        Self::butterfly_slice(v01, v23, w2_0);
+        Self::butterfly_slice(v45, v67, w2_1);
+        let (v0, v1) = v01.split_at_mut(e);
+        let (v2, v3) = v23.split_at_mut(e);
+        let (v4, v5) = v45.split_at_mut(e);
+        let (v6, v7) = v67.split_at_mut(e);
+        Self::butterfly_slice(v0, v1, w1[0]);
+        Self::butterfly_slice(v2, v3, w1[1]);
+        Self::butterfly_slice(v4, v5, w1[2]);
+        Self::butterfly_slice(v6, v7, w1[3]);
+        assert_eq!(v7.len(), e);
+    }
+
+    fn copy_half_radix8_uninit(
+        novel_low: &[Self],
+        novel_high: &[Self],
+        dst: &mut [MaybeUninit<Self>],
+        w_eff: u128,
+        w4: u128,
+        w2: [u128; 2],
+        w1: [u128; 4],
+    ) {
+        assert!(dst.len() >= 8 && dst.len().is_multiple_of(8));
+        Self::copy_half_uninit(novel_low, novel_high, dst, w_eff);
+        let full = unsafe { std::slice::from_raw_parts_mut(dst.as_mut_ptr().cast::<Self>(), dst.len()) };
+        Self::butterfly_radix8_outer(full, w4, w2[0], w2[1], w1);
+        assert_eq!(full.len(), novel_low.len());
+    }
+
     fn copy_half_radix4_uninit(
         novel_low: &[Self],
         novel_high: &[Self],

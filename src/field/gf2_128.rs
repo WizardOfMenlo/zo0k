@@ -212,11 +212,21 @@ impl Field for Gf2_128 {
     }
 
     fn xor_slice(dst: &mut [Self], src: &[Self]) {
-        assert_eq!(dst.len(), src.len());
-        for (d, s) in dst.iter_mut().zip(src) {
-            d.0 ^= s.0;
+        let len = dst.len();
+        assert_eq!(len, src.len());
+        let chunks = len / 4;
+        for c in 0..chunks {
+            let i = c * 4;
+            for k in 0..4 {
+                let v = vector::xor(vector::load(dst[i + k].0), vector::load(src[i + k].0));
+                dst[i + k] = Self(vector::store(v));
+            }
         }
-        assert_eq!(dst.len(), src.len());
+        for i in (chunks * 4)..len {
+            let v = vector::xor(vector::load(dst[i].0), vector::load(src[i].0));
+            dst[i] = Self(vector::store(v));
+        }
+        assert!(chunks * 4 <= len);
     }
 }
 
@@ -320,6 +330,92 @@ fn write_radix4_128(
     d3[i].write(Gf2_128(vector::store(b3)));
 }
 
+#[inline(always)]
+fn radix8_zero_prefix_8lanes(v: &mut [V; 8], p2_1: Mul128, p1: [Mul128; 4]) {
+    for j in 0..4 {
+        v[j + 4] = vector::xor(v[j + 4], v[j]);
+    }
+    for j in 0..2 {
+        v[j + 2] = vector::xor(v[j + 2], v[j]);
+        (v[j + 4], v[j + 6]) = butterfly_step_v(v[j + 4], v[j + 6], p2_1);
+    }
+    v[1] = vector::xor(v[1], v[0]);
+    for j in 1..4 {
+        (v[2 * j], v[2 * j + 1]) = butterfly_step_v(v[2 * j], v[2 * j + 1], p1[j]);
+    }
+}
+
+fn radix8_outer_128(values: &mut [Gf2_128], m4: Mul128, m2: [Mul128; 2], m1: [Mul128; 4], zero_prefix: bool) {
+    let len = values.len();
+    assert!(len >= 8 && len.is_multiple_of(8));
+    let e = len / 8;
+    let ptr = values.as_mut_ptr();
+    if zero_prefix {
+        for i in 0..e {
+            let mut v = [vector::zero(); 8];
+            for (k, slot) in v.iter_mut().enumerate() {
+                *slot = vector::load(unsafe { (*ptr.add(k * e + i)).0 });
+            }
+            radix8_zero_prefix_8lanes(&mut v, m2[1], m1);
+            for (k, &val) in v.iter().enumerate() {
+                unsafe { (*ptr.add(k * e + i)).0 = vector::store(val) };
+            }
+        }
+    } else {
+        for i in 0..e {
+            let mut v = [vector::zero(); 8];
+            for (k, slot) in v.iter_mut().enumerate() {
+                *slot = vector::load(unsafe { (*ptr.add(k * e + i)).0 });
+            }
+            radix8_8lanes(&mut v, m4, m2[0], m2[1], m1);
+            for (k, &val) in v.iter().enumerate() {
+                unsafe { (*ptr.add(k * e + i)).0 = vector::store(val) };
+            }
+        }
+    }
+    assert_eq!(e * 8, len);
+}
+
+fn copy_radix8_128_short(
+    novel_low: &[Gf2_128],
+    novel_high: &[Gf2_128],
+    dst: &mut [MaybeUninit<Gf2_128>],
+    pw_eff: Mul128,
+    m4: Mul128,
+    m2: [Mul128; 2],
+    m1: [Mul128; 4],
+) {
+    let e = dst.len() / 8;
+    let qcount = novel_high.len();
+    assert!(dst.len() == 8 * e && novel_low.len() == 8 * e && qcount <= e);
+    let nl = novel_low.as_ptr();
+    let nh = novel_high.as_ptr();
+    let dp = dst.as_mut_ptr();
+    for i in 0..qcount {
+        let mut v = [vector::zero(); 8];
+        v[0] = pw_eff
+            .mul_xor_v(vector::load(unsafe { (*nl.add(i)).0 }), vector::load(unsafe { (*nh.add(i)).0 }));
+        for (k, slot) in v.iter_mut().enumerate().skip(1) {
+            *slot = vector::load(unsafe { (*nl.add(k * e + i)).0 });
+        }
+        radix8_8lanes(&mut v, m4, m2[0], m2[1], m1);
+        for (k, &val) in v.iter().enumerate() {
+            unsafe { (*dp.add(k * e + i)).write(Gf2_128(vector::store(val))) };
+        }
+    }
+    for i in qcount..e {
+        let mut v = [vector::zero(); 8];
+        for (k, slot) in v.iter_mut().enumerate() {
+            *slot = vector::load(unsafe { (*nl.add(k * e + i)).0 });
+        }
+        radix8_8lanes(&mut v, m4, m2[0], m2[1], m1);
+        for (k, &val) in v.iter().enumerate() {
+            unsafe { (*dp.add(k * e + i)).write(Gf2_128(vector::store(val))) };
+        }
+    }
+    assert!(qcount <= e);
+}
+
 impl BinaryField for Gf2_128 {
     fn from_base(limb: u128) -> Self {
         Self(limb)
@@ -416,6 +512,58 @@ impl BinaryField for Gf2_128 {
             radix8_8lanes(&mut v, m4, m2_0, m2_0.xor(p2), m1);
             for j in 0..8 {
                 block[j] = Self(vector::store(v[j]));
+            }
+        }
+    }
+
+    fn butterfly_radix8_outer(values: &mut [Self], w4: u128, w2_0: u128, w2_1: u128, w1: [u128; 4]) {
+        let len = values.len();
+        assert!(len >= 8 && len.is_multiple_of(8));
+        let m4 = Mul128::new(w4);
+        let m2 = [Mul128::new(w2_0), Mul128::new(w2_1)];
+        let m1 = [Mul128::new(w1[0]), Mul128::new(w1[1]), Mul128::new(w1[2]), Mul128::new(w1[3])];
+        radix8_outer_128(values, m4, m2, m1, w4 == 0 && w2_0 == 0 && w1[0] == 0);
+        assert_eq!(values.len(), len);
+    }
+
+    fn copy_half_radix8_uninit(
+        novel_low: &[Self],
+        novel_high: &[Self],
+        dst: &mut [MaybeUninit<Self>],
+        w_eff: u128,
+        w4: u128,
+        w2: [u128; 2],
+        w1: [u128; 4],
+    ) {
+        let half = dst.len();
+        assert!(half >= 8 && half.is_multiple_of(8) && novel_low.len() == half);
+        assert!(novel_high.len() <= half);
+        let e = half / 8;
+        let qcount = novel_high.len();
+        let pw_eff = Mul128::new(w_eff);
+        let m4 = Mul128::new(w4);
+        let m2 = [Mul128::new(w2[0]), Mul128::new(w2[1])];
+        let m1 = [Mul128::new(w1[0]), Mul128::new(w1[1]), Mul128::new(w1[2]), Mul128::new(w1[3])];
+        if qcount <= e {
+            return copy_radix8_128_short(novel_low, novel_high, dst, pw_eff, m4, m2, m1);
+        }
+        let nl = novel_low.as_ptr();
+        let nh = novel_high.as_ptr();
+        let dp = dst.as_mut_ptr();
+        for i in 0..e {
+            let mut v = [vector::zero(); 8];
+            for (k, slot) in v.iter_mut().enumerate() {
+                let idx = k * e + i;
+                let lo = vector::load(unsafe { (*nl.add(idx)).0 });
+                *slot = if idx < qcount {
+                    pw_eff.mul_xor_v(lo, vector::load(unsafe { (*nh.add(idx)).0 }))
+                } else {
+                    lo
+                };
+            }
+            radix8_8lanes(&mut v, m4, m2[0], m2[1], m1);
+            for (k, &val) in v.iter().enumerate() {
+                unsafe { (*dp.add(k * e + i)).write(Self(vector::store(val))) };
             }
         }
     }
