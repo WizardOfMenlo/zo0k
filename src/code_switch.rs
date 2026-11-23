@@ -6,16 +6,12 @@ use crate::error::Result;
 use crate::field::Field;
 use crate::hash::{Digest, Hasher};
 use crate::oracle::{Opening, Oracle};
-use crate::parallel;
 use crate::parameters::{MASK_LEN, Stage};
-use crate::polynomial::{eq_table, inner_product};
+use crate::polynomial::{eq_table, evaluate, inner_product};
 use crate::reed_solomon::RsField;
 use crate::rng::Rng;
 use crate::transcript::{Challenges, ProverTranscript, VerifierTranscript};
 use crate::witness::{Message, Row, Witness};
-
-const EVAL_PARALLEL_THRESHOLD: usize = 1 << 14;
-const EVAL_PIECE_MIN: usize = 1 << 12;
 
 pub struct CodeSwitch<'a> {
     pub source: &'a Stage,
@@ -39,85 +35,6 @@ fn square_pow2<F: Field>(mut value: F, log_exp: u32) -> F {
     }
     assert!(log_exp < 64);
     value
-}
-
-fn eval_horner_4<F: Field>(coefficients: &[F], x: F) -> F {
-    let (chunks, remainder) = coefficients.as_chunks::<4>();
-    let mut a0 = remainder.iter().rev().fold(F::ZERO, |acc, &c| acc * x + c);
-    if chunks.is_empty() {
-        assert_eq!(remainder.len(), coefficients.len());
-        return a0;
-    }
-    let x2 = x.square();
-    let x3 = x2 * x;
-    let x4 = x2.square();
-    let (mut a1, mut a2, mut a3) = (F::ZERO, F::ZERO, F::ZERO);
-    for chunk in chunks.iter().rev() {
-        a0 = a0 * x4 + chunk[0];
-        a1 = a1 * x4 + chunk[1];
-        a2 = a2 * x4 + chunk[2];
-        a3 = a3 * x4 + chunk[3];
-    }
-    assert!(remainder.len() < 4);
-    a0 + x * a1 + x2 * a2 + x3 * a3
-}
-
-fn evaluate_parallel<F: Field>(coefficients: &[F], x: F) -> F {
-    if coefficients.len() < EVAL_PARALLEL_THRESHOLD {
-        return eval_horner_4(coefficients, x);
-    }
-    assert!(coefficients.len() >= EVAL_PARALLEL_THRESHOLD);
-    let pieces = parallel::map_pieces(coefficients.len(), EVAL_PIECE_MIN, |range| {
-        (range.len(), eval_horner_4(&coefficients[range], x))
-    });
-    assert!(!pieces.is_empty());
-    pieces.into_iter().rev().fold(F::ZERO, |acc, (len, value)| acc * x.pow(len as u64) + value)
-}
-
-fn add_powers_returning_next<F: Field>(target: &mut [F], x: F, mut scale: F) -> F {
-    assert!(target.len() <= isize::MAX as usize);
-    let (chunks, remainder) = target.as_chunks_mut::<4>();
-    if !chunks.is_empty() {
-        let x2 = x.square();
-        let x4 = x2.square();
-        let mut s0 = scale;
-        let mut s1 = s0 * x;
-        let mut s2 = s0 * x2;
-        let mut s3 = s1 * x2;
-        for chunk in chunks {
-            chunk[0] += s0;
-            chunk[1] += s1;
-            chunk[2] += s2;
-            chunk[3] += s3;
-            s0 *= x4;
-            s1 *= x4;
-            s2 *= x4;
-            s3 *= x4;
-        }
-        scale = s0;
-    }
-    for entry in remainder {
-        *entry += scale;
-        scale *= x;
-    }
-    assert!(target.len() < usize::MAX);
-    scale
-}
-
-fn inner_product_4<F: Field>(a: &[F], b: &[F]) -> F {
-    assert_eq!(a.len(), b.len());
-    let (mut s0, mut s1, mut s2, mut s3) = (F::ZERO, F::ZERO, F::ZERO, F::ZERO);
-    let (a_chunks, a_rem) = a.as_chunks::<4>();
-    let (b_chunks, b_rem) = b.as_chunks::<4>();
-    for (ac, bc) in a_chunks.iter().zip(b_chunks.iter()) {
-        s0 += ac[0] * bc[0];
-        s1 += ac[1] * bc[1];
-        s2 += ac[2] * bc[2];
-        s3 += ac[3] * bc[3];
-    }
-    let tail: F = a_rem.iter().zip(b_rem).map(|(&x, &y)| x * y).sum();
-    assert_eq!(a_rem.len(), b_rem.len());
-    (s0 + s1) + (s2 + s3) + tail
 }
 
 impl CodeSwitch<'_> {
@@ -146,8 +63,8 @@ impl CodeSwitch<'_> {
         transcript.prove_work(self.ood_pow_bits);
         let ood_point = transcript.challenge_field();
         let pad_coefficients = transcript.challenge_nonzero_vector(self.source.pad_len);
-        let main_eval = evaluate_parallel(&witness.message.main, ood_point);
-        let carried_eval = eval_horner_4(&witness.message.aux[..carried_len], ood_point);
+        let main_eval = evaluate(&witness.message.main, ood_point);
+        let carried_eval = F::eval_horner_slice(&witness.message.aux[..carried_len], ood_point);
         let pad_eval = inner_product(&pad_coefficients, &witness.message.aux[carried_len..]);
         let ood_answer = main_eval
             + square_pow2(ood_point, self.source.main_len.trailing_zeros()) * carried_eval
@@ -217,27 +134,29 @@ impl CodeSwitch<'_> {
         let mut coefficient = challenges.batching;
         let x = challenges.ood_point;
         let mut main_rows = Vec::with_capacity(1 + challenges.positions.len());
-        main_rows.push(PowerRow { scale: coefficient, base: x });
-        add_powers_returning_next(&mut aux[..pad_at], x, coefficient * square_pow2(x, main_log));
-        for (entry, &beta) in aux[pad_at..].iter_mut().zip(&challenges.pad_coefficients) {
-            *entry += coefficient * beta;
-        }
+        main_rows.push((PowerRow { scale: coefficient, base: x }, None));
+        F::add_powers_slice(&mut aux[..pad_at], x, coefficient * square_pow2(x, main_log));
+        F::add_scaled_slice(&mut aux[pad_at..], &challenges.pad_coefficients, coefficient);
         target += coefficient * ood_answer;
 
         let weights = eq_table(fold_challenges);
         for (column, &position) in opening.columns(&challenges.positions).zip(&challenges.positions) {
             coefficient *= challenges.batching;
             let z = F::point(position);
-            let after_seed = add_powers_returning_next(&mut aux[seed_at..pad_at], z, coefficient);
-            let after_mask = add_powers_returning_next(&mut aux[mask_at..seed_at], z, after_seed);
-            main_rows.push(PowerRow { scale: after_mask, base: z });
+            F::add_powers_slice(&mut aux[seed_at..pad_at], z, coefficient);
+            let after_seed = coefficient * z.pow(source.seed_len as u64);
+            aux[mask_at] += after_seed;
+            let after_mask_one = after_seed * z;
+            aux[mask_at + 1] += after_mask_one;
+            let after_mask = after_mask_one * z;
+            main_rows.push((PowerRow { scale: after_mask, base: z }, Some(position)));
             if mask_at > 0 {
                 let aux_scale = after_mask * square_pow2(z, main_log);
-                add_powers_returning_next(&mut aux[..mask_at], z, aux_scale);
+                F::add_powers_slice(&mut aux[..mask_at], z, aux_scale);
             }
-            target += coefficient * inner_product_4(column, &weights);
+            target += coefficient * F::inner_product_slice(column, &weights);
         }
-        main.add_power_rows(&main_rows);
+        main.add_power_rows_positioned(&main_rows);
         Claim { main, aux, target }
     }
 }

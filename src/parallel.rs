@@ -8,9 +8,9 @@ use std::sync::{Arc, Condvar, Mutex, MutexGuard, OnceLock, PoisonError};
 use std::thread;
 
 pub const THREADS_MAX: usize = 512;
-const PIECES_PER_THREAD: usize = 8;
-const SPIN_PAUSE_ROUNDS: usize = 2048;
-const SPIN_YIELD_ROUNDS: usize = 8;
+const PIECES_PER_THREAD: usize = 16;
+const SPIN_PAUSE_ROUNDS: usize = 256;
+const SPIN_YIELD_ROUNDS: usize = 2;
 const WORKER_STACK_BYTES: usize = 8 << 20;
 
 static THREADS_CHOSEN: AtomicUsize = AtomicUsize::new(0);

@@ -2,10 +2,12 @@ use crate::field::Field;
 use crate::parallel;
 use crate::parameters::MASK_LEN;
 use crate::polynomial::{eq_table, inner_product};
+use crate::reed_solomon::RsField;
 use crate::witness::Row;
 
-const POWER_PIECE_MIN: usize = 1 << 12;
-const POWER_L1_TILE: usize = 1 << 10;
+const POWER_PIECE_MIN: usize = 1 << 11;
+const POWER_L1_TILE: usize = 1 << 11;
+const POWER_L1_TILE_LOG: u32 = 11;
 const EVAL_PARALLEL_OPS: usize = 1 << 17;
 const EVAL_TERMS_PIECE_MIN: usize = 8;
 
@@ -46,36 +48,23 @@ pub struct PowerRow<F> {
 
 pub trait MainCoefficients<F> {
     fn add_power_rows(&mut self, rows: &[PowerRow<F>]);
+
+    fn add_power_rows_positioned(&mut self, rows: &[(PowerRow<F>, Option<usize>)])
+    where
+        F: Copy,
+    {
+        let plain: Vec<PowerRow<F>> = rows.iter().map(|&(row, _)| row).collect();
+        self.add_power_rows(&plain);
+    }
 }
 
-fn add_power_tile_single<F: Field>(tile: &mut [F], base: F, mut power: F) -> F {
-    assert!(!tile.is_empty());
-    let (chunks, remainder) = tile.as_chunks_mut::<4>();
-    if !chunks.is_empty() {
-        let b2 = base.square();
-        let b4 = b2.square();
-        let mut p0 = power;
-        let mut p1 = p0 * base;
-        let mut p2 = p0 * b2;
-        let mut p3 = p1 * b2;
-        for chunk in chunks {
-            chunk[0] += p0;
-            chunk[1] += p1;
-            chunk[2] += p2;
-            chunk[3] += p3;
-            p0 *= b4;
-            p1 *= b4;
-            p2 *= b4;
-            p3 *= b4;
-        }
-        power = p0;
+fn square_pow2<F: Field>(mut value: F, log_exp: u32) -> F {
+    assert!(log_exp <= 63);
+    for _ in 0..log_exp {
+        value = value.square();
     }
-    for entry in remainder {
-        *entry += power;
-        power *= base;
-    }
-    assert!(tile.len() <= isize::MAX as usize);
-    power
+    assert!(log_exp < 64);
+    value
 }
 
 impl<F: Field> MainCoefficients<F> for Vec<F> {
@@ -84,13 +73,18 @@ impl<F: Field> MainCoefficients<F> for Vec<F> {
             return;
         }
         assert!(self.len() <= isize::MAX as usize);
-        assert!(!rows.is_empty());
+        assert_eq!(1usize << POWER_L1_TILE_LOG, POWER_L1_TILE);
+        let tile_steps: Vec<F> = rows.iter().map(|row| square_pow2(row.base, POWER_L1_TILE_LOG)).collect();
         parallel::for_each_piece_mut(self, POWER_PIECE_MIN, |piece_start, piece| {
             let first = piece_start as u64;
             let mut powers: Vec<F> = rows.iter().map(|row| row.scale * row.base.pow(first)).collect();
             for tile in piece.chunks_mut(POWER_L1_TILE) {
-                for (row, power) in rows.iter().zip(powers.iter_mut()) {
-                    *power = add_power_tile_single(tile, row.base, *power);
+                let advance = tile.len() == POWER_L1_TILE;
+                for ((row, power), &step) in rows.iter().zip(powers.iter_mut()).zip(&tile_steps) {
+                    F::add_powers_slice(tile, row.base, *power);
+                    if advance {
+                        *power *= step;
+                    }
                 }
             }
         });
@@ -101,6 +95,7 @@ impl<F: Field> MainCoefficients<F> for Vec<F> {
 struct PowerTerm<F> {
     scale: F,
     base: F,
+    position: Option<usize>,
     squares_start: usize,
 }
 
@@ -118,42 +113,10 @@ struct Term<F> {
     factors: Vec<[F; 2]>,
 }
 
-fn eval_horner_single<F: Field>(values: &[F], x: F) -> F {
-    assert!(!values.is_empty());
-    let (chunks, remainder) = values.as_chunks::<4>();
-    let mut a0 = remainder.iter().rev().fold(F::ZERO, |acc, &c| acc * x + c);
-    if chunks.is_empty() {
-        assert_eq!(remainder.len(), values.len());
-        return a0;
-    }
-    let x2 = x.square();
-    let x3 = x2 * x;
-    let x4 = x2.square();
-    let (mut a1, mut a2, mut a3) = (F::ZERO, F::ZERO, F::ZERO);
-    for chunk in chunks.iter().rev() {
-        a0 = a0 * x4 + chunk[0];
-        a1 = a1 * x4 + chunk[1];
-        a2 = a2 * x4 + chunk[2];
-        a3 = a3 * x4 + chunk[3];
-    }
-    assert!(remainder.len() < 4);
-    a0 + x * a1 + x2 * a2 + x3 * a3
-}
-
 fn fold_step_in_place<F: Field>(lo: &mut [F], hi: &[F], zero: F, one: F) {
     assert_eq!(lo.len(), hi.len());
     if zero + one == F::ONE {
-        let (lc, lr) = lo.as_chunks_mut::<4>();
-        let (hc, hr) = hi.as_chunks::<4>();
-        for (l, h) in lc.iter_mut().zip(hc.iter()) {
-            l[0] += (h[0] - l[0]) * one;
-            l[1] += (h[1] - l[1]) * one;
-            l[2] += (h[2] - l[2]) * one;
-            l[3] += (h[3] - l[3]) * one;
-        }
-        for (l, &h) in lr.iter_mut().zip(hr) {
-            *l += (h - *l) * one;
-        }
+        F::fold_slice(lo, hi, one);
     } else {
         for (l, &h) in lo.iter_mut().zip(hi) {
             *l = *l * zero + h * one;
@@ -182,7 +145,11 @@ fn eval_term<F: Field>(term: &Term<F>, values: &[F]) -> F {
     term.scale * folded[0]
 }
 
-fn eval_power_terms<F: Field>(terms: &[PowerTerm<F>], values: &[F]) -> F {
+fn eval_power_terms<F: Field>(
+    terms: &[PowerTerm<F>],
+    values: &[F],
+    eval_one: impl Fn(&PowerTerm<F>, &[F]) -> F + Sync,
+) -> F {
     assert!(!values.is_empty());
     if terms.is_empty() {
         return F::ZERO;
@@ -192,9 +159,8 @@ fn eval_power_terms<F: Field>(terms: &[PowerTerm<F>], values: &[F]) -> F {
         assert!(terms.len() <= isize::MAX as usize);
         return sum * values[0];
     }
-    let eval_slice = |slice: &[PowerTerm<F>]| -> F {
-        slice.iter().map(|term| term.scale * eval_horner_single(values, term.base)).sum()
-    };
+    let eval_slice =
+        |slice: &[PowerTerm<F>]| -> F { slice.iter().map(|term| term.scale * eval_one(term, values)).sum() };
     let ops = terms.len().saturating_mul(values.len());
     assert!(values.len() >= 2);
     if ops < EVAL_PARALLEL_OPS || terms.len() < EVAL_TERMS_PIECE_MIN {
@@ -256,7 +222,8 @@ impl<F: Field> LinearForm<F> {
         for term in &self.terms {
             total += eval_term(term, values);
         }
-        total + eval_power_terms(&self.power_terms, values)
+        total
+            + eval_power_terms(&self.power_terms, values, |term, vals| F::eval_horner_slice(vals, term.base))
     }
 
     pub fn to_dense(&self) -> Vec<F> {
@@ -281,6 +248,35 @@ impl<F: Field> LinearForm<F> {
         assert_eq!(dense.len(), 1 << self.num_variables);
         dense
     }
+
+    fn push_power_term(&mut self, row: PowerRow<F>, position: Option<usize>) {
+        let vars = self.num_variables;
+        let squares_start = self.squares.len();
+        let mut power = row.base;
+        for step in 0..vars {
+            self.squares.push(power);
+            if step + 1 < vars {
+                power = power.square();
+            }
+        }
+        self.power_terms.push(PowerTerm { scale: row.scale, base: row.base, position, squares_start });
+    }
+}
+
+impl<F: RsField> LinearForm<F> {
+    pub(crate) fn evaluate_rs(&self, values: &[F]) -> F {
+        assert!(self.num_variables <= 60);
+        assert_eq!(values.len(), 1usize << self.num_variables);
+        let mut total = F::ZERO;
+        for term in &self.terms {
+            total += eval_term(term, values);
+        }
+        total
+            + eval_power_terms(&self.power_terms, values, |term, vals| match term.position {
+                Some(pos) => F::evaluate_at(vals, pos),
+                None => F::eval_horner_slice(vals, term.base),
+            })
+    }
 }
 
 impl<F: Field> MainCoefficients<F> for LinearForm<F> {
@@ -288,16 +284,19 @@ impl<F: Field> MainCoefficients<F> for LinearForm<F> {
         let vars = self.num_variables;
         self.power_terms.reserve(rows.len());
         self.squares.reserve(rows.len().saturating_mul(vars));
-        for row in rows {
-            let squares_start = self.squares.len();
-            let mut power = row.base;
-            for step in 0..vars {
-                self.squares.push(power);
-                if step + 1 < vars {
-                    power = power.square();
-                }
-            }
-            self.power_terms.push(PowerTerm { scale: row.scale, base: row.base, squares_start });
+        for &row in rows {
+            self.push_power_term(row, None);
+        }
+        assert!(self.squares.len() >= self.power_terms.len() * vars);
+        assert!(self.power_terms.len() >= rows.len());
+    }
+
+    fn add_power_rows_positioned(&mut self, rows: &[(PowerRow<F>, Option<usize>)]) {
+        let vars = self.num_variables;
+        self.power_terms.reserve(rows.len());
+        self.squares.reserve(rows.len().saturating_mul(vars));
+        for &(row, position) in rows {
+            self.push_power_term(row, position);
         }
         assert!(self.squares.len() >= self.power_terms.len() * vars);
         assert!(self.power_terms.len() >= rows.len());

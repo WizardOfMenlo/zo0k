@@ -41,7 +41,7 @@ pub fn verify<F: RsField, H: Hasher>(
     let disclosed = Row::from_fields(stage, &transcript.read_fields(stage.dimension())?);
 
     let FoldedClaim { main, aux, mask, target } = claim;
-    let evaluated = main.evaluate(&disclosed.main)
+    let evaluated = main.evaluate_rs(&disclosed.main)
         + inner_product(&aux, &disclosed.aux)
         + inner_product(&mask, &disclosed.mask);
     if evaluated != mask_target + target * combination {
