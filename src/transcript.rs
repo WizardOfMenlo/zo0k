@@ -13,21 +13,22 @@ const POW_SEQUENTIAL_BITS_MAX: u32 = 10;
 const POW_SEQUENTIAL_PREFIX: usize = 1024;
 
 struct Sponge<H> {
-    hasher: H,
+    hasher: Option<H>,
     buffer: Vec<u8>,
 }
 
 impl<H: Hasher> Sponge<H> {
     fn new(statement: &[u8]) -> Self {
-        let mut sponge = Self { hasher: H::new(Domain::Transcript), buffer: Vec::new() };
+        let mut sponge = Self { hasher: None, buffer: Vec::new() };
         sponge.absorb(PROTOCOL_TAG);
         sponge.absorb(statement);
         sponge
     }
 
-    fn flush(&mut self) {
+    fn flush_into_hasher(&mut self) {
+        let hasher = self.hasher.get_or_insert_with(|| H::new(Domain::Transcript));
         if !self.buffer.is_empty() {
-            self.hasher.update(&self.buffer);
+            hasher.update(&self.buffer);
             self.buffer.clear();
         }
         assert!(self.buffer.is_empty());
@@ -36,9 +37,9 @@ impl<H: Hasher> Sponge<H> {
     fn absorb(&mut self, message: &[u8]) {
         self.buffer.extend_from_slice(&(message.len() as u64).to_le_bytes());
         if self.buffer.len() + message.len() >= SPONGE_FLUSH_BYTES {
-            self.flush();
+            self.flush_into_hasher();
             if message.len() >= SPONGE_FLUSH_BYTES {
-                self.hasher.update(message);
+                self.hasher.as_mut().expect("hasher initialized").update(message);
                 return;
             }
         }
@@ -46,9 +47,18 @@ impl<H: Hasher> Sponge<H> {
     }
 
     fn squeeze(&mut self) -> ChallengeStream<H> {
-        self.flush();
-        let seed = self.hasher.clone().finalize();
-        self.hasher = H::new(Domain::Transcript);
+        let seed = if let Some(mut hasher) = self.hasher.take() {
+            if !self.buffer.is_empty() {
+                hasher.update(&self.buffer);
+                self.buffer.clear();
+            }
+            hasher.finalize()
+        } else {
+            let digest = H::hash(Domain::Transcript, &self.buffer);
+            self.buffer.clear();
+            digest
+        };
+        assert!(self.hasher.is_none() && self.buffer.is_empty());
         self.buffer.extend_from_slice(&seed);
         ChallengeStream {
             seed,
@@ -73,10 +83,7 @@ impl<H: Hasher> ChallengeStream<H> {
         let mut filled = 0;
         while filled < bytes.len() {
             if self.used == DIGEST_BYTES {
-                let mut input = [0; DIGEST_BYTES + 8];
-                input[..DIGEST_BYTES].copy_from_slice(&self.seed);
-                input[DIGEST_BYTES..].copy_from_slice(&self.counter.to_le_bytes());
-                self.block = H::hash(Domain::Challenge, &input);
+                self.block = H::hash_challenge(&self.seed, self.counter);
                 self.counter += 1;
                 self.used = 0;
             }
@@ -147,9 +154,9 @@ fn search_nonce<H: Hasher>(seed: &Digest, bits: u32) -> u64 {
         }
         start = POW_SEQUENTIAL_PREFIX as u64;
     }
-    let window_nonces: usize = if bits <= 16 { 1 << 16 } else { 1 << 20 };
-    let window_batches = window_nonces / POW_BATCH;
-    assert!(window_batches >= 4);
+    let window_batches: usize = if bits <= 16 { 256 } else { 4096 };
+    let window_nonces = window_batches * POW_BATCH;
+    assert!(window_batches >= 4 && window_nonces == window_batches * POW_BATCH);
     let max_windows = u64::MAX / window_nonces as u64;
     for _ in 0..max_windows {
         let found = parallel::find_first(0..window_batches, 4, |batch| {

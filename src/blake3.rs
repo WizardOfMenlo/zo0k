@@ -800,6 +800,205 @@ mod neon {
         }
     }
 
+    #[inline(always)]
+    unsafe fn load_row_8x_32<F: crate::field::Field>(row: &[F], base: usize) -> ([V; 8], [V; 8]) {
+        assert!(F::BYTES == 32);
+        assert!(base + 8 <= row.len());
+        let mut raw0 = [0u8; 128];
+        let mut raw1 = [0u8; 128];
+        for lane in 0..4 {
+            row[base + lane].write_bytes(&mut raw0[lane * 32..(lane + 1) * 32]);
+            row[base + 4 + lane].write_bytes(&mut raw1[lane * 32..(lane + 1) * 32]);
+        }
+        unsafe {
+            let p0 = raw0.as_ptr();
+            let lo0 = transpose4(
+                vreinterpretq_u32_u8(vld1q_u8(p0)),
+                vreinterpretq_u32_u8(vld1q_u8(p0.add(32))),
+                vreinterpretq_u32_u8(vld1q_u8(p0.add(64))),
+                vreinterpretq_u32_u8(vld1q_u8(p0.add(96))),
+            );
+            let hi0 = transpose4(
+                vreinterpretq_u32_u8(vld1q_u8(p0.add(16))),
+                vreinterpretq_u32_u8(vld1q_u8(p0.add(48))),
+                vreinterpretq_u32_u8(vld1q_u8(p0.add(80))),
+                vreinterpretq_u32_u8(vld1q_u8(p0.add(112))),
+            );
+            let p1 = raw1.as_ptr();
+            let lo1 = transpose4(
+                vreinterpretq_u32_u8(vld1q_u8(p1)),
+                vreinterpretq_u32_u8(vld1q_u8(p1.add(32))),
+                vreinterpretq_u32_u8(vld1q_u8(p1.add(64))),
+                vreinterpretq_u32_u8(vld1q_u8(p1.add(96))),
+            );
+            let hi1 = transpose4(
+                vreinterpretq_u32_u8(vld1q_u8(p1.add(16))),
+                vreinterpretq_u32_u8(vld1q_u8(p1.add(48))),
+                vreinterpretq_u32_u8(vld1q_u8(p1.add(80))),
+                vreinterpretq_u32_u8(vld1q_u8(p1.add(112))),
+            );
+            (
+                [lo0[0], lo0[1], lo0[2], lo0[3], hi0[0], hi0[1], hi0[2], hi0[3]],
+                [lo1[0], lo1[1], lo1[2], lo1[3], hi1[0], hi1[1], hi1[2], hi1[3]],
+            )
+        }
+    }
+
+    #[inline(always)]
+    unsafe fn load_row_8x_16<F: crate::field::Field>(row: &[F], base: usize) -> ([V; 4], [V; 4]) {
+        assert!(F::BYTES == 16);
+        assert!(base + 8 <= row.len());
+        let mut raw0 = [0u8; 64];
+        let mut raw1 = [0u8; 64];
+        for lane in 0..4 {
+            row[base + lane].write_bytes(&mut raw0[lane * 16..(lane + 1) * 16]);
+            row[base + 4 + lane].write_bytes(&mut raw1[lane * 16..(lane + 1) * 16]);
+        }
+        unsafe {
+            let p0 = raw0.as_ptr();
+            let w0 = transpose4(
+                vreinterpretq_u32_u8(vld1q_u8(p0)),
+                vreinterpretq_u32_u8(vld1q_u8(p0.add(16))),
+                vreinterpretq_u32_u8(vld1q_u8(p0.add(32))),
+                vreinterpretq_u32_u8(vld1q_u8(p0.add(48))),
+            );
+            let p1 = raw1.as_ptr();
+            let w1 = transpose4(
+                vreinterpretq_u32_u8(vld1q_u8(p1)),
+                vreinterpretq_u32_u8(vld1q_u8(p1.add(16))),
+                vreinterpretq_u32_u8(vld1q_u8(p1.add(32))),
+                vreinterpretq_u32_u8(vld1q_u8(p1.add(48))),
+            );
+            (w0, w1)
+        }
+    }
+
+    pub fn hash_rows_8x_f32<F: crate::field::Field>(
+        key: &[u32; 8],
+        rows: &[Vec<F>],
+        base: usize,
+        out: &mut [[u8; OUT_LEN]; 8],
+    ) {
+        assert!(F::BYTES == 32 && !rows.is_empty());
+        assert!(8 + rows.len() * 32 <= CHUNK_LEN);
+        unsafe {
+            let mut cv0 = key_splat(key);
+            let mut cv1 = cv0;
+            let (mut c0_lo, mut c0_hi) = counter_vecs(base as u64);
+            let (mut c1_lo, mut c1_hi) = counter_vecs((base + 4) as u64);
+            let pairs = rows.len() / 2;
+            for pair in 0..pairs {
+                let (a0, a1) = load_row_8x_32(&rows[2 * pair], base);
+                let (b0, b1) = load_row_8x_32(&rows[2 * pair + 1], base);
+                let m0 = [
+                    c0_lo, c0_hi, a0[0], a0[1], a0[2], a0[3], a0[4], a0[5], a0[6], a0[7], b0[0], b0[1],
+                    b0[2], b0[3], b0[4], b0[5],
+                ];
+                let m1 = [
+                    c1_lo, c1_hi, a1[0], a1[1], a1[2], a1[3], a1[4], a1[5], a1[6], a1[7], b1[0], b1[1],
+                    b1[2], b1[3], b1[4], b1[5],
+                ];
+                let start = if pair == 0 { CHUNK_START } else { 0 };
+                (cv0, cv1) = compress_cv_8x(&cv0, &cv1, &m0, &m1, BLOCK_LEN as u32, KEYED_HASH | start);
+                (c0_lo, c0_hi) = (b0[6], b0[7]);
+                (c1_lo, c1_hi) = (b1[6], b1[7]);
+            }
+            let zero = vdupq_n_u32(0);
+            let start = if pairs == 0 { CHUNK_START } else { 0 };
+            let flags = KEYED_HASH | start | CHUNK_END | ROOT;
+            let (cv0, cv1) = if rows.len().is_multiple_of(2) {
+                let m0 = [
+                    c0_lo, c0_hi, zero, zero, zero, zero, zero, zero, zero, zero, zero, zero, zero, zero,
+                    zero, zero,
+                ];
+                let m1 = [
+                    c1_lo, c1_hi, zero, zero, zero, zero, zero, zero, zero, zero, zero, zero, zero, zero,
+                    zero, zero,
+                ];
+                compress_cv_8x(&cv0, &cv1, &m0, &m1, 8, flags)
+            } else {
+                let (a0, a1) = load_row_8x_32(&rows[rows.len() - 1], base);
+                let m0 = [
+                    c0_lo, c0_hi, a0[0], a0[1], a0[2], a0[3], a0[4], a0[5], a0[6], a0[7], zero, zero, zero,
+                    zero, zero, zero,
+                ];
+                let m1 = [
+                    c1_lo, c1_hi, a1[0], a1[1], a1[2], a1[3], a1[4], a1[5], a1[6], a1[7], zero, zero, zero,
+                    zero, zero, zero,
+                ];
+                compress_cv_8x(&cv0, &cv1, &m0, &m1, 40, flags)
+            };
+            let (out0, out1) = out.split_at_mut(4);
+            store_cv_4x(&cv0, out0.try_into().expect("four digests"));
+            store_cv_4x(&cv1, out1.try_into().expect("four digests"));
+        }
+    }
+
+    pub fn hash_rows_8x_f16<F: crate::field::Field>(
+        key: &[u32; 8],
+        rows: &[Vec<F>],
+        base: usize,
+        out: &mut [[u8; OUT_LEN]; 8],
+    ) {
+        assert!(F::BYTES == 16 && !rows.is_empty());
+        assert!(8 + rows.len() * 16 <= CHUNK_LEN);
+        unsafe {
+            let mut cv0 = key_splat(key);
+            let mut cv1 = cv0;
+            let (mut c0_lo, mut c0_hi) = counter_vecs(base as u64);
+            let (mut c1_lo, mut c1_hi) = counter_vecs((base + 4) as u64);
+            let quads = rows.len() / 4;
+            for quad in 0..quads {
+                let (r0a, r0b) = load_row_8x_16(&rows[4 * quad], base);
+                let (r1a, r1b) = load_row_8x_16(&rows[4 * quad + 1], base);
+                let (r2a, r2b) = load_row_8x_16(&rows[4 * quad + 2], base);
+                let (r3a, r3b) = load_row_8x_16(&rows[4 * quad + 3], base);
+                let m0 = [
+                    c0_lo, c0_hi, r0a[0], r0a[1], r0a[2], r0a[3], r1a[0], r1a[1], r1a[2], r1a[3], r2a[0],
+                    r2a[1], r2a[2], r2a[3], r3a[0], r3a[1],
+                ];
+                let m1 = [
+                    c1_lo, c1_hi, r0b[0], r0b[1], r0b[2], r0b[3], r1b[0], r1b[1], r1b[2], r1b[3], r2b[0],
+                    r2b[1], r2b[2], r2b[3], r3b[0], r3b[1],
+                ];
+                let start = if quad == 0 { CHUNK_START } else { 0 };
+                (cv0, cv1) = compress_cv_8x(&cv0, &cv1, &m0, &m1, BLOCK_LEN as u32, KEYED_HASH | start);
+                (c0_lo, c0_hi) = (r3a[2], r3a[3]);
+                (c1_lo, c1_hi) = (r3b[2], r3b[3]);
+            }
+            let zero = vdupq_n_u32(0);
+            let start = if quads == 0 { CHUNK_START } else { 0 };
+            let flags = KEYED_HASH | start | CHUNK_END | ROOT;
+            let rem = rows.len() % 4;
+            let (cv0, cv1) = if rem == 0 {
+                let m0 = [
+                    c0_lo, c0_hi, zero, zero, zero, zero, zero, zero, zero, zero, zero, zero, zero, zero,
+                    zero, zero,
+                ];
+                let m1 = [
+                    c1_lo, c1_hi, zero, zero, zero, zero, zero, zero, zero, zero, zero, zero, zero, zero,
+                    zero, zero,
+                ];
+                compress_cv_8x(&cv0, &cv1, &m0, &m1, 8, flags)
+            } else {
+                let mut m0 = [zero; 16];
+                let mut m1 = [zero; 16];
+                (m0[0], m0[1]) = (c0_lo, c0_hi);
+                (m1[0], m1[1]) = (c1_lo, c1_hi);
+                for extra in 0..rem {
+                    let (ra, rb) = load_row_8x_16(&rows[4 * quads + extra], base);
+                    let dst = 2 + 4 * extra;
+                    m0[dst..dst + 4].copy_from_slice(&ra);
+                    m1[dst..dst + 4].copy_from_slice(&rb);
+                }
+                compress_cv_8x(&cv0, &cv1, &m0, &m1, (8 + 16 * rem) as u32, flags)
+            };
+            let (out0, out1) = out.split_at_mut(4);
+            store_cv_4x(&cv0, out0.try_into().expect("four digests"));
+            store_cv_4x(&cv1, out1.try_into().expect("four digests"));
+        }
+    }
+
     pub fn keyed_hash_8x(key: &[u32; 8], inputs: [&[u8]; 8], out: &mut [[u8; OUT_LEN]; 8]) {
         let len_bytes = inputs[0].len();
         assert!(inputs.iter().all(|slice| slice.len() == len_bytes));
@@ -1311,6 +1510,33 @@ pub(crate) fn keyed_hash_4x(key: &[u32; 8], inputs: [&[u8]; 4], out: &mut [[u8; 
         for lane in 0..4 {
             out[lane] = keyed_hash_words(key, inputs[lane]);
         }
+    }
+}
+
+pub(crate) fn hash_challenge_words(key: &[u32; 8], seed: &[u8; 32], counter: u64) -> [u8; OUT_LEN] {
+    const { assert!(KEY_LEN == 32 && BLOCK_LEN == 64) };
+    let seed_words = words_from_key(seed);
+    let mut message = [0u32; 16];
+    message[..8].copy_from_slice(&seed_words);
+    message[8] = counter as u32;
+    message[9] = (counter >> 32) as u32;
+    let flags = KEYED_HASH | CHUNK_START | CHUNK_END | ROOT;
+    hash_from_cv(compress_cv(key, &message, 0, 40, flags))
+}
+
+#[cfg(all(target_arch = "aarch64", target_feature = "neon", target_endian = "little"))]
+pub(crate) fn hash_rows_8x_direct<F: crate::field::Field>(
+    key: &[u32; 8],
+    rows: &[Vec<F>],
+    base: usize,
+    out: &mut [[u8; OUT_LEN]; 8],
+) {
+    assert!(F::BYTES == 16 || F::BYTES == 32);
+    assert!(8 + rows.len() * F::BYTES <= CHUNK_LEN);
+    if F::BYTES == 32 {
+        neon::hash_rows_8x_f32(key, rows, base, out);
+    } else {
+        neon::hash_rows_8x_f16(key, rows, base, out);
     }
 }
 

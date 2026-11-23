@@ -7,6 +7,7 @@ use crate::transcript::{ProverTranscript, VerifierTranscript};
 
 const PARALLEL_THRESHOLD: usize = 1 << 12;
 const LEAF_BATCH: usize = 8;
+const PARALLEL_LEAF_MIN: usize = 8;
 
 pub struct Oracle<F> {
     rows: Vec<Vec<F>>,
@@ -136,7 +137,7 @@ impl<F: Field> Opening<F> {
         let leaves: Vec<(usize, Digest)> = if positions.len() * width < PARALLEL_THRESHOLD {
             hash_leaf_slice::<H, F>(&positions, &columns, &rests, width)
         } else {
-            let pieces = parallel::map_pieces(positions.len(), LEAF_BATCH, |range| {
+            let pieces = parallel::map_pieces(positions.len(), PARALLEL_LEAF_MIN, |range| {
                 hash_leaf_slice::<H, F>(
                     &positions[range.clone()],
                     &columns[range.clone()],

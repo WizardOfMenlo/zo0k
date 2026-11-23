@@ -1,3 +1,5 @@
+use crate::field::Field;
+
 pub type Digest = [u8; DIGEST_BYTES];
 
 pub const DIGEST_BYTES: usize = 32;
@@ -54,6 +56,13 @@ pub trait Hasher: Clone + Send + Sync + 'static {
         hasher.finalize()
     }
 
+    fn hash_challenge(seed: &Digest, counter: u64) -> Digest {
+        let mut input = [0u8; DIGEST_BYTES + 8];
+        input[..DIGEST_BYTES].copy_from_slice(seed);
+        input[DIGEST_BYTES..].copy_from_slice(&counter.to_le_bytes());
+        Self::hash(Domain::Challenge, &input)
+    }
+
     fn hash_nodes(children: &[Digest], out: &mut [Digest]) {
         assert!(out.len() == children.len().div_ceil(2));
         for (dst, pair) in out.iter_mut().zip(children.chunks(2)) {
@@ -71,6 +80,16 @@ pub trait Hasher: Clone + Send + Sync + 'static {
         for (dst, chunk) in out.iter_mut().zip(inputs.chunks_exact(input_len)) {
             *dst = Self::hash(domain, chunk);
         }
+    }
+
+    fn hash_rows_range<F: Field>(
+        rows: &[Vec<F>],
+        start: usize,
+        count: usize,
+        scratch: &mut Vec<u8>,
+        out: &mut [Digest],
+    ) {
+        crate::merkle::hash_rows_scratch::<Self, F>(rows, start, count, scratch, out);
     }
 
     fn pow_bits(seed: &Digest, nonce: u64) -> u32 {
@@ -116,6 +135,11 @@ impl Hasher for Blake3 {
 
     fn hash(domain: Domain, bytes: &[u8]) -> Digest {
         crate::blake3::keyed_hash_words(&domain.key_words(), bytes)
+    }
+
+    fn hash_challenge(seed: &Digest, counter: u64) -> Digest {
+        const KEY: [u32; 8] = Domain::Challenge.key_words();
+        crate::blake3::hash_challenge_words(&KEY, seed, counter)
     }
 
     fn hash_nodes(children: &[Digest], out: &mut [Digest]) {
@@ -179,6 +203,37 @@ impl Hasher for Blake3 {
         assert!(offset == inputs.len());
     }
 
+    fn hash_rows_range<F: Field>(
+        rows: &[Vec<F>],
+        start: usize,
+        count: usize,
+        scratch: &mut Vec<u8>,
+        out: &mut [Digest],
+    ) {
+        assert!(!rows.is_empty());
+        assert!(out.len() == count);
+        #[cfg(all(target_arch = "aarch64", target_feature = "neon", target_endian = "little"))]
+        if (F::BYTES == 16 || F::BYTES == 32) && 8 + rows.len() * F::BYTES <= crate::blake3::CHUNK_LEN {
+            const KEY: [u32; 8] = Domain::MerkleLeaf.key_words();
+            let (out_octs, out_rem) = out.as_chunks_mut::<8>();
+            for (group, dst) in out_octs.iter_mut().enumerate() {
+                crate::blake3::hash_rows_8x_direct(&KEY, rows, start + group * 8, dst);
+            }
+            if !out_rem.is_empty() {
+                let done = out_octs.len() * 8;
+                crate::merkle::hash_rows_scratch::<Self, F>(
+                    rows,
+                    start + done,
+                    out_rem.len(),
+                    scratch,
+                    out_rem,
+                );
+            }
+            return;
+        }
+        crate::merkle::hash_rows_scratch::<Self, F>(rows, start, count, scratch, out);
+    }
+
     fn pow_bits(seed: &Digest, nonce: u64) -> u32 {
         const KEY: [u32; 8] = Domain::ProofOfWork.key_words();
         crate::blake3::pow_bits_with_key_words(&KEY, seed, nonce)
@@ -210,6 +265,11 @@ impl Hasher for Keccak256 {
 
     fn hash(domain: Domain, bytes: &[u8]) -> Digest {
         crate::keccak::keccak256_with_key_lanes(&domain.key_lanes(), bytes)
+    }
+
+    fn hash_challenge(seed: &Digest, counter: u64) -> Digest {
+        const KEY: [u64; 4] = Domain::Challenge.key_lanes();
+        crate::keccak::hash_challenge_lanes(&KEY, seed, counter)
     }
 
     fn hash_nodes(children: &[Digest], out: &mut [Digest]) {
@@ -246,6 +306,37 @@ impl Hasher for Keccak256 {
             offset += input_len;
         }
         assert!(offset == inputs.len());
+    }
+
+    fn hash_rows_range<F: Field>(
+        rows: &[Vec<F>],
+        start: usize,
+        count: usize,
+        scratch: &mut Vec<u8>,
+        out: &mut [Digest],
+    ) {
+        assert!(!rows.is_empty());
+        assert!(out.len() == count);
+        #[cfg(all(target_arch = "aarch64", target_feature = "sha3", target_endian = "little"))]
+        if F::BYTES == 16 || F::BYTES == 32 {
+            const KEY: [u64; 4] = Domain::MerkleLeaf.key_lanes();
+            let (out_pairs, out_rem) = out.as_chunks_mut::<2>();
+            for (pair_index, dst) in out_pairs.iter_mut().enumerate() {
+                crate::keccak::hash_rows_2x_direct(&KEY, rows, start + pair_index * 2, dst);
+            }
+            if !out_rem.is_empty() {
+                let done = out_pairs.len() * 2;
+                crate::merkle::hash_rows_scratch::<Self, F>(
+                    rows,
+                    start + done,
+                    out_rem.len(),
+                    scratch,
+                    out_rem,
+                );
+            }
+            return;
+        }
+        crate::merkle::hash_rows_scratch::<Self, F>(rows, start, count, scratch, out);
     }
 
     fn pow_bits(seed: &Digest, nonce: u64) -> u32 {

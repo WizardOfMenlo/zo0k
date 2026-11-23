@@ -41,18 +41,21 @@ fn leaf_tile_len(leaf_len_bytes: usize) -> usize {
     tile
 }
 
-fn hash_rows_range<H: Hasher, F: Field>(
+pub(crate) fn hash_rows_scratch<H: Hasher, F: Field>(
     rows: &[Vec<F>],
     start: usize,
     count: usize,
-    scratch: &mut [u8],
+    scratch: &mut Vec<u8>,
     out: &mut [Digest],
 ) {
     assert!(!rows.is_empty());
     assert!(out.len() == count);
     let leaf_len_bytes = 8 + rows.len() * F::BYTES;
-    let tile_cap = scratch.len() / leaf_len_bytes;
-    assert!(tile_cap >= 1);
+    let tile_cap = leaf_tile_len(leaf_len_bytes);
+    let need_bytes = tile_cap * leaf_len_bytes;
+    if scratch.len() < need_bytes {
+        scratch.resize(need_bytes, 0);
+    }
     let mut done = 0;
     while done < count {
         let batch = (count - done).min(tile_cap);
@@ -214,12 +217,10 @@ impl MerkleTree {
         let len = rows[0].len();
         assert!(len > 0);
         assert!(rows.iter().all(|row| row.len() == len));
-        let leaf_len_bytes = 8 + rows.len() * F::BYTES;
-        let tile = leaf_tile_len(leaf_len_bytes);
         if len < SUBTREE_LEAVES * 2 {
             let mut leaves = vec![[0u8; 32]; len];
-            let mut scratch = vec![0u8; tile * leaf_len_bytes];
-            hash_rows_range::<H, F>(rows, 0, len, &mut scratch, &mut leaves);
+            let mut scratch = Vec::new();
+            H::hash_rows_range(rows, 0, len, &mut scratch, &mut leaves);
             return Self::new::<H>(leaves);
         }
         let lens = level_lengths(len, SUBTREE_HEIGHT + 1);
@@ -228,14 +229,14 @@ impl MerkleTree {
             levels.iter_mut().zip(&lens).map(|(level, &n)| (RawMut(level.as_mut_ptr()), n)).collect();
         let num_subtrees = len.div_ceil(SUBTREE_LEAVES);
         parallel::map_pieces(num_subtrees, 1, |range| {
-            let mut scratch = vec![0u8; tile * leaf_len_bytes];
+            let mut scratch = Vec::new();
             let mut buf_a = [[0u8; 32]; SUBTREE_LEAVES];
             let mut buf_b = [[0u8; 32]; SUBTREE_LEAVES / 2];
             for subtree in range {
                 let start = subtree << SUBTREE_HEIGHT;
                 let end = ((subtree + 1) << SUBTREE_HEIGHT).min(len);
                 let cur_len = end - start;
-                hash_rows_range::<H, F>(rows, start, cur_len, &mut scratch, &mut buf_a[..cur_len]);
+                H::hash_rows_range(rows, start, cur_len, &mut scratch, &mut buf_a[..cur_len]);
                 write_disjoint(ptrs[0].0, start, ptrs[0].1, &buf_a[..cur_len]);
                 build_subtree_levels::<H>(subtree, cur_len, &mut buf_a, &mut buf_b, &ptrs, 1);
             }

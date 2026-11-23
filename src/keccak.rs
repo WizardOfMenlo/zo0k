@@ -114,7 +114,7 @@ fn digest_from_state(state: &[u64; LANES]) -> [u8; OUT_LEN] {
 
 #[cfg(all(target_arch = "aarch64", target_feature = "sha3", target_endian = "little"))]
 mod sha3_extension {
-    use super::{LANES, OUT_LEN, RATE_BYTES, ROUND_CONSTANTS, lanes_from_32};
+    use super::{LANES, OUT_LEN, RATE_BYTES, RATE_LANES, ROUND_CONSTANTS, lanes_from_32};
     use std::arch::aarch64::*;
 
     type V = uint64x2_t;
@@ -261,6 +261,66 @@ mod sha3_extension {
     }
 
     #[inline(always)]
+    unsafe fn absorb_lane_2x(lanes: &mut [V; LANES], pos: &mut usize, val: V) {
+        assert!(*pos < RATE_LANES);
+        unsafe {
+            lanes[*pos] = veorq_u64(lanes[*pos], val);
+        }
+        *pos += 1;
+        if *pos == RATE_LANES {
+            permute_lanes(lanes);
+            *pos = 0;
+        }
+    }
+
+    pub fn hash_rows_2x_direct<F: crate::field::Field>(
+        key_lanes: &[u64; 4],
+        rows: &[Vec<F>],
+        base: usize,
+        out: &mut [[u8; OUT_LEN]; 2],
+    ) {
+        assert!(F::BYTES == 16 || F::BYTES == 32);
+        assert!(!rows.is_empty());
+        unsafe {
+            let mut lanes = [vdupq_n_u64(0); LANES];
+            for i in 0..4 {
+                lanes[i] = vdupq_n_u64(key_lanes[i]);
+            }
+            lanes[4] = pair(base as u64, (base + 1) as u64);
+            let mut pos = 5usize;
+            if F::BYTES == 32 {
+                let mut raw0 = [0u8; 32];
+                let mut raw1 = [0u8; 32];
+                for row in rows {
+                    row[base].write_bytes(&mut raw0);
+                    row[base + 1].write_bytes(&mut raw1);
+                    let (v0, v1) = load_pair2(raw0.as_ptr(), raw1.as_ptr());
+                    let (v2, v3) = load_pair2(raw0.as_ptr().add(16), raw1.as_ptr().add(16));
+                    absorb_lane_2x(&mut lanes, &mut pos, v0);
+                    absorb_lane_2x(&mut lanes, &mut pos, v1);
+                    absorb_lane_2x(&mut lanes, &mut pos, v2);
+                    absorb_lane_2x(&mut lanes, &mut pos, v3);
+                }
+            } else {
+                let mut raw0 = [0u8; 16];
+                let mut raw1 = [0u8; 16];
+                for row in rows {
+                    row[base].write_bytes(&mut raw0);
+                    row[base + 1].write_bytes(&mut raw1);
+                    let (v0, v1) = load_pair2(raw0.as_ptr(), raw1.as_ptr());
+                    absorb_lane_2x(&mut lanes, &mut pos, v0);
+                    absorb_lane_2x(&mut lanes, &mut pos, v1);
+                }
+            }
+            assert!(pos < RATE_LANES);
+            lanes[pos] = veorq_u64(lanes[pos], vdupq_n_u64(0x01));
+            lanes[RATE_LANES - 1] = veorq_u64(lanes[RATE_LANES - 1], vdupq_n_u64(0x8000_0000_0000_0000));
+            permute_lanes(&mut lanes);
+            *out = extract_2_digests(&lanes);
+        }
+    }
+
+    #[inline(always)]
     unsafe fn xor_full_block_2x(lanes: &mut [V; LANES], b0: &[u8; RATE_BYTES], b1: &[u8; RATE_BYTES]) {
         unsafe {
             let p0 = b0.as_ptr();
@@ -403,6 +463,16 @@ pub fn keccak_f1600(state: &mut [u64; LANES]) {
     keccak_f1600_portable(state);
 }
 
+#[cfg(all(target_arch = "aarch64", target_feature = "sha3", target_endian = "little"))]
+pub(crate) fn hash_rows_2x_direct<F: crate::field::Field>(
+    key_lanes: &[u64; 4],
+    rows: &[Vec<F>],
+    base: usize,
+    out: &mut [[u8; OUT_LEN]; 2],
+) {
+    sha3_extension::hash_rows_2x_direct(key_lanes, rows, base, out);
+}
+
 #[inline(always)]
 fn absorb_block(state: &mut [u64; LANES], block: &[u8; RATE_BYTES]) {
     const { assert!(RATE_LANES * 8 == RATE_BYTES) };
@@ -483,6 +553,18 @@ pub(crate) fn keccak256_domain_2x(key_lanes: &[u64; 4], in0: &[u8], in1: &[u8]) 
     {
         [keccak256_with_key_lanes(key_lanes, in0), keccak256_with_key_lanes(key_lanes, in1)]
     }
+}
+
+pub(crate) fn hash_challenge_lanes(key_lanes: &[u64; 4], seed: &[u8; 32], counter: u64) -> [u8; OUT_LEN] {
+    const { assert!(RATE_BYTES == 136 && OUT_LEN == 32) };
+    let mut state = [0u64; LANES];
+    state[..4].copy_from_slice(key_lanes);
+    state[4..8].copy_from_slice(&lanes_from_32(seed));
+    state[8] = counter;
+    state[9] = 0x01;
+    state[16] = 0x8000_0000_0000_0000;
+    keccak_f1600(&mut state);
+    digest_from_state(&state)
 }
 
 pub(crate) fn pow_bits(key_lanes: &[u64; 4], seed: &[u8; 32], nonce: u64) -> u32 {
