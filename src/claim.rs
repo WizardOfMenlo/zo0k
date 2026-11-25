@@ -6,7 +6,7 @@ use crate::reed_solomon::RsField;
 use crate::witness::Row;
 use std::mem::MaybeUninit;
 
-const EVAL_PARALLEL_OPS: usize = 1 << 13;
+const EVAL_PARALLEL_OPS: usize = 1 << 17;
 const EVAL_TERMS_PIECE_MIN: usize = 4;
 const STACK_TERM_HALF_MAX: usize = 256;
 const PARALLEL_EQ_DOT_MIN: usize = 1 << 14;

@@ -9,12 +9,11 @@ use std::thread;
 
 pub const THREADS_MAX: usize = 512;
 const PIECES_PER_THREAD: usize = 16;
-const COMPUTE_HEAD_MULTIPLIER: usize = 4;
-const COMPUTE_TAIL_MULTIPLIER: usize = 8;
+const COARSE_PIECES_PER_THREAD: usize = 64;
 const BOUNDARY_ALIGN: usize = 16;
 const SLOT_COUNT: usize = 64;
-const SPIN_PAUSE_ROUNDS: usize = 16384;
-const SPIN_YIELD_ROUNDS: usize = 4;
+const SPIN_PAUSE_ROUNDS: usize = 512;
+const SPIN_YIELD_ROUNDS: usize = 2;
 const SPIN_CHECK_STRIDE: usize = 64;
 const WORKER_STACK_BYTES: usize = 8 << 20;
 
@@ -82,10 +81,8 @@ impl<T> CellSlot<T> {
 struct PiecePlan {
     len: usize,
     align: usize,
-    head_units: usize,
-    tail_units: usize,
-    head_pieces: usize,
-    tail_pieces: usize,
+    units: usize,
+    pieces: usize,
 }
 
 impl PiecePlan {
@@ -93,10 +90,12 @@ impl PiecePlan {
         assert!(piece_len_min >= 1);
         let threads = threads();
         if threads == 1 || len <= piece_len_min || len / piece_len_min < 2 {
-            return Self { len, align: 1, head_units: len, tail_units: 0, head_pieces: 1, tail_pieces: 0 };
+            return Self { len, align: 1, units: len, pieces: 1 };
         }
-        if piece_len_min == 1 && len <= threads * PIECES_PER_THREAD {
-            return Self { len, align: 1, head_units: len, tail_units: 0, head_pieces: len, tail_pieces: 0 };
+        if piece_len_min == 1 {
+            let pieces = len.min(threads * COARSE_PIECES_PER_THREAD);
+            assert!((2..=len).contains(&pieces));
+            return Self { len, align: 1, units: len, pieces };
         }
         let align = if piece_len_min >= BOUNDARY_ALIGN
             && (len / BOUNDARY_ALIGN) / 2 >= piece_len_min.div_ceil(BOUNDARY_ALIGN)
@@ -108,43 +107,21 @@ impl PiecePlan {
         let units = len / align;
         let min_units = piece_len_min.div_ceil(align);
         assert!(units / 2 >= min_units);
-        let head_p = threads * COMPUTE_HEAD_MULTIPLIER;
-        let tail_p = threads * COMPUTE_TAIL_MULTIPLIER;
-        let head_u = units - units.div_ceil(4);
-        let tail_u = units - head_u;
-        if head_u / head_p >= min_units && tail_u / tail_p >= min_units {
-            return Self {
-                len,
-                align,
-                head_units: head_u,
-                tail_units: tail_u,
-                head_pieces: head_p,
-                tail_pieces: tail_p,
-            };
-        }
         let pieces = (units / min_units).clamp(2, threads * PIECES_PER_THREAD);
-        Self { len, align, head_units: units, tail_units: 0, head_pieces: pieces, tail_pieces: 0 }
+        Self { len, align, units, pieces }
     }
 
     fn pieces(self) -> usize {
-        self.head_pieces + self.tail_pieces
+        self.pieces
     }
 
     fn range(self, piece: usize) -> Range<usize> {
-        let total = self.pieces();
-        assert!(piece < total);
-        let (start, end) = if piece < self.head_pieces {
-            let s = ((piece as u128 * self.head_units as u128) / self.head_pieces as u128) as usize;
-            let e = (((piece + 1) as u128 * self.head_units as u128) / self.head_pieces as u128) as usize;
-            (s * self.align, if piece + 1 == total { self.len } else { e * self.align })
+        assert!(piece < self.pieces);
+        let start = ((piece as u128 * self.units as u128) / self.pieces as u128) as usize * self.align;
+        let end = if piece + 1 == self.pieces {
+            self.len
         } else {
-            let t = piece - self.head_pieces;
-            let s = ((t as u128 * self.tail_units as u128) / self.tail_pieces as u128) as usize;
-            let e = (((t + 1) as u128 * self.tail_units as u128) / self.tail_pieces as u128) as usize;
-            (
-                (self.head_units + s) * self.align,
-                if piece + 1 == total { self.len } else { (self.head_units + e) * self.align },
-            )
+            (((piece + 1) as u128 * self.units as u128) / self.pieces as u128) as usize * self.align
         };
         assert!(start <= end && end <= self.len);
         start..end
@@ -794,18 +771,6 @@ fn pool() -> &'static Pool {
     pool
 }
 
-#[cfg(target_os = "macos")]
-fn set_worker_qos() {
-    const QOS_CLASS_USER_INTERACTIVE: u32 = 0x21;
-    unsafe extern "C" {
-        fn pthread_set_qos_class_self_np(qos_class: u32, relative_priority: i32) -> i32;
-    }
-    let _ = unsafe { pthread_set_qos_class_self_np(QOS_CLASS_USER_INTERACTIVE, 0) };
-}
-
-#[cfg(not(target_os = "macos"))]
-fn set_worker_qos() {}
-
 fn is_active(worker: usize) -> bool {
     worker + 1 < threads()
 }
@@ -1126,7 +1091,6 @@ impl Pool {
 
     fn work_forever(&self, worker: usize) {
         assert!(worker < THREADS_MAX);
-        set_worker_qos();
         loop {
             if self.spin_for_work(worker) {
                 continue;
