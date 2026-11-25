@@ -3,14 +3,18 @@ use crate::field::Field;
 use crate::hash::{DIGEST_BYTES, Digest, Domain, Hasher};
 use crate::parallel;
 use std::marker::PhantomData;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 pub const NONCE_BYTES: usize = 8;
 
 const PROTOCOL_TAG: &[u8] = b"zo0k/v1";
 const SPONGE_FLUSH_BYTES: usize = 64 * 1024 + 64;
-const POW_BATCH: usize = 256;
-const POW_SEQUENTIAL_BITS_MAX: u32 = 10;
-const POW_SEQUENTIAL_PREFIX: usize = 1024;
+const POW_SEQUENTIAL_BITS_MAX: u32 = 11;
+const POW_SEQUENTIAL_PREFIX: usize = 1536;
+const POW_WINDOW_NONCES: u64 = 1u64 << 44;
+
+#[repr(align(128))]
+struct CachePadded<T>(T);
 
 struct Sponge<H> {
     hasher: Option<H>,
@@ -142,6 +146,43 @@ pub trait Challenges {
     }
 }
 
+fn search_nonce_window<H: Hasher>(seed: &Digest, bits: u32, start: u64, span: u64) -> Option<u64> {
+    assert!(bits > 0 && bits <= 64);
+    assert!(span > 0 && span <= POW_WINDOW_NONCES);
+    let chunk = (H::POW_CHUNK_NONCES as u64).max(1);
+    let workers = parallel::threads();
+    if workers == 1 {
+        let mut off = 0u64;
+        let steps = span.div_ceil(chunk);
+        for _ in 0..steps {
+            let count = (span - off).min(chunk) as usize;
+            if let Some(nonce) = H::find_pow_nonce(seed, bits, start + off, count) {
+                return Some(nonce);
+            }
+            off += count as u64;
+        }
+        return None;
+    }
+    let next_off = CachePadded(AtomicU64::new(0));
+    let best_off = CachePadded(AtomicU64::new(u64::MAX));
+    let max_iters = span.div_ceil(chunk).saturating_add(1);
+    parallel::map_range(workers, 1, |_| {
+        for _ in 0..max_iters {
+            let off = next_off.0.fetch_add(chunk, Ordering::Relaxed);
+            if off >= span || off >= best_off.0.load(Ordering::Relaxed) {
+                break;
+            }
+            let count = (span - off).min(chunk) as usize;
+            if let Some(nonce) = H::find_pow_nonce(seed, bits, start + off, count) {
+                best_off.0.fetch_min(nonce - start, Ordering::Relaxed);
+                break;
+            }
+        }
+    });
+    let found_off = best_off.0.into_inner();
+    (found_off < span).then(|| start + found_off)
+}
+
 fn search_nonce<H: Hasher>(seed: &Digest, bits: u32) -> u64 {
     assert!(bits <= 64, "a proof-of-work hash has 64 bits");
     if bits == 0 {
@@ -154,23 +195,23 @@ fn search_nonce<H: Hasher>(seed: &Digest, bits: u32) -> u64 {
         }
         start = POW_SEQUENTIAL_PREFIX as u64;
     }
-    let window_batches: usize = if bits <= 16 { 256 } else { 4096 };
-    let window_nonces = window_batches * POW_BATCH;
-    assert!(window_batches >= 4 && window_nonces == window_batches * POW_BATCH);
-    let max_windows = u64::MAX / window_nonces as u64;
+    let max_windows = u64::MAX / POW_WINDOW_NONCES + 2;
     for _ in 0..max_windows {
-        let found = parallel::find_first(0..window_batches, 4, |batch| {
-            let batch_start = start + (batch as u64) * (POW_BATCH as u64);
-            H::find_pow_nonce(seed, bits, batch_start, POW_BATCH).is_some()
-        });
-        if let Some(batch) = found {
-            let batch_start = start + (batch as u64) * (POW_BATCH as u64);
-            let nonce = H::find_pow_nonce(seed, bits, batch_start, POW_BATCH)
-                .expect("the winning batch contains a valid nonce");
+        let remaining = u64::MAX - start;
+        let span = if remaining >= POW_WINDOW_NONCES { POW_WINDOW_NONCES } else { remaining };
+        if span > 0
+            && let Some(nonce) = search_nonce_window::<H>(seed, bits, start, span)
+        {
             assert!(H::pow_bits(seed, nonce) >= bits);
             return nonce;
         }
-        start += window_nonces as u64;
+        if remaining < POW_WINDOW_NONCES {
+            if H::pow_bits(seed, u64::MAX) >= bits {
+                return u64::MAX;
+            }
+            break;
+        }
+        start += POW_WINDOW_NONCES;
     }
     panic!("some nonce meets the difficulty")
 }

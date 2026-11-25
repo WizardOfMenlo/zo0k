@@ -6,8 +6,8 @@ use crate::parallel;
 use crate::transcript::{ProverTranscript, VerifierTranscript};
 
 const PARALLEL_THRESHOLD: usize = 1 << 12;
-const LEAF_BATCH: usize = 8;
-const PARALLEL_LEAF_MIN: usize = 8;
+const LEAF_BATCH: usize = 24;
+const PARALLEL_LEAF_MIN: usize = 12;
 
 pub struct Oracle<F> {
     rows: Vec<Vec<F>>,
@@ -45,7 +45,7 @@ impl<F: Field> Oracle<F> {
         for column in &columns {
             transcript.send_fields(column);
         }
-        for digest in self.tree.open(&positions) {
+        for digest in self.tree.open_with_rows::<H, F>(&self.rows, &positions) {
             transcript.send_digest(&digest);
         }
         Opening { positions, columns }
