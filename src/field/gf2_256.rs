@@ -68,6 +68,38 @@ fn store_256(x: (V, V)) -> Gf2_256 {
     Gf2_256(vector::store(x.0), vector::store(x.1))
 }
 
+fn eval_horner_4way_base_256(coefficients: &[Gf2_256], x: u128) -> Gf2_256 {
+    let len = coefficients.len();
+    assert!(len >= 4);
+    let px = Mul128::new(x);
+    let px4 = Mul128::new(vector::square(vector::square(x)));
+    let rem = len & 3;
+    let full = len - rem;
+    let mut a0 = [vector::zero(); 4];
+    let mut a1 = [vector::zero(); 4];
+    for k in 0..rem {
+        let (c0, c1) = load_256(coefficients[full + k]);
+        a0[k] = c0;
+        a1[k] = c1;
+    }
+    let (chunks, _) = coefficients[..full].as_chunks::<4>();
+    assert_eq!(chunks.len() * 4, full);
+    for chunk in chunks.iter().rev() {
+        for k in 0..4 {
+            let (c0, c1) = load_256(chunk[k]);
+            a0[k] = px4.mul_xor_v(c0, a0[k]);
+            a1[k] = px4.mul_xor_v(c1, a1[k]);
+        }
+    }
+    let (mut r0, mut r1) = (vector::zero(), vector::zero());
+    for k in (0..4).rev() {
+        r0 = px.mul_xor_v(a0[k], r0);
+        r1 = px.mul_xor_v(a1[k], r1);
+    }
+    store_256((r0, r1))
+}
+
+#[inline(never)]
 fn eval_horner_blocked_base_256(coefficients: &[Gf2_256], x: u128) -> Gf2_256 {
     const BLOCK: usize = 32;
     let len = coefficients.len();
@@ -77,8 +109,8 @@ fn eval_horner_blocked_base_256(coefficients: &[Gf2_256], x: u128) -> Gf2_256 {
     let mut ps = [vector::zero(); BLOCK];
     let mut cur = vector::load(1);
     for k in 0..BLOCK {
-        p[k] = cur;
-        ps[k] = Acc128::precompute_aux(cur);
+        p[k] = vector::pack_v(cur);
+        ps[k] = vector::pack_v(Acc128::precompute_aux(cur));
         cur = px.mul_v(cur);
     }
     let px32 = Mul128::new(vector::store(cur));
@@ -116,6 +148,7 @@ fn eval_horner_blocked_base_256(coefficients: &[Gf2_256], x: u128) -> Gf2_256 {
     store_256((acc0, acc1))
 }
 
+#[inline(never)]
 fn eval_horner_blocked_full_256(coefficients: &[Gf2_256], x: Gf2_256) -> Gf2_256 {
     const BLOCK: usize = 32;
     let len = coefficients.len();
@@ -130,12 +163,12 @@ fn eval_horner_blocked_full_256(coefficients: &[Gf2_256], x: Gf2_256) -> Gf2_256
     let mut cur = (vector::load(1), vector::zero());
     for k in 0..BLOCK {
         let sum = vector::xor(cur.0, cur.1);
-        p0[k] = cur.0;
-        p1[k] = cur.1;
-        p01[k] = sum;
-        p0s[k] = Acc128::precompute_aux(cur.0);
-        p1s[k] = Acc128::precompute_aux(cur.1);
-        p01s[k] = Acc128::precompute_aux(sum);
+        p0[k] = vector::pack_v(cur.0);
+        p1[k] = vector::pack_v(cur.1);
+        p01[k] = vector::pack_v(sum);
+        p0s[k] = vector::pack_v(Acc128::precompute_aux(cur.0));
+        p1s[k] = vector::pack_v(Acc128::precompute_aux(cur.1));
+        p01s[k] = vector::pack_v(Acc128::precompute_aux(sum));
         cur = px.mul_pair(cur.0, cur.1);
     }
     let px32 = Mul256::new(vector::store(cur.0), vector::store(cur.1));
@@ -513,6 +546,9 @@ impl Field for Gf2_256 {
             return Self::eval_horner_base(coefficients, x.0);
         }
         let len = coefficients.len();
+        if len <= 1 {
+            return coefficients.first().copied().unwrap_or(Self::ZERO);
+        }
         if len >= 64 {
             return eval_horner_blocked_full_256(coefficients, x);
         }
@@ -530,10 +566,24 @@ impl Field for Gf2_256 {
         if len == 0 {
             return;
         }
+        if len == 1 {
+            target[0] += scale;
+            return;
+        }
         if x.1 == 0 {
             return add_powers_base_256(target, x.0, scale);
         }
         let px = Mul256::new(x.0, x.1);
+        if len < 8 {
+            let mut cur = load_256(scale);
+            for entry in target {
+                let (t0, t1) = load_256(*entry);
+                *entry = store_256((vector::xor(t0, cur.0), vector::xor(t1, cur.1)));
+                cur = px.mul_pair(cur.0, cur.1);
+            }
+            assert!(len < 8);
+            return;
+        }
         let mut s = [load_256(scale); 4];
         for k in 1..4 {
             s[k] = px.mul_pair(s[k - 1].0, s[k - 1].1);
@@ -589,6 +639,16 @@ fn add_powers_base_256(target: &mut [Gf2_256], x: u128, scale: Gf2_256) {
     let len = target.len();
     assert!(len >= 1);
     let px = Mul128::new(x);
+    if len < 8 {
+        let mut cur = load_256(scale);
+        for entry in target {
+            let (t0, t1) = load_256(*entry);
+            *entry = store_256((vector::xor(t0, cur.0), vector::xor(t1, cur.1)));
+            cur = (px.mul_v(cur.0), px.mul_v(cur.1));
+        }
+        assert!(len < 8);
+        return;
+    }
     let mut s = [load_256(scale); 4];
     for k in 1..4 {
         s[k] = (px.mul_v(s[k - 1].0), px.mul_v(s[k - 1].1));
@@ -736,6 +796,7 @@ fn radix8_octants_256(
     assert_eq!(octants[7].len(), e);
 }
 
+#[inline(never)]
 #[allow(clippy::too_many_arguments)]
 fn copy_radix8_full_256(
     novel_low: [&[Gf2_256]; 8],
@@ -799,39 +860,347 @@ fn copy_radix8_full_256(
 
 #[inline(never)]
 #[allow(clippy::too_many_arguments)]
-fn copy_radix8_pure_256(
+fn copy_radix8_ragged_256(
     novel_low: [&[Gf2_256]; 8],
+    novel_high: [&[Gf2_256]; 8],
     dst: &mut [&mut [MaybeUninit<Gf2_256>]],
     start: usize,
     end: usize,
-    m4: Mul128,
-    m2_0: Mul128,
-    m1_0: Mul128,
-    p2: Mul128,
-    p4: Mul128,
+    pw_eff: Mul128,
+    tw: &[Mul128; 5],
 ) {
     let octants = dst.len();
     assert!((1..=8).contains(&octants) && start <= end);
     assert!(novel_low.iter().all(|s| s.len() >= end) && dst.iter().all(|s| s.len() >= end));
-    if octants == 8 {
-        let m2 = [m2_0, m2_0.xor(p2)];
-        let m1_1 = m1_0.xor(p2);
-        let m1 = [m1_0, m1_1, m1_0.xor(p4), m1_1.xor(p4)];
-        let dp: [*mut Gf2_256; 8] = std::array::from_fn(|k| dst[k].as_mut_ptr().cast::<Gf2_256>());
-        for i in start..end {
-            let mut v0: [V; 8] = std::array::from_fn(|k| vector::load(novel_low[k][i].0));
-            vector::radix8_8lanes_twiddles(&mut v0, m4, m2, m1);
-            for k in 0..8 {
-                unsafe { std::ptr::write(&raw mut (*dp[k].add(i)).0, vector::store(v0[k])) };
-            }
-            let mut v1: [V; 8] = std::array::from_fn(|k| vector::load(novel_low[k][i].1));
-            vector::radix8_8lanes_twiddles(&mut v1, m4, m2, m1);
-            for k in 0..8 {
-                unsafe { std::ptr::write(&raw mut (*dp[k].add(i)).1, vector::store(v1[k])) };
+    let [m4, m2_0, m1_0, p2, p4] = *tw;
+    for i in start..end {
+        let mut v0 = [vector::zero(); 8];
+        let mut v1 = [vector::zero(); 8];
+        for k in 0..8 {
+            let lo = load_256(novel_low[k][i]);
+            if i < novel_high[k].len() {
+                let hi = load_256(novel_high[k][i]);
+                v0[k] = pw_eff.mul_xor_v(lo.0, hi.0);
+                v1[k] = pw_eff.mul_xor_v(lo.1, hi.1);
+            } else {
+                v0[k] = lo.0;
+                v1[k] = lo.1;
             }
         }
-        return;
+        vector::radix8_8lanes_partial(&mut v0, m4, m2_0, m1_0, p2, p4, octants);
+        vector::radix8_8lanes_partial(&mut v1, m4, m2_0, m1_0, p2, p4, octants);
+        for (k, out_oct) in dst.iter_mut().enumerate() {
+            out_oct[i].write(store_256((v0[k], v1[k])));
+        }
     }
+}
+
+#[inline(always)]
+fn load_tw5_256(tw: &[(u128, u128); 5]) -> [Mul128; 5] {
+    [
+        Mul128::from_pair(tw[0].0, tw[0].1),
+        Mul128::from_pair(tw[1].0, tw[1].1),
+        Mul128::from_pair(tw[2].0, tw[2].1),
+        Mul128::from_pair(tw[3].0, tw[3].1),
+        Mul128::from_pair(tw[4].0, tw[4].1),
+    ]
+}
+
+#[inline(never)]
+fn copy_radix8_strided_8_zero_256(
+    src: &[Gf2_256],
+    src_stride: usize,
+    dst: &mut [MaybeUninit<Gf2_256>],
+    dst_stride: usize,
+    len: usize,
+    tw: &[(u128, u128); 5],
+) {
+    assert!(len == 0 || 7 * src_stride + len <= src.len());
+    assert!(len == 0 || 7 * dst_stride + len <= dst.len());
+    let [_, m2_0, m1_0, p2, p4] = load_tw5_256(tw);
+    let m2_1 = m2_0.xor(p2);
+    let m1_1 = m1_0.xor(p2);
+    let m1_2 = m1_0.xor(p4);
+    let m1_3 = m1_1.xor(p4);
+    let sp = src.as_ptr();
+    let dp = dst.as_mut_ptr().cast::<Gf2_256>();
+    let mut base = 0;
+    for _ in 0..len.div_ceil(64) {
+        let end = (base + 64).min(len);
+        for i in base..end {
+            let mut v0: [V; 8] =
+                std::array::from_fn(|k| vector::load(unsafe { (*sp.add(k * src_stride + i)).0 }));
+            vector::radix8_8lanes_zero_prefix(&mut v0, m2_1, m1_1, m1_2, m1_3);
+            for (k, &val) in v0.iter().enumerate() {
+                unsafe { std::ptr::write(&raw mut (*dp.add(k * dst_stride + i)).0, vector::store(val)) };
+            }
+        }
+        for i in base..end {
+            let mut v1: [V; 8] =
+                std::array::from_fn(|k| vector::load(unsafe { (*sp.add(k * src_stride + i)).1 }));
+            vector::radix8_8lanes_zero_prefix(&mut v1, m2_1, m1_1, m1_2, m1_3);
+            for (k, &val) in v1.iter().enumerate() {
+                unsafe { std::ptr::write(&raw mut (*dp.add(k * dst_stride + i)).1, vector::store(val)) };
+            }
+        }
+        base = end;
+    }
+}
+
+#[inline(never)]
+fn copy_radix8_strided_8_nonzero_256(
+    src: &[Gf2_256],
+    src_stride: usize,
+    dst: &mut [MaybeUninit<Gf2_256>],
+    dst_stride: usize,
+    len: usize,
+    tw: &[(u128, u128); 5],
+) {
+    assert!(len == 0 || 7 * src_stride + len <= src.len());
+    assert!(len == 0 || 7 * dst_stride + len <= dst.len());
+    let [m4, m2_0, m1_0, p2, p4] = load_tw5_256(tw);
+    let m2 = [m2_0, m2_0.xor(p2)];
+    let m1_1 = m1_0.xor(p2);
+    let m1 = [m1_0, m1_1, m1_0.xor(p4), m1_1.xor(p4)];
+    let sp = src.as_ptr();
+    let dp = dst.as_mut_ptr().cast::<Gf2_256>();
+    let mut base = 0;
+    for _ in 0..len.div_ceil(64) {
+        let end = (base + 64).min(len);
+        for i in base..end {
+            let mut v0: [V; 8] =
+                std::array::from_fn(|k| vector::load(unsafe { (*sp.add(k * src_stride + i)).0 }));
+            vector::radix8_8lanes_twiddles(&mut v0, m4, m2, m1);
+            for (k, &val) in v0.iter().enumerate() {
+                unsafe { std::ptr::write(&raw mut (*dp.add(k * dst_stride + i)).0, vector::store(val)) };
+            }
+        }
+        for i in base..end {
+            let mut v1: [V; 8] =
+                std::array::from_fn(|k| vector::load(unsafe { (*sp.add(k * src_stride + i)).1 }));
+            vector::radix8_8lanes_twiddles(&mut v1, m4, m2, m1);
+            for (k, &val) in v1.iter().enumerate() {
+                unsafe { std::ptr::write(&raw mut (*dp.add(k * dst_stride + i)).1, vector::store(val)) };
+            }
+        }
+        base = end;
+    }
+}
+
+#[inline(always)]
+fn copy_radix8_strided_8_256(
+    src: &[Gf2_256],
+    src_stride: usize,
+    dst: &mut [MaybeUninit<Gf2_256>],
+    dst_stride: usize,
+    len: usize,
+    tw: &[(u128, u128); 5],
+    zero_prefix: bool,
+) {
+    if zero_prefix {
+        copy_radix8_strided_8_zero_256(src, src_stride, dst, dst_stride, len, tw);
+    } else {
+        copy_radix8_strided_8_nonzero_256(src, src_stride, dst, dst_stride, len, tw);
+    }
+}
+
+#[inline(never)]
+fn copy_radix8_from_strided_zero_256(
+    src: &[Gf2_256],
+    src_stride: usize,
+    dst: [&mut [MaybeUninit<Gf2_256>]; 8],
+    tw: &[(u128, u128); 5],
+) {
+    let len = dst[0].len();
+    assert!(dst.iter().all(|s| s.len() == len));
+    assert!(len == 0 || 7 * src_stride + len <= src.len());
+    let [_, m2_0, m1_0, p2, p4] = load_tw5_256(tw);
+    let m2_1 = m2_0.xor(p2);
+    let m1_1 = m1_0.xor(p2);
+    let m1_2 = m1_0.xor(p4);
+    let m1_3 = m1_1.xor(p4);
+    let sp = src.as_ptr();
+    let dp: [*mut Gf2_256; 8] = std::array::from_fn(|k| dst[k].as_mut_ptr().cast());
+    let mut base = 0;
+    for _ in 0..len.div_ceil(64) {
+        let end = (base + 64).min(len);
+        for i in base..end {
+            let mut v0: [V; 8] =
+                std::array::from_fn(|k| vector::load(unsafe { (*sp.add(k * src_stride + i)).0 }));
+            vector::radix8_8lanes_zero_prefix(&mut v0, m2_1, m1_1, m1_2, m1_3);
+            for (k, &val) in v0.iter().enumerate() {
+                unsafe { std::ptr::write(&raw mut (*dp[k].add(i)).0, vector::store(val)) };
+            }
+        }
+        for i in base..end {
+            let mut v1: [V; 8] =
+                std::array::from_fn(|k| vector::load(unsafe { (*sp.add(k * src_stride + i)).1 }));
+            vector::radix8_8lanes_zero_prefix(&mut v1, m2_1, m1_1, m1_2, m1_3);
+            for (k, &val) in v1.iter().enumerate() {
+                unsafe { std::ptr::write(&raw mut (*dp[k].add(i)).1, vector::store(val)) };
+            }
+        }
+        base = end;
+    }
+}
+
+#[inline(never)]
+fn copy_radix8_from_strided_nonzero_256(
+    src: &[Gf2_256],
+    src_stride: usize,
+    dst: [&mut [MaybeUninit<Gf2_256>]; 8],
+    tw: &[(u128, u128); 5],
+) {
+    let len = dst[0].len();
+    assert!(dst.iter().all(|s| s.len() == len));
+    assert!(len == 0 || 7 * src_stride + len <= src.len());
+    let [m4, m2_0, m1_0, p2, p4] = load_tw5_256(tw);
+    let m2 = [m2_0, m2_0.xor(p2)];
+    let m1_1 = m1_0.xor(p2);
+    let m1 = [m1_0, m1_1, m1_0.xor(p4), m1_1.xor(p4)];
+    let sp = src.as_ptr();
+    let dp: [*mut Gf2_256; 8] = std::array::from_fn(|k| dst[k].as_mut_ptr().cast());
+    let mut base = 0;
+    for _ in 0..len.div_ceil(64) {
+        let end = (base + 64).min(len);
+        for i in base..end {
+            let mut v0: [V; 8] =
+                std::array::from_fn(|k| vector::load(unsafe { (*sp.add(k * src_stride + i)).0 }));
+            vector::radix8_8lanes_twiddles(&mut v0, m4, m2, m1);
+            for (k, &val) in v0.iter().enumerate() {
+                unsafe { std::ptr::write(&raw mut (*dp[k].add(i)).0, vector::store(val)) };
+            }
+        }
+        for i in base..end {
+            let mut v1: [V; 8] =
+                std::array::from_fn(|k| vector::load(unsafe { (*sp.add(k * src_stride + i)).1 }));
+            vector::radix8_8lanes_twiddles(&mut v1, m4, m2, m1);
+            for (k, &val) in v1.iter().enumerate() {
+                unsafe { std::ptr::write(&raw mut (*dp[k].add(i)).1, vector::store(val)) };
+            }
+        }
+        base = end;
+    }
+}
+
+#[inline(never)]
+fn copy_radix8_to_strided_zero_256(
+    src: [&[Gf2_256]; 8],
+    dst: &mut [MaybeUninit<Gf2_256>],
+    dst_stride: usize,
+    tw: &[(u128, u128); 5],
+) {
+    let len = src[0].len();
+    assert!(src.iter().all(|s| s.len() == len));
+    assert!(len == 0 || 7 * dst_stride + len <= dst.len());
+    let [_, m2_0, m1_0, p2, p4] = load_tw5_256(tw);
+    let m2_1 = m2_0.xor(p2);
+    let m1_1 = m1_0.xor(p2);
+    let m1_2 = m1_0.xor(p4);
+    let m1_3 = m1_1.xor(p4);
+    let sp: [*const Gf2_256; 8] = std::array::from_fn(|k| src[k].as_ptr());
+    let dp = dst.as_mut_ptr().cast::<Gf2_256>();
+    let mut base = 0;
+    for _ in 0..len.div_ceil(64) {
+        let end = (base + 64).min(len);
+        for i in base..end {
+            let mut v0: [V; 8] = std::array::from_fn(|k| vector::load(unsafe { (*sp[k].add(i)).0 }));
+            vector::radix8_8lanes_zero_prefix(&mut v0, m2_1, m1_1, m1_2, m1_3);
+            for (k, &val) in v0.iter().enumerate() {
+                unsafe { std::ptr::write(&raw mut (*dp.add(k * dst_stride + i)).0, vector::store(val)) };
+            }
+        }
+        for i in base..end {
+            let mut v1: [V; 8] = std::array::from_fn(|k| vector::load(unsafe { (*sp[k].add(i)).1 }));
+            vector::radix8_8lanes_zero_prefix(&mut v1, m2_1, m1_1, m1_2, m1_3);
+            for (k, &val) in v1.iter().enumerate() {
+                unsafe { std::ptr::write(&raw mut (*dp.add(k * dst_stride + i)).1, vector::store(val)) };
+            }
+        }
+        base = end;
+    }
+}
+
+#[inline(never)]
+fn copy_radix8_to_strided_nonzero_256(
+    src: [&[Gf2_256]; 8],
+    dst: &mut [MaybeUninit<Gf2_256>],
+    dst_stride: usize,
+    tw: &[(u128, u128); 5],
+) {
+    let len = src[0].len();
+    assert!(src.iter().all(|s| s.len() == len));
+    assert!(len == 0 || 7 * dst_stride + len <= dst.len());
+    let [m4, m2_0, m1_0, p2, p4] = load_tw5_256(tw);
+    let m2 = [m2_0, m2_0.xor(p2)];
+    let m1_1 = m1_0.xor(p2);
+    let m1 = [m1_0, m1_1, m1_0.xor(p4), m1_1.xor(p4)];
+    let sp: [*const Gf2_256; 8] = std::array::from_fn(|k| src[k].as_ptr());
+    let dp = dst.as_mut_ptr().cast::<Gf2_256>();
+    let mut base = 0;
+    for _ in 0..len.div_ceil(64) {
+        let end = (base + 64).min(len);
+        for i in base..end {
+            let mut v0: [V; 8] = std::array::from_fn(|k| vector::load(unsafe { (*sp[k].add(i)).0 }));
+            vector::radix8_8lanes_twiddles(&mut v0, m4, m2, m1);
+            for (k, &val) in v0.iter().enumerate() {
+                unsafe { std::ptr::write(&raw mut (*dp.add(k * dst_stride + i)).0, vector::store(val)) };
+            }
+        }
+        for i in base..end {
+            let mut v1: [V; 8] = std::array::from_fn(|k| vector::load(unsafe { (*sp[k].add(i)).1 }));
+            vector::radix8_8lanes_twiddles(&mut v1, m4, m2, m1);
+            for (k, &val) in v1.iter().enumerate() {
+                unsafe { std::ptr::write(&raw mut (*dp.add(k * dst_stride + i)).1, vector::store(val)) };
+            }
+        }
+        base = end;
+    }
+}
+
+#[inline(never)]
+fn copy_radix8_pure_8_256(
+    novel_low: [&[Gf2_256]; 8],
+    dst: &mut [&mut [MaybeUninit<Gf2_256>]],
+    start: usize,
+    end: usize,
+    tw: &[Mul128; 5],
+) {
+    assert!(dst.len() == 8 && start <= end);
+    assert!(novel_low.iter().all(|s| s.len() >= end) && dst.iter().all(|s| s.len() >= end));
+    let [m4, m2_0, m1_0, p2, p4] = *tw;
+    let m2 = [m2_0, m2_0.xor(p2)];
+    let m1_1 = m1_0.xor(p2);
+    let m1 = [m1_0, m1_1, m1_0.xor(p4), m1_1.xor(p4)];
+    let len = end - start;
+    let sp: [*const Gf2_256; 8] = std::array::from_fn(|k| unsafe { novel_low[k].as_ptr().add(start) });
+    let dp: [*mut Gf2_256; 8] = std::array::from_fn(|k| unsafe { dst[k].as_mut_ptr().add(start).cast() });
+    for i in 0..len {
+        let mut v0: [V; 8] = std::array::from_fn(|k| vector::load(unsafe { (*sp[k].add(i)).0 }));
+        vector::radix8_8lanes_twiddles(&mut v0, m4, m2, m1);
+        for (k, &val) in v0.iter().enumerate() {
+            unsafe { std::ptr::write(&raw mut (*dp[k].add(i)).0, vector::store(val)) };
+        }
+        let mut v1: [V; 8] = std::array::from_fn(|k| vector::load(unsafe { (*sp[k].add(i)).1 }));
+        vector::radix8_8lanes_twiddles(&mut v1, m4, m2, m1);
+        for (k, &val) in v1.iter().enumerate() {
+            unsafe { std::ptr::write(&raw mut (*dp[k].add(i)).1, vector::store(val)) };
+        }
+    }
+}
+
+#[inline(never)]
+fn copy_radix8_pure_partial_256(
+    novel_low: [&[Gf2_256]; 8],
+    dst: &mut [&mut [MaybeUninit<Gf2_256>]],
+    start: usize,
+    end: usize,
+    tw: &[Mul128; 5],
+) {
+    let octants = dst.len();
+    assert!((1..8).contains(&octants) && start <= end);
+    assert!(novel_low.iter().all(|s| s.len() >= end) && dst.iter().all(|s| s.len() >= end));
+    let [m4, m2_0, m1_0, p2, p4] = *tw;
     for i in start..end {
         let mut v0: [V; 8] = std::array::from_fn(|k| vector::load(novel_low[k][i].0));
         vector::radix8_8lanes_partial(&mut v0, m4, m2_0, m1_0, p2, p4, octants);
@@ -864,33 +1233,21 @@ fn copy_radix8_octants_256(
     let e = novel_low[0].len();
     assert!((1..=8).contains(&octants));
     assert!(novel_low.iter().all(|s| s.len() == e) && dst.iter().all(|s| s.len() == e));
+    let tw = [m4, m2_0, m1_0, p2, p4];
     let min_hi = novel_high.iter().map(|s| s.len()).min().unwrap_or(0);
     let max_hi = novel_high.iter().map(|s| s.len()).max().unwrap_or(0);
     if min_hi > 0 {
         copy_radix8_full_256(novel_low, novel_high, dst, min_hi, pw_eff, m4, m2_0, m1_0, p2, p4);
     }
-    for i in min_hi..max_hi {
-        let mut v0 = [vector::zero(); 8];
-        let mut v1 = [vector::zero(); 8];
-        for k in 0..8 {
-            let lo = load_256(novel_low[k][i]);
-            if i < novel_high[k].len() {
-                let hi = load_256(novel_high[k][i]);
-                v0[k] = pw_eff.mul_xor_v(lo.0, hi.0);
-                v1[k] = pw_eff.mul_xor_v(lo.1, hi.1);
-            } else {
-                v0[k] = lo.0;
-                v1[k] = lo.1;
-            }
-        }
-        vector::radix8_8lanes_partial(&mut v0, m4, m2_0, m1_0, p2, p4, octants);
-        vector::radix8_8lanes_partial(&mut v1, m4, m2_0, m1_0, p2, p4, octants);
-        for (k, out_oct) in dst.iter_mut().enumerate() {
-            out_oct[i].write(store_256((v0[k], v1[k])));
-        }
+    if min_hi < max_hi {
+        copy_radix8_ragged_256(novel_low, novel_high, dst, min_hi, max_hi, pw_eff, &tw);
     }
     if max_hi < e {
-        copy_radix8_pure_256(novel_low, dst, max_hi, e, m4, m2_0, m1_0, p2, p4);
+        if octants == 8 {
+            copy_radix8_pure_8_256(novel_low, dst, max_hi, e, &tw);
+        } else {
+            copy_radix8_pure_partial_256(novel_low, dst, max_hi, e, &tw);
+        }
     }
 }
 
@@ -977,6 +1334,35 @@ fn apply_radix8_block_256<const TRANSPOSE: bool>(
     }
 }
 
+#[inline(always)]
+fn apply_radix8_block_compact_256<const TRANSPOSE: bool>(
+    block: &mut [Gf2_256; 8],
+    m4: Mul128,
+    m2_0: Mul128,
+    m1_0: Mul128,
+    p2: Mul128,
+    p4: Mul128,
+) {
+    let mut v0 = std::array::from_fn(|j| vector::load(block[j].0));
+    if TRANSPOSE {
+        vector::transpose_radix8_8lanes_compact(&mut v0, m4, m2_0, m1_0, p2, p4);
+    } else {
+        vector::radix8_8lanes_compact(&mut v0, m4, m2_0, m1_0, p2, p4);
+    }
+    for j in 0..8 {
+        block[j].0 = vector::store(v0[j]);
+    }
+    let mut v1 = std::array::from_fn(|j| vector::load(block[j].1));
+    if TRANSPOSE {
+        vector::transpose_radix8_8lanes_compact(&mut v1, m4, m2_0, m1_0, p2, p4);
+    } else {
+        vector::radix8_8lanes_compact(&mut v1, m4, m2_0, m1_0, p2, p4);
+    }
+    for j in 0..8 {
+        block[j].1 = vector::store(v1[j]);
+    }
+}
+
 fn radix8_steps_256<const TRANSPOSE: bool>(
     values: &mut [Gf2_256],
     base4: u128,
@@ -988,26 +1374,20 @@ fn radix8_steps_256<const TRANSPOSE: bool>(
     let p2 = load_m(steps[0][0]);
     let p4 = load_m(steps[1][0]);
     let mut m4 = Mul128::new(base4);
-    let m2_0 = Mul128::new(base2);
-    let mut m2 = [m2_0, m2_0.xor(p2)];
-    let m1_0 = Mul128::new(base1);
-    let m1_1 = m1_0.xor(p2);
-    let mut m1 = [m1_0, m1_1, m1_0.xor(p4), m1_1.xor(p4)];
+    let mut m2_0 = Mul128::new(base2);
+    let mut m1_0 = Mul128::new(base1);
     let (blocks, remainder) = values.as_chunks_mut::<8>();
     let n = blocks.len();
     assert!(remainder.is_empty());
     assert!((1..=65536).contains(&n));
     for (i, block) in blocks.iter_mut().enumerate() {
-        apply_radix8_block_256::<TRANSPOSE>(block, m4, m2, m1);
+        apply_radix8_block_compact_256::<TRANSPOSE>(block, m4, m2_0, m1_0, p2, p4);
         let next = i + 1;
         if next < n {
             let tz = (next.trailing_zeros() as usize) & 15;
-            let d4 = load_m(steps[0][tz]);
-            let d2 = load_m(steps[1][tz]);
-            let d1 = load_m(steps[2][tz]);
-            m4 = m4.xor(d4);
-            m2 = [m2[0].xor(d2), m2[1].xor(d2)];
-            m1 = [m1[0].xor(d1), m1[1].xor(d1), m1[2].xor(d1), m1[3].xor(d1)];
+            m4 = m4.xor(load_m(steps[0][tz]));
+            m2_0 = m2_0.xor(load_m(steps[1][tz]));
+            m1_0 = m1_0.xor(load_m(steps[2][tz]));
         }
     }
 }
@@ -1203,6 +1583,49 @@ impl BinaryField for Gf2_256 {
         assert_eq!(values.len(), len);
     }
 
+    #[inline(always)]
+    fn copy_radix8_strided_uninit(
+        src: &[Self],
+        src_stride: usize,
+        dst: &mut [MaybeUninit<Self>],
+        dst_stride: usize,
+        len: usize,
+        tw: &[(u128, u128); 5],
+        zero_prefix: bool,
+    ) {
+        copy_radix8_strided_8_256(src, src_stride, dst, dst_stride, len, tw, zero_prefix);
+    }
+
+    #[inline(always)]
+    fn copy_radix8_from_strided_uninit(
+        src: &[Self],
+        src_stride: usize,
+        dst: [&mut [MaybeUninit<Self>]; 8],
+        tw: &[(u128, u128); 5],
+        zero_prefix: bool,
+    ) {
+        if zero_prefix {
+            copy_radix8_from_strided_zero_256(src, src_stride, dst, tw);
+        } else {
+            copy_radix8_from_strided_nonzero_256(src, src_stride, dst, tw);
+        }
+    }
+
+    #[inline(always)]
+    fn copy_radix8_to_strided_uninit(
+        src: [&[Self]; 8],
+        dst: &mut [MaybeUninit<Self>],
+        dst_stride: usize,
+        tw: &[(u128, u128); 5],
+        zero_prefix: bool,
+    ) {
+        if zero_prefix {
+            copy_radix8_to_strided_zero_256(src, dst, dst_stride, tw);
+        } else {
+            copy_radix8_to_strided_nonzero_256(src, dst, dst_stride, tw);
+        }
+    }
+
     fn copy_half_radix8_octants_uninit(
         novel_low: [&[Self]; 8],
         novel_high: [&[Self]; 8],
@@ -1239,6 +1662,43 @@ impl BinaryField for Gf2_256 {
         assert!(half >= 8 && half.is_multiple_of(8) && (1..=8).contains(&octants));
         let e = half / 8;
         assert!(dst.len() == octants * e && novel_high.len() <= half);
+        if octants == 8 && novel_high.len() < e {
+            let p2_w = w2[0] ^ w2[1];
+            let p4_w = w1[0] ^ w1[2];
+            assert!(w1[1] == (w1[0] ^ p2_w) && w1[3] == (w1[1] ^ p4_w));
+            let tw = [
+                Mul128::new(w4),
+                Mul128::new(w2[0]),
+                Mul128::new(w1[0]),
+                Mul128::new(p2_w),
+                Mul128::new(p4_w),
+            ];
+            let max_hi = novel_high.len();
+            if max_hi > 0 {
+                let low_oct = split_octants_ref_256(novel_low);
+                let high_oct = split_high_octants_256(novel_high, e);
+                let mut dst_vec: [&mut [MaybeUninit<Self>]; 8] = Default::default();
+                let mut rest = &mut *dst;
+                for slot in &mut dst_vec {
+                    let (head, tail) = rest.split_at_mut(e);
+                    *slot = head;
+                    rest = tail;
+                }
+                copy_radix8_ragged_256(low_oct, high_oct, &mut dst_vec, 0, max_hi, Mul128::new(w_eff), &tw);
+            }
+            let tw_pairs =
+                [tw[0].to_pair(), tw[1].to_pair(), tw[2].to_pair(), tw[3].to_pair(), tw[4].to_pair()];
+            copy_radix8_strided_8_256(
+                &novel_low[max_hi..],
+                e,
+                &mut dst[max_hi..],
+                e,
+                e - max_hi,
+                &tw_pairs,
+                w4 == 0 && w2[0] == 0 && w1[0] == 0,
+            );
+            return;
+        }
         let low_oct = split_octants_ref_256(novel_low);
         let high_oct = split_high_octants_256(novel_high, e);
         let mut dst_vec: [&mut [MaybeUninit<Self>]; 8] = Default::default();
@@ -1353,14 +1813,20 @@ impl BinaryField for Gf2_256 {
 
     fn eval_horner_base(coefficients: &[Self], x: u128) -> Self {
         let len = coefficients.len();
-        if len >= 64 {
+        if len <= 1 {
+            return coefficients.first().copied().unwrap_or(Self::ZERO);
+        }
+        if len >= 160 {
             return eval_horner_blocked_base_256(coefficients, x);
+        }
+        if len >= 4 {
+            return eval_horner_4way_base_256(coefficients, x);
         }
         let px = Mul128::new(x);
         let acc = coefficients.iter().rev().fold((vector::zero(), vector::zero()), |acc, c| {
             (px.mul_xor_v(vector::load(c.0), acc.0), px.mul_xor_v(vector::load(c.1), acc.1))
         });
-        assert!(len < 64);
+        assert!(len < 4);
         store_256(acc)
     }
 

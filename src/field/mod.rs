@@ -415,6 +415,41 @@ pub trait BinaryField: Field {
         unreachable!("implemented for concrete binary fields");
     }
 
+    fn copy_radix8_strided_uninit(
+        src: &[Self],
+        src_stride: usize,
+        dst: &mut [MaybeUninit<Self>],
+        dst_stride: usize,
+        len: usize,
+        tw: &[(u128, u128); 5],
+        zero_prefix: bool,
+    ) {
+        let _ = (src, src_stride, dst, dst_stride, len, tw, zero_prefix);
+        unreachable!("implemented for concrete binary fields");
+    }
+
+    fn copy_radix8_from_strided_uninit(
+        src: &[Self],
+        src_stride: usize,
+        dst: [&mut [MaybeUninit<Self>]; 8],
+        tw: &[(u128, u128); 5],
+        zero_prefix: bool,
+    ) {
+        let _ = (src, src_stride, dst, tw, zero_prefix);
+        unreachable!("implemented for concrete binary fields");
+    }
+
+    fn copy_radix8_to_strided_uninit(
+        src: [&[Self]; 8],
+        dst: &mut [MaybeUninit<Self>],
+        dst_stride: usize,
+        tw: &[(u128, u128); 5],
+        zero_prefix: bool,
+    ) {
+        let _ = (src, dst, dst_stride, tw, zero_prefix);
+        unreachable!("implemented for concrete binary fields");
+    }
+
     #[allow(clippy::too_many_arguments)]
     fn copy_half_radix8_octants_uninit(
         novel_low: [&[Self]; 8],

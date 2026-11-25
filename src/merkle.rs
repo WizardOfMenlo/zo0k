@@ -14,8 +14,20 @@ const PRUNE_SKIP_NARROW: usize = 5;
 const PRUNE_SKIP_WIDE: usize = 3;
 const PRUNE_LEAF_NARROW_MAX: usize = 1024;
 const OPEN_PARALLEL_WORK_MIN: usize = 8192;
-const LEAF_TILE_MAX: usize = 24;
+const LEAF_TILE_MAX: usize = 8;
 const LEAF_TILE_BYTES_MAX: usize = 16384;
+
+fn subtree_piece_min(num_subtrees: usize, leaf_len_bytes: usize) -> usize {
+    assert!(num_subtrees > 0 && leaf_len_bytes >= 8);
+    let threads = parallel::threads();
+    let piece_min = if leaf_len_bytes > PRUNE_LEAF_NARROW_MAX || num_subtrees < 16 * threads {
+        1
+    } else {
+        SUBTREE_PIECE_MIN
+    };
+    assert!(piece_min == 1 || piece_min == SUBTREE_PIECE_MIN);
+    piece_min
+}
 
 #[derive(Clone, Copy)]
 struct RawMut(*mut Digest);
@@ -43,14 +55,8 @@ pub fn leaf_digest<H: Hasher, F: Field>(position: usize, column: impl IntoIterat
 
 fn leaf_tile_len(leaf_len_bytes: usize) -> usize {
     assert!(leaf_len_bytes >= 8);
-    let tile = if LEAF_TILE_MAX * leaf_len_bytes <= LEAF_TILE_BYTES_MAX {
-        LEAF_TILE_MAX
-    } else if 8 * leaf_len_bytes <= LEAF_TILE_BYTES_MAX {
-        8
-    } else {
-        4
-    };
-    assert!(tile == 4 || tile == 8 || tile == LEAF_TILE_MAX);
+    let tile = if LEAF_TILE_MAX * leaf_len_bytes <= LEAF_TILE_BYTES_MAX { LEAF_TILE_MAX } else { 4 };
+    assert!(tile == 4 || tile == LEAF_TILE_MAX);
     tile
 }
 
@@ -195,7 +201,8 @@ fn append_subtree_pass<H: Hasher>(levels: &mut Vec<Vec<Digest>>) {
     }
     let below_ref: &[Digest] = &levels[base_idx];
     let num_subtrees = len.div_ceil(SUBTREE_LEAVES);
-    parallel::map_pieces(num_subtrees, SUBTREE_PIECE_MIN, |range| {
+    let piece_min = subtree_piece_min(num_subtrees, 64);
+    parallel::map_pieces(num_subtrees, piece_min, |range| {
         let mut buf_a = [[0u8; 32]; SUBTREE_LEAVES];
         let mut buf_b = [[0u8; 32]; SUBTREE_LEAVES / 2];
         for subtree in range {
@@ -300,7 +307,8 @@ impl MerkleTree {
             H::hash_rows_range(rows, 0, len, &mut scratch, &mut leaves);
             return Self::new::<H>(leaves);
         }
-        let skip_levels = choose_skip_levels(len, 8 + rows.len() * F::BYTES);
+        let leaf_len_bytes = 8 + rows.len() * F::BYTES;
+        let skip_levels = choose_skip_levels(len, leaf_len_bytes);
         let lens = level_lengths(len, SUBTREE_HEIGHT + 1);
         let mut levels: Vec<Vec<Digest>> =
             lens[skip_levels..].iter().map(|&n| Vec::with_capacity(n)).collect();
@@ -310,7 +318,8 @@ impl MerkleTree {
         }
         assert!(ptrs.len() == SUBTREE_HEIGHT + 1);
         let num_subtrees = len.div_ceil(SUBTREE_LEAVES);
-        parallel::map_pieces(num_subtrees, SUBTREE_PIECE_MIN, |range| {
+        let piece_min = subtree_piece_min(num_subtrees, leaf_len_bytes);
+        parallel::map_pieces(num_subtrees, piece_min, |range| {
             let mut scratch = Vec::new();
             let mut buf_a = [[0u8; 32]; SUBTREE_LEAVES];
             let mut buf_b = [[0u8; 32]; SUBTREE_LEAVES / 2];
