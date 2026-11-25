@@ -17,12 +17,23 @@ mod neon {
     pub type V = uint64x2_t;
 
     #[inline(always)]
+    pub fn pack_v(mut v: V) -> V {
+        unsafe {
+            std::arch::asm!(
+                "/* {0:v} */",
+                inout(vreg) v,
+                options(pure, nomem, nostack, preserves_flags)
+            );
+        }
+        v
+    }
+    #[inline(always)]
     pub fn zero() -> V {
         unsafe { vdupq_n_u64(0) }
     }
     #[inline(always)]
     pub fn modulus() -> V {
-        unsafe { vdupq_n_u64(MODULUS_LOW) }
+        pack_v(unsafe { vdupq_n_u64(MODULUS_LOW) })
     }
     #[inline(always)]
     pub fn load(a: u128) -> V {
@@ -113,6 +124,10 @@ mod sse {
 
     pub type V = __m128i;
 
+    #[inline(always)]
+    pub fn pack_v(v: V) -> V {
+        v
+    }
     #[inline(always)]
     pub fn zero() -> V {
         unsafe { _mm_setzero_si128() }
@@ -221,6 +236,10 @@ mod portable {
     }
 
     #[inline(always)]
+    pub fn pack_v(v: V) -> V {
+        v
+    }
+    #[inline(always)]
     pub fn zero() -> V {
         0
     }
@@ -304,7 +323,7 @@ impl Mul128 {
     pub fn new(b: u128) -> Self {
         let b = load(b);
         let b_x64 = xor(shift_up(b), mul_high(b, modulus()));
-        Self { b_lo: zip_lo(b, b_x64), b_hi: zip_hi(b, b_x64) }
+        Self { b_lo: pack_v(zip_lo(b, b_x64)), b_hi: pack_v(zip_hi(b, b_x64)) }
     }
 
     #[inline(always)]
@@ -323,6 +342,11 @@ impl Mul128 {
     }
 
     #[inline(always)]
+    pub fn xor3(self, a: Self, b: Self) -> Self {
+        Self { b_lo: xor3(self.b_lo, a.b_lo, b.b_lo), b_hi: xor3(self.b_hi, a.b_hi, b.b_hi) }
+    }
+
+    #[inline(always)]
     pub fn mul_lm(self, a: V) -> (V, V) {
         (
             xor(mul_low(a, self.b_lo), mul_high(a, self.b_lo)),
@@ -333,14 +357,14 @@ impl Mul128 {
     #[inline(always)]
     pub fn mul_v(self, a: V) -> V {
         let (l, m) = self.mul_lm(a);
-        xor3(l, shift_up(m), mul_high(m, modulus()))
+        reduce_lm(l, m)
     }
 
     #[inline(always)]
     pub fn mul_xor_v(self, r: V, a: V) -> V {
         let l = xor3(r, mul_low(a, self.b_lo), mul_high(a, self.b_lo));
         let m = xor(mul_low(a, self.b_hi), mul_high(a, self.b_hi));
-        xor3(l, shift_up(m), mul_high(m, modulus()))
+        reduce_lm(l, m)
     }
 
     #[inline(always)]
@@ -349,11 +373,15 @@ impl Mul128 {
     }
 }
 
+#[inline(always)]
+pub fn reduce_lm(l: V, m: V) -> V {
+    xor3(l, shift_up(m), mul_high(m, modulus()))
+}
+
 #[derive(Clone, Copy)]
 pub struct Mul256 {
     c: Mul128,
     dx: Mul128,
-    d: Mul128,
     cd: Mul128,
 }
 
@@ -361,39 +389,225 @@ impl Mul256 {
     #[inline(always)]
     pub fn new(c: u128, d: u128) -> Self {
         let dx = store(mul_x121(load(d)));
-        Self { c: Mul128::new(c), dx: Mul128::new(dx), d: Mul128::new(d), cd: Mul128::new(c ^ d) }
+        Self { c: Mul128::new(c), dx: Mul128::new(dx), cd: Mul128::new(c ^ d) }
+    }
+
+    #[inline(always)]
+    pub fn mul_lm_pair(self, a: V, b: V) -> ((V, V), (V, V)) {
+        let (l0, m0) = self.c.mul_lm(a);
+        let (l1, m1) = self.dx.mul_lm(b);
+        let (l2, m2) = self.cd.mul_lm(xor(a, b));
+        ((xor(l0, l1), xor(m0, m1)), (xor(l0, l2), xor(m0, m2)))
     }
 
     #[inline(always)]
     pub fn mul_pair(self, a: V, b: V) -> (V, V) {
-        let m = modulus();
-        let (l0, m0) = self.c.mul_lm(a);
-        let (l1, m1) = self.dx.mul_lm(b);
-        let l_lo = xor(l0, l1);
-        let m_lo = xor(m0, m1);
-        let lo = xor3(l_lo, shift_up(m_lo), mul_high(m_lo, m));
-        let (l2, m2) = self.d.mul_lm(a);
-        let (l3, m3) = self.cd.mul_lm(b);
-        let l_hi = xor(l2, l3);
-        let m_hi = xor(m2, m3);
-        let hi = xor3(l_hi, shift_up(m_hi), mul_high(m_hi, m));
-        (lo, hi)
+        let ((l_lo, m_lo), (l_hi, m_hi)) = self.mul_lm_pair(a, b);
+        (reduce_lm(l_lo, m_lo), reduce_lm(l_hi, m_hi))
     }
 
     #[inline(always)]
     pub fn mul_xor_pair(self, r0: V, r1: V, a: V, b: V) -> (V, V) {
-        let m = modulus();
         let (l0, m0) = self.c.mul_lm(a);
         let (l1, m1) = self.dx.mul_lm(b);
-        let l_lo = xor3(r0, l0, l1);
-        let m_lo = xor(m0, m1);
-        let lo = xor3(l_lo, shift_up(m_lo), mul_high(m_lo, m));
-        let (l2, m2) = self.d.mul_lm(a);
-        let (l3, m3) = self.cd.mul_lm(b);
-        let l_hi = xor3(r1, l2, l3);
-        let m_hi = xor(m2, m3);
-        let hi = xor3(l_hi, shift_up(m_hi), mul_high(m_hi, m));
+        let (l2, m2) = self.cd.mul_lm(xor(a, b));
+        let lo = reduce_lm(xor3(r0, l0, l1), xor(m0, m1));
+        let hi = reduce_lm(xor3(r1, l0, l2), xor(m0, m2));
         (lo, hi)
+    }
+}
+
+#[inline(always)]
+pub fn butterfly_step_v(r: V, q: V, p: Mul128) -> (V, V) {
+    let nr = p.mul_xor_v(r, q);
+    (nr, xor(q, nr))
+}
+
+#[inline(always)]
+pub fn transpose_butterfly_step_v(u: V, v: V, p: Mul128) -> (V, V) {
+    let nu = xor(u, v);
+    (nu, p.mul_xor_v(v, nu))
+}
+
+#[inline(always)]
+pub fn radix8_8lanes_zero_prefix(v: &mut [V; 8], m2_1: Mul128, m1_1: Mul128, m1_2: Mul128, m1_3: Mul128) {
+    for j in 0..4 {
+        v[j + 4] = xor(v[j + 4], v[j]);
+    }
+    for j in 0..2 {
+        v[j + 2] = xor(v[j + 2], v[j]);
+        (v[j + 4], v[j + 6]) = butterfly_step_v(v[j + 4], v[j + 6], m2_1);
+    }
+    v[1] = xor(v[1], v[0]);
+    (v[2], v[3]) = butterfly_step_v(v[2], v[3], m1_1);
+    (v[4], v[5]) = butterfly_step_v(v[4], v[5], m1_2);
+    (v[6], v[7]) = butterfly_step_v(v[6], v[7], m1_3);
+}
+
+#[inline(always)]
+pub fn radix8_8lanes_partial(
+    v: &mut [V; 8],
+    m4: Mul128,
+    m2_0: Mul128,
+    m1_0: Mul128,
+    p2: Mul128,
+    p4: Mul128,
+    octants: usize,
+) {
+    assert!((1..=8).contains(&octants));
+    if octants <= 4 {
+        for j in 0..4 {
+            v[j] = m4.mul_xor_v(v[j], v[j + 4]);
+        }
+    } else {
+        for j in 0..4 {
+            (v[j], v[j + 4]) = butterfly_step_v(v[j], v[j + 4], m4);
+        }
+    }
+    if octants <= 2 {
+        for j in 0..2 {
+            v[j] = m2_0.mul_xor_v(v[j], v[j + 2]);
+        }
+    } else {
+        for j in 0..2 {
+            (v[j], v[j + 2]) = butterfly_step_v(v[j], v[j + 2], m2_0);
+        }
+    }
+    if octants > 4 {
+        let m2_1 = m2_0.xor(p2);
+        if octants <= 6 {
+            for j in 0..2 {
+                v[j + 4] = m2_1.mul_xor_v(v[j + 4], v[j + 6]);
+            }
+        } else {
+            for j in 0..2 {
+                (v[j + 4], v[j + 6]) = butterfly_step_v(v[j + 4], v[j + 6], m2_1);
+            }
+        }
+    }
+    let m1 = [m1_0, m1_0.xor(p2), m1_0.xor(p4), m1_0.xor3(p2, p4)];
+    let pairs = octants.div_ceil(2);
+    assert!((1..=4).contains(&pairs));
+    for j in 0..pairs {
+        if 2 * j + 1 < octants {
+            (v[2 * j], v[2 * j + 1]) = butterfly_step_v(v[2 * j], v[2 * j + 1], m1[j]);
+        } else {
+            v[2 * j] = m1[j].mul_xor_v(v[2 * j], v[2 * j + 1]);
+        }
+    }
+}
+
+#[inline(always)]
+pub fn radix8_8lanes_twiddles(v: &mut [V; 8], m4: Mul128, m2: [Mul128; 2], m1: [Mul128; 4]) {
+    for j in 0..4 {
+        (v[j], v[j + 4]) = butterfly_step_v(v[j], v[j + 4], m4);
+    }
+    for j in 0..2 {
+        (v[j], v[j + 2]) = butterfly_step_v(v[j], v[j + 2], m2[0]);
+        (v[j + 4], v[j + 6]) = butterfly_step_v(v[j + 4], v[j + 6], m2[1]);
+    }
+    for j in 0..4 {
+        (v[2 * j], v[2 * j + 1]) = butterfly_step_v(v[2 * j], v[2 * j + 1], m1[j]);
+    }
+}
+
+#[inline(always)]
+pub fn transpose_radix8_8lanes_twiddles(v: &mut [V; 8], m4: Mul128, m2: [Mul128; 2], m1: [Mul128; 4]) {
+    for j in 0..4 {
+        (v[2 * j], v[2 * j + 1]) = transpose_butterfly_step_v(v[2 * j], v[2 * j + 1], m1[j]);
+    }
+    for j in 0..2 {
+        (v[j], v[j + 2]) = transpose_butterfly_step_v(v[j], v[j + 2], m2[0]);
+        (v[j + 4], v[j + 6]) = transpose_butterfly_step_v(v[j + 4], v[j + 6], m2[1]);
+    }
+    for j in 0..4 {
+        (v[j], v[j + 4]) = transpose_butterfly_step_v(v[j], v[j + 4], m4);
+    }
+}
+
+#[inline(never)]
+pub fn radix8_rows_compact(
+    rows: &mut [[V; 8]],
+    m4: Mul128,
+    m2_0: Mul128,
+    m1_0: Mul128,
+    p2: Mul128,
+    p4: Mul128,
+) {
+    let len = rows.len();
+    assert!(len >= 1);
+    let m2_1 = m2_0.xor(p2);
+    let m1_1 = m1_0.xor(p2);
+    let m1_2 = m1_0.xor(p4);
+    let m1_3 = m1_1.xor(p4);
+    let m2 = [m2_0, m2_1];
+    let m1 = [m1_0, m1_1, m1_2, m1_3];
+    for row in rows.iter_mut() {
+        radix8_8lanes_twiddles(row, m4, m2, m1);
+    }
+    assert_eq!(rows.len(), len);
+}
+
+#[inline(never)]
+pub fn radix8_rows_partial(
+    rows: &mut [[V; 8]],
+    m4: Mul128,
+    m2_0: Mul128,
+    m1_0: Mul128,
+    p2: Mul128,
+    p4: Mul128,
+    octants: usize,
+) {
+    let len = rows.len();
+    assert!(len >= 1 && (1..=8).contains(&octants));
+    for row in rows.iter_mut() {
+        radix8_8lanes_partial(row, m4, m2_0, m1_0, p2, p4, octants);
+    }
+    assert_eq!(rows.len(), len);
+}
+
+#[inline(always)]
+pub fn radix8_8lanes_compact(v: &mut [V; 8], m4: Mul128, m2_0: Mul128, m1_0: Mul128, p2: Mul128, p4: Mul128) {
+    for j in 0..4 {
+        (v[j], v[j + 4]) = butterfly_step_v(v[j], v[j + 4], m4);
+    }
+    let m2_1 = m2_0.xor(p2);
+    for j in 0..2 {
+        (v[j], v[j + 2]) = butterfly_step_v(v[j], v[j + 2], m2_0);
+        (v[j + 4], v[j + 6]) = butterfly_step_v(v[j + 4], v[j + 6], m2_1);
+    }
+    (v[0], v[1]) = butterfly_step_v(v[0], v[1], m1_0);
+    let m1_1 = m1_0.xor(p2);
+    (v[2], v[3]) = butterfly_step_v(v[2], v[3], m1_1);
+    let m1_3 = m1_1.xor(p4);
+    (v[6], v[7]) = butterfly_step_v(v[6], v[7], m1_3);
+    let m1_2 = m1_0.xor(p4);
+    (v[4], v[5]) = butterfly_step_v(v[4], v[5], m1_2);
+}
+
+#[inline(always)]
+pub fn transpose_radix8_8lanes_compact(
+    v: &mut [V; 8],
+    m4: Mul128,
+    m2_0: Mul128,
+    m1_0: Mul128,
+    p2: Mul128,
+    p4: Mul128,
+) {
+    (v[0], v[1]) = transpose_butterfly_step_v(v[0], v[1], m1_0);
+    let m1_1 = m1_0.xor(p2);
+    (v[2], v[3]) = transpose_butterfly_step_v(v[2], v[3], m1_1);
+    let m1_3 = m1_1.xor(p4);
+    (v[6], v[7]) = transpose_butterfly_step_v(v[6], v[7], m1_3);
+    let m1_2 = m1_0.xor(p4);
+    (v[4], v[5]) = transpose_butterfly_step_v(v[4], v[5], m1_2);
+    let m2_1 = m2_0.xor(p2);
+    for j in 0..2 {
+        (v[j], v[j + 2]) = transpose_butterfly_step_v(v[j], v[j + 2], m2_0);
+        (v[j + 4], v[j + 6]) = transpose_butterfly_step_v(v[j + 4], v[j + 6], m2_1);
+    }
+    for j in 0..4 {
+        (v[j], v[j + 4]) = transpose_butterfly_step_v(v[j], v[j + 4], m4);
     }
 }
 
@@ -411,7 +625,7 @@ impl Acc128 {
     }
 
     #[inline(always)]
-    pub fn add_product(&mut self, a: V, b: V) {
+    pub fn add_product_pre(&mut self, a: V, b: V, b_aux: V) {
         self.lo = xor(self.lo, mul_low(a, b));
         self.hi = xor(self.hi, mul_high(a, b));
         #[cfg(any(
@@ -419,17 +633,38 @@ impl Acc128 {
             all(target_arch = "x86_64", target_feature = "pclmulqdq")
         ))]
         {
-            let b_sw = swap_lanes(b);
-            self.mid = xor3(self.mid, mul_low(a, b_sw), mul_high(a, b_sw));
+            self.mid = xor3(self.mid, mul_low(a, b_aux), mul_high(a, b_aux));
         }
         #[cfg(not(any(
             all(target_arch = "aarch64", target_feature = "aes", target_endian = "little"),
             all(target_arch = "x86_64", target_feature = "pclmulqdq")
         )))]
         {
-            let p_sum = mul_low(xor(a, swap_lanes(a)), xor(b, swap_lanes(b)));
-            self.mid = xor(self.mid, p_sum);
+            self.mid = xor(self.mid, mul_low(xor(a, swap_lanes(a)), b_aux));
         }
+    }
+
+    #[inline(always)]
+    pub fn precompute_aux(b: V) -> V {
+        #[cfg(any(
+            all(target_arch = "aarch64", target_feature = "aes", target_endian = "little"),
+            all(target_arch = "x86_64", target_feature = "pclmulqdq")
+        ))]
+        {
+            swap_lanes(b)
+        }
+        #[cfg(not(any(
+            all(target_arch = "aarch64", target_feature = "aes", target_endian = "little"),
+            all(target_arch = "x86_64", target_feature = "pclmulqdq")
+        )))]
+        {
+            xor(b, swap_lanes(b))
+        }
+    }
+
+    #[inline(always)]
+    pub fn add_product(&mut self, a: V, b: V) {
+        self.add_product_pre(a, b, Self::precompute_aux(b));
     }
 
     #[inline(always)]
@@ -471,6 +706,18 @@ impl Acc128 {
 pub fn mul_wide(a: V, b: V) -> (V, V) {
     let low = mul_low(a, b);
     let high = mul_high(a, b);
+    #[cfg(any(
+        all(target_arch = "aarch64", target_feature = "aes", target_endian = "little"),
+        all(target_arch = "x86_64", target_feature = "pclmulqdq")
+    ))]
+    let middle = {
+        let bs = swap_lanes(b);
+        xor(mul_low(a, bs), mul_high(a, bs))
+    };
+    #[cfg(not(any(
+        all(target_arch = "aarch64", target_feature = "aes", target_endian = "little"),
+        all(target_arch = "x86_64", target_feature = "pclmulqdq")
+    )))]
     let middle = xor3(mul_low(xor(a, swap_lanes(a)), xor(b, swap_lanes(b))), low, high);
     (xor(low, shift_up(middle)), xor(high, shift_down(middle)))
 }
@@ -488,6 +735,18 @@ pub fn mul(a: u128, b: u128) -> u128 {
     let (a, b) = (load(a), load(b));
     let low_raw = mul_low(a, b);
     let high_raw = mul_high(a, b);
+    #[cfg(any(
+        all(target_arch = "aarch64", target_feature = "aes", target_endian = "little"),
+        all(target_arch = "x86_64", target_feature = "pclmulqdq")
+    ))]
+    let middle = {
+        let bs = swap_lanes(b);
+        xor(mul_low(a, bs), mul_high(a, bs))
+    };
+    #[cfg(not(any(
+        all(target_arch = "aarch64", target_feature = "aes", target_endian = "little"),
+        all(target_arch = "x86_64", target_feature = "pclmulqdq")
+    )))]
     let middle = xor3(mul_low(xor(a, swap_lanes(a)), xor(b, swap_lanes(b))), low_raw, high_raw);
     store(reduce_karatsuba(low_raw, middle, high_raw))
 }
