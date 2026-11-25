@@ -133,6 +133,69 @@ pub trait Field:
             *d += s;
         }
     }
+
+    fn scale_slice(dst: &mut [Self], scale: Self) {
+        if scale == Self::ONE {
+            return;
+        }
+        if scale == Self::ZERO {
+            dst.fill(Self::ZERO);
+            return;
+        }
+        for d in dst {
+            *d *= scale;
+        }
+    }
+
+    fn scale_to_uninit(dst: &mut [MaybeUninit<Self>], src: &[Self], scale: Self) {
+        assert_eq!(dst.len(), src.len());
+        for (d, &s) in dst.iter_mut().zip(src) {
+            d.write(s * scale);
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn fold_and_round_slice(
+        a0: &mut [Self],
+        a1: &mut [Self],
+        a2: &[Self],
+        a3: &[Self],
+        b0: &mut [Self],
+        b1: &mut [Self],
+        b2: &[Self],
+        b3: &[Self],
+        challenge: Self,
+    ) -> (Self, Self) {
+        let len = a0.len();
+        assert!(a1.len() == len && a2.len() == len && a3.len() == len);
+        assert!(b0.len() == len && b1.len() == len && b2.len() == len && b3.len() == len);
+        Self::fold_slice(a0, a2, challenge);
+        Self::fold_slice(a1, a3, challenge);
+        Self::fold_slice(b0, b2, challenge);
+        Self::fold_slice(b1, b3, challenge);
+        Self::round_coefficients_slice(a0, a1, b0, b1)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn add_scaled_4_slice(
+        dst: &mut [Self],
+        s0: &[Self],
+        w0: Self,
+        s1: &[Self],
+        w1: Self,
+        s2: &[Self],
+        w2: Self,
+        s3: &[Self],
+        w3: Self,
+    ) {
+        let len = dst.len();
+        assert!(s0.len() == len && s1.len() == len);
+        assert!(s2.len() == len && s3.len() == len);
+        Self::add_scaled_slice(dst, s0, w0);
+        Self::add_scaled_slice(dst, s1, w1);
+        Self::add_scaled_slice(dst, s2, w2);
+        Self::add_scaled_slice(dst, s3, w3);
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -308,6 +371,146 @@ pub trait BinaryField: Field {
 
     fn eval_horner_base(coefficients: &[Self], x: u128) -> Self {
         coefficients.iter().rev().fold(Self::ZERO, |value, &c| value.mul_base(x) + c)
+    }
+
+    fn butterfly_radix8_steps(
+        values: &mut [Self],
+        base4: u128,
+        base2: u128,
+        base1: u128,
+        steps: &[[(u128, u128); 16]; 3],
+    ) {
+        let _ = (values, base4, base2, base1, steps);
+        unreachable!("implemented for concrete binary fields");
+    }
+
+    fn butterfly_radix8_stride8(
+        values: &mut [Self],
+        base4: u128,
+        base2: u128,
+        base1: u128,
+        steps: &[[(u128, u128); 16]; 3],
+    ) {
+        let _ = (values, base4, base2, base1, steps);
+        unreachable!("implemented for concrete binary fields");
+    }
+
+    fn butterfly_radix8_octants(octants: [&mut [Self]; 8], w4: u128, w2: [u128; 2], w1: [u128; 4]) {
+        let _ = (octants, w4, w2, w1);
+        unreachable!("implemented for concrete binary fields");
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn copy_half_radix8_partial_uninit(
+        novel_low: &[Self],
+        novel_high: &[Self],
+        dst: &mut [MaybeUninit<Self>],
+        octants: usize,
+        w_eff: u128,
+        w4: u128,
+        w2: [u128; 2],
+        w1: [u128; 4],
+    ) {
+        let _ = (novel_low, novel_high, dst, octants, w_eff, w4, w2, w1);
+        unreachable!("implemented for concrete binary fields");
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn copy_half_radix8_octants_uninit(
+        novel_low: [&[Self]; 8],
+        novel_high: [&[Self]; 8],
+        dst: &mut [&mut [MaybeUninit<Self>]],
+        w_eff: u128,
+        w4: u128,
+        w2: [u128; 2],
+        w1: [u128; 4],
+    ) {
+        let _ = (novel_low, novel_high, dst, w_eff, w4, w2, w1);
+        unreachable!("implemented for concrete binary fields");
+    }
+
+    fn transpose_butterfly_slice(low: &mut [Self], high: &mut [Self], twiddle: u128) {
+        assert_eq!(low.len(), high.len());
+        if twiddle == 0 {
+            for (u, v) in low.iter_mut().zip(high) {
+                *u += *v;
+            }
+        } else {
+            for (u, v) in low.iter_mut().zip(high) {
+                *u += *v;
+                *v += u.mul_base(twiddle);
+            }
+        }
+    }
+
+    fn transpose_from_low(low: &[Self], high: &mut [Self], twiddle: u128) {
+        assert_eq!(low.len(), high.len());
+        if twiddle == 0 {
+            high.fill(Self::ZERO);
+            return;
+        }
+        for (h, &l) in high.iter_mut().zip(low) {
+            *h = l.mul_base(twiddle);
+        }
+    }
+
+    fn transpose_from_high(low: &mut [Self], high: &mut [Self], twiddle: u128) {
+        assert_eq!(low.len(), high.len());
+        if twiddle == 0 {
+            low.copy_from_slice(high);
+            return;
+        }
+        let w1 = twiddle ^ 1;
+        for (l, h) in low.iter_mut().zip(high) {
+            let v = *h;
+            *l = v;
+            *h = v.mul_base(w1);
+        }
+    }
+
+    fn transpose_radix8_steps(
+        values: &mut [Self],
+        base4: u128,
+        base2: u128,
+        base1: u128,
+        steps: &[[(u128, u128); 16]; 3],
+    ) {
+        let _ = (values, base4, base2, base1, steps);
+        unreachable!("implemented for concrete binary fields");
+    }
+
+    fn transpose_radix8_stride8(
+        values: &mut [Self],
+        base4: u128,
+        base2: u128,
+        base1: u128,
+        steps: &[[(u128, u128); 16]; 3],
+    ) {
+        let _ = (values, base4, base2, base1, steps);
+        unreachable!("implemented for concrete binary fields");
+    }
+
+    fn transpose_radix8_outer(values: &mut [Self], w4: u128, w2: [u128; 2], w1: [u128; 4]) {
+        let len = values.len();
+        assert!(len >= 8 && len.is_multiple_of(8));
+        let half = len / 2;
+        let q = len / 4;
+        let e = len / 8;
+        let (lo, hi) = values.split_at_mut(half);
+        let (v01, v23) = lo.split_at_mut(q);
+        let (v45, v67) = hi.split_at_mut(q);
+        let (v0, v1) = v01.split_at_mut(e);
+        let (v2, v3) = v23.split_at_mut(e);
+        let (v4, v5) = v45.split_at_mut(e);
+        let (v6, v7) = v67.split_at_mut(e);
+        Self::transpose_butterfly_slice(v0, v1, w1[0]);
+        Self::transpose_butterfly_slice(v2, v3, w1[1]);
+        Self::transpose_butterfly_slice(v4, v5, w1[2]);
+        Self::transpose_butterfly_slice(v6, v7, w1[3]);
+        Self::transpose_butterfly_slice(v01, v23, w2[0]);
+        Self::transpose_butterfly_slice(v45, v67, w2[1]);
+        Self::transpose_butterfly_slice(lo, hi, w4);
+        assert_eq!(lo.len(), half);
     }
 }
 
