@@ -99,7 +99,7 @@ impl PiecePlan {
             return Self { len, align: 1, head_units: len, tail_units: 0, head_pieces: len, tail_pieces: 0 };
         }
         let align = if piece_len_min >= BOUNDARY_ALIGN
-            && len / BOUNDARY_ALIGN >= 2 * piece_len_min.div_ceil(BOUNDARY_ALIGN)
+            && (len / BOUNDARY_ALIGN) / 2 >= piece_len_min.div_ceil(BOUNDARY_ALIGN)
         {
             BOUNDARY_ALIGN
         } else {
@@ -107,12 +107,12 @@ impl PiecePlan {
         };
         let units = len / align;
         let min_units = piece_len_min.div_ceil(align);
-        assert!(units >= 2 * min_units);
+        assert!(units / 2 >= min_units);
         let head_p = threads * COMPUTE_HEAD_MULTIPLIER;
         let tail_p = threads * COMPUTE_TAIL_MULTIPLIER;
-        let head_u = (units * 3) / 4;
+        let head_u = units - units.div_ceil(4);
         let tail_u = units - head_u;
-        if head_u >= head_p * min_units && tail_u >= tail_p * min_units {
+        if head_u / head_p >= min_units && tail_u / tail_p >= min_units {
             return Self {
                 len,
                 align,
@@ -615,8 +615,6 @@ struct Slot {
     owner_sleeping: CachePadded<AtomicBool>,
     task: UnsafeCell<Option<*const (dyn Fn(usize) + Sync + 'static)>>,
     tasks_len: UnsafeCell<usize>,
-    done_lock: Mutex<()>,
-    done_cv: Condvar,
     panicked: AtomicBool,
     panic: Mutex<Option<Box<dyn Any + Send>>>,
 }
@@ -633,8 +631,6 @@ impl Slot {
             owner_sleeping: CachePadded(AtomicBool::new(false)),
             task: UnsafeCell::new(None),
             tasks_len: UnsafeCell::new(0),
-            done_lock: Mutex::new(()),
-            done_cv: Condvar::new(),
             panicked: AtomicBool::new(false),
             panic: Mutex::new(None),
         }
@@ -728,8 +724,6 @@ struct Job {
     claimed: CachePadded<AtomicUsize>,
     finished: CachePadded<AtomicUsize>,
     waiter_sleeping: CachePadded<AtomicBool>,
-    done_lock: Mutex<()>,
-    done_cv: Condvar,
 }
 
 unsafe impl Send for Job {}
@@ -748,8 +742,6 @@ impl Job {
             claimed: CachePadded(AtomicUsize::new(0)),
             finished: CachePadded(AtomicUsize::new(0)),
             waiter_sleeping: CachePadded(AtomicBool::new(false)),
-            done_lock: Mutex::new(()),
-            done_cv: Condvar::new(),
         }
     }
 
@@ -851,7 +843,7 @@ impl Pool {
             let wakes = current.min(max_wakes);
             (wakes, wakes > 1 && wakes == current)
         };
-        assert!(wakes.0 < THREADS_MAX);
+        assert!(wakes.0 <= max_wakes);
         if wakes.1 {
             self.wake.notify_all();
         } else {
@@ -935,8 +927,8 @@ impl Pool {
         let prev = slot.meta.0.fetch_sub(REF_UNIT, Ordering::SeqCst);
         assert!(prev & REF_MASK >= REF_UNIT);
         if (prev - REF_UNIT) & REF_MASK == 0 && slot.owner_sleeping.0.load(Ordering::SeqCst) {
-            let _guard = lock(&slot.done_lock);
-            slot.done_cv.notify_one();
+            let _queue = lock(&self.queue);
+            self.wake.notify_all();
         }
     }
 
@@ -964,13 +956,18 @@ impl Pool {
     fn sleep_slot_done(&self, idx: usize) {
         assert!(idx < SLOT_COUNT);
         let slot = &self.slots[idx];
-        let mut guard = lock(&slot.done_lock);
+        let mut queue = lock(&self.queue);
+        self.sleepers.0.fetch_add(1, Ordering::SeqCst);
         slot.owner_sleeping.0.store(true, Ordering::SeqCst);
-        if slot.meta.0.load(Ordering::SeqCst) & REF_MASK != 0 {
-            guard = wait(&slot.done_cv, guard);
+        let done = slot.meta.0.load(Ordering::SeqCst) & REF_MASK == 0;
+        let has_work = (self.active_mask.0.load(Ordering::SeqCst) & !(1u64 << idx)) != 0
+            || self.take_overflow_job(&mut queue).is_some();
+        if !done && !has_work {
+            queue = wait(&self.wake, queue);
         }
         slot.owner_sleeping.0.store(false, Ordering::Relaxed);
-        drop(guard);
+        self.sleepers.0.fetch_sub(1, Ordering::SeqCst);
+        drop(queue);
         assert!(idx < 64);
     }
 
@@ -998,7 +995,7 @@ impl Pool {
     }
 
     fn take_overflow_job(&self, queue: &mut Queue) -> Option<Arc<Job>> {
-        if queue.jobs.first().is_some_and(|job| job.is_exhausted()) {
+        if queue.jobs.last().is_some_and(|job| job.is_exhausted()) {
             queue.jobs.retain(|job| !job.is_exhausted());
             self.overflow_len.0.store(queue.jobs.len(), Ordering::Release);
         }
@@ -1045,10 +1042,27 @@ impl Pool {
             let finished = job.finished.0.fetch_add(completed, Ordering::SeqCst) + completed;
             assert!(finished <= job.tasks_len);
             if finished == job.tasks_len && job.waiter_sleeping.0.load(Ordering::SeqCst) {
-                let _guard = lock(&job.done_lock);
-                job.done_cv.notify_one();
+                let _queue = lock(&self.queue);
+                self.wake.notify_all();
             }
         }
+    }
+
+    fn sleep_overflow_done(&self, job: &Job) {
+        assert!(job.tasks_len >= 2);
+        let mut queue = lock(&self.queue);
+        self.sleepers.0.fetch_add(1, Ordering::SeqCst);
+        job.waiter_sleeping.0.store(true, Ordering::SeqCst);
+        let done = job.is_finished();
+        let has_work =
+            self.active_mask.0.load(Ordering::SeqCst) != 0 || self.take_overflow_job(&mut queue).is_some();
+        if !done && !has_work {
+            queue = wait(&self.wake, queue);
+        }
+        job.waiter_sleeping.0.store(false, Ordering::Relaxed);
+        self.sleepers.0.fetch_sub(1, Ordering::SeqCst);
+        drop(queue);
+        assert!(job.tasks_len >= 2);
     }
 
     fn help_overflow_until_finished(&self, job: &Job) {
@@ -1064,13 +1078,7 @@ impl Pool {
                 idle_rounds += 1;
                 thread::yield_now();
             } else {
-                let mut guard = lock(&job.done_lock);
-                job.waiter_sleeping.0.store(true, Ordering::SeqCst);
-                if !job.is_finished() {
-                    guard = wait(&job.done_cv, guard);
-                }
-                job.waiter_sleeping.0.store(false, Ordering::Relaxed);
-                drop(guard);
+                self.sleep_overflow_done(job);
                 idle_rounds = 0;
             }
         }
