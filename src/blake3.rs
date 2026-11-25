@@ -943,38 +943,47 @@ mod neon {
         }
     }
 
-    pub fn keyed_hash_16x(key: &[u32; 8], inputs: &[&[u8]; 16], out: &mut [[u8; OUT_LEN]; 16]) {
+    #[cold]
+    #[inline(never)]
+    fn keyed_hash_16x_multi(key: &[u32; 8], inputs: &[&[u8]; 16], out: &mut [[u8; OUT_LEN]; 16]) {
         let len = inputs[0].len();
-        assert!(inputs.iter().all(|s| s.len() == len));
+        assert!(len > CHUNK_LEN && inputs.iter().all(|s| s.len() == len));
         unsafe {
             let rot8 = vld1q_u8(ROT8_MASK.as_ptr());
             let key_v = broadcast_key(key);
-            let root = if len <= CHUNK_LEN {
-                compress_chunk_16x(&key_v, inputs, 0, len, 0, ROOT, rot8)
-            } else {
-                let total_chunks = len.div_ceil(CHUNK_LEN);
-                let mut stack = [[[vdupq_n_u32(0); 8]; 4]; CV_STACK_LEN_MAX];
-                let mut stack_len = 0usize;
-                for chunk_idx in 0..total_chunks {
-                    let cstart = chunk_idx * CHUNK_LEN;
-                    let cend = (cstart + CHUNK_LEN).min(len);
-                    let cv = compress_chunk_16x(&key_v, inputs, cstart, cend, chunk_idx as u64, 0, rot8);
-                    if chunk_idx + 1 < total_chunks {
-                        push_chunk_cv_16x(
-                            &mut stack,
-                            &mut stack_len,
-                            cv,
-                            (chunk_idx + 1) as u64,
-                            &key_v,
-                            rot8,
-                        );
-                    } else {
-                        stack[stack_len] = cv;
-                        stack_len += 1;
-                    }
+            let total_chunks = len.div_ceil(CHUNK_LEN);
+            let mut stack = [[[vdupq_n_u32(0); 8]; 4]; CV_STACK_LEN_MAX];
+            let mut stack_len = 0usize;
+            for chunk_idx in 0..total_chunks {
+                let cstart = chunk_idx * CHUNK_LEN;
+                let cend = (cstart + CHUNK_LEN).min(len);
+                let cv = compress_chunk_16x(&key_v, inputs, cstart, cend, chunk_idx as u64, 0, rot8);
+                if chunk_idx + 1 < total_chunks {
+                    push_chunk_cv_16x(&mut stack, &mut stack_len, cv, (chunk_idx + 1) as u64, &key_v, rot8);
+                } else {
+                    stack[stack_len] = cv;
+                    stack_len += 1;
                 }
-                finish_stack_16x(&mut stack, stack_len, &key_v, rot8)
-            };
+            }
+            let root = finish_stack_16x(&mut stack, stack_len, &key_v, rot8);
+            let chunks = out.as_chunks_mut::<4>().0;
+            for (c, dst) in root.iter().zip(chunks.iter_mut()) {
+                store_4_digests(c, dst);
+            }
+        }
+    }
+
+    pub fn keyed_hash_16x(key: &[u32; 8], inputs: &[&[u8]; 16], out: &mut [[u8; OUT_LEN]; 16]) {
+        let len = inputs[0].len();
+        assert!(inputs.iter().all(|s| s.len() == len));
+        if len > CHUNK_LEN {
+            keyed_hash_16x_multi(key, inputs, out);
+            return;
+        }
+        unsafe {
+            let rot8 = vld1q_u8(ROT8_MASK.as_ptr());
+            let key_v = broadcast_key(key);
+            let root = compress_chunk_16x(&key_v, inputs, 0, len, 0, ROOT, rot8);
             let chunks = out.as_chunks_mut::<4>().0;
             for (c, dst) in root.iter().zip(chunks.iter_mut()) {
                 store_4_digests(c, dst);
@@ -1261,7 +1270,15 @@ mod neon {
         }
 
         #[inline(always)]
-        unsafe fn finish(mut self, m: &[[V; 16]; 4], tail_len: u32, out: &mut [[u8; OUT_LEN]; 16]) {
+        fn reset(&mut self) {
+            self.cv = [self.key_v; 4];
+            self.stack_len = 0;
+            self.block_in_chunk = 0;
+            self.chunk_counter = 0;
+        }
+
+        #[inline(always)]
+        unsafe fn finish(&mut self, m: &[[V; 16]; 4], tail_len: u32, out: &mut [[u8; OUT_LEN]; 16]) {
             let mut flags = KEYED_HASH | CHUNK_END;
             if self.block_in_chunk == 0 {
                 flags |= CHUNK_START;
@@ -1285,94 +1302,219 @@ mod neon {
         }
     }
 
-    fn hash_rows_16x_f32<F: crate::field::Field>(
+    #[inline(never)]
+    fn hash_rows_16x_f32_single<F: crate::field::Field>(
         key: &[u32; 8],
         rows: &[Vec<F>],
-        base: usize,
-        out: &mut [[u8; OUT_LEN]; 16],
+        start: usize,
+        out: &mut [[[u8; OUT_LEN]; 16]],
     ) {
         assert!(F::BYTES == 32 && !rows.is_empty());
-        assert!(base + 16 <= rows[0].len());
+        assert!(8 + rows.len() * 32 <= CHUNK_LEN && start + out.len() * 16 <= rows[0].len());
         unsafe {
-            let mut st = Rows16State::new(key);
-            let mut carry = init_pos_carry_16x(base);
-            for p in 0..(rows.len() / 2) {
-                let m = [
-                    build_block_f32(&rows[2 * p], &rows[2 * p + 1], base, &mut carry[0]),
-                    build_block_f32(&rows[2 * p], &rows[2 * p + 1], base + 4, &mut carry[1]),
-                    build_block_f32(&rows[2 * p], &rows[2 * p + 1], base + 8, &mut carry[2]),
-                    build_block_f32(&rows[2 * p], &rows[2 * p + 1], base + 12, &mut carry[3]),
-                ];
-                st.push_full_block(&m);
+            let rot8 = vld1q_u8(ROT8_MASK.as_ptr());
+            let zero = vdupq_n_u32(0);
+            let key_v = broadcast_key(key);
+            let pairs = rows.len() / 2;
+            let odd = rows.len() % 2 == 1;
+            for (group, dst) in out.iter_mut().enumerate() {
+                let base = start + group * 16;
+                let mut cv = [key_v; 4];
+                let mut carry = init_pos_carry_16x(base);
+                for p in 0..pairs {
+                    let m = [
+                        build_block_f32(&rows[2 * p], &rows[2 * p + 1], base, &mut carry[0]),
+                        build_block_f32(&rows[2 * p], &rows[2 * p + 1], base + 4, &mut carry[1]),
+                        build_block_f32(&rows[2 * p], &rows[2 * p + 1], base + 8, &mut carry[2]),
+                        build_block_f32(&rows[2 * p], &rows[2 * p + 1], base + 12, &mut carry[3]),
+                    ];
+                    let flags = KEYED_HASH | if p == 0 { CHUNK_START } else { 0 };
+                    compress_cv_16x(&mut cv, &m, 0, BLOCK_LEN as u32, flags, rot8);
+                }
+                let mut m = [[zero; 16]; 4];
+                let tail_len = if odd {
+                    let last = &rows[rows.len() - 1];
+                    for grp in 0..4 {
+                        m[grp][0] = carry[grp][0];
+                        m[grp][1] = carry[grp][1];
+                        m[grp][2..10].copy_from_slice(&load_row_4x_32(last, base + grp * 4));
+                    }
+                    40u32
+                } else {
+                    for grp in 0..4 {
+                        m[grp][0] = carry[grp][0];
+                        m[grp][1] = carry[grp][1];
+                    }
+                    8u32
+                };
+                let flags = KEYED_HASH | if pairs == 0 { CHUNK_START } else { 0 } | CHUNK_END | ROOT;
+                compress_cv_16x(&mut cv, &m, 0, tail_len, flags, rot8);
+                let chunks = dst.as_chunks_mut::<4>().0;
+                for (c, d) in cv.iter().zip(chunks.iter_mut()) {
+                    store_4_digests(c, d);
+                }
             }
-            let mut m = [[vdupq_n_u32(0); 16]; 4];
-            let tail_len = if rows.len() % 2 == 1 {
-                let last = &rows[rows.len() - 1];
-                for grp in 0..4 {
-                    m[grp][0] = carry[grp][0];
-                    m[grp][1] = carry[grp][1];
-                    m[grp][2..10].copy_from_slice(&load_row_4x_32(last, base + grp * 4));
-                }
-                40u32
-            } else {
-                for grp in 0..4 {
-                    m[grp][0] = carry[grp][0];
-                    m[grp][1] = carry[grp][1];
-                }
-                8u32
-            };
-            st.finish(&m, tail_len, out);
         }
     }
 
-    fn hash_rows_16x_f16<F: crate::field::Field>(
+    #[inline(never)]
+    fn hash_rows_16x_f16_single<F: crate::field::Field>(
         key: &[u32; 8],
         rows: &[Vec<F>],
-        base: usize,
-        out: &mut [[u8; OUT_LEN]; 16],
+        start: usize,
+        out: &mut [[[u8; OUT_LEN]; 16]],
     ) {
         assert!(F::BYTES == 16 && !rows.is_empty());
-        assert!(base + 16 <= rows[0].len());
+        assert!(8 + rows.len() * 16 <= CHUNK_LEN && start + out.len() * 16 <= rows[0].len());
         unsafe {
-            let mut st = Rows16State::new(key);
-            let mut carry = init_pos_carry_16x(base);
+            let rot8 = vld1q_u8(ROT8_MASK.as_ptr());
+            let zero = vdupq_n_u32(0);
+            let key_v = broadcast_key(key);
             let quads = rows.len() / 4;
-            for q in 0..quads {
-                let slice = &rows[q * 4..q * 4 + 4];
-                let m = [
-                    build_block_f16(slice, base, &mut carry[0]),
-                    build_block_f16(slice, base + 4, &mut carry[1]),
-                    build_block_f16(slice, base + 8, &mut carry[2]),
-                    build_block_f16(slice, base + 12, &mut carry[3]),
-                ];
-                st.push_full_block(&m);
-            }
             let rem = rows.len() % 4;
-            let mut m = [[vdupq_n_u32(0); 16]; 4];
-            for grp in 0..4 {
-                m[grp][0] = carry[grp][0];
-                m[grp][1] = carry[grp][1];
-                for r in 0..rem {
-                    let v = load_row_4x_16(&rows[quads * 4 + r], base + grp * 4);
-                    m[grp][2 + r * 4..6 + r * 4].copy_from_slice(&v);
+            for (group, dst) in out.iter_mut().enumerate() {
+                let base = start + group * 16;
+                let mut cv = [key_v; 4];
+                let mut carry = init_pos_carry_16x(base);
+                for q in 0..quads {
+                    let slice = &rows[q * 4..q * 4 + 4];
+                    let m = [
+                        build_block_f16(slice, base, &mut carry[0]),
+                        build_block_f16(slice, base + 4, &mut carry[1]),
+                        build_block_f16(slice, base + 8, &mut carry[2]),
+                        build_block_f16(slice, base + 12, &mut carry[3]),
+                    ];
+                    let flags = KEYED_HASH | if q == 0 { CHUNK_START } else { 0 };
+                    compress_cv_16x(&mut cv, &m, 0, BLOCK_LEN as u32, flags, rot8);
+                }
+                let mut m = [[zero; 16]; 4];
+                for grp in 0..4 {
+                    m[grp][0] = carry[grp][0];
+                    m[grp][1] = carry[grp][1];
+                    for r in 0..rem {
+                        let v = load_row_4x_16(&rows[quads * 4 + r], base + grp * 4);
+                        m[grp][2 + r * 4..6 + r * 4].copy_from_slice(&v);
+                    }
+                }
+                let flags = KEYED_HASH | if quads == 0 { CHUNK_START } else { 0 } | CHUNK_END | ROOT;
+                compress_cv_16x(&mut cv, &m, 0, (8 + rem * 16) as u32, flags, rot8);
+                let chunks = dst.as_chunks_mut::<4>().0;
+                for (c, d) in cv.iter().zip(chunks.iter_mut()) {
+                    store_4_digests(c, d);
                 }
             }
-            st.finish(&m, (8 + rem * 16) as u32, out);
+        }
+    }
+
+    #[cold]
+    #[inline(never)]
+    fn hash_rows_16x_f32_multi<F: crate::field::Field>(
+        key: &[u32; 8],
+        rows: &[Vec<F>],
+        start: usize,
+        out: &mut [[[u8; OUT_LEN]; 16]],
+    ) {
+        assert!(F::BYTES == 32 && 8 + rows.len() * 32 > CHUNK_LEN);
+        assert!(start + out.len() * 16 <= rows[0].len());
+        unsafe {
+            let mut st = Rows16State::new(key);
+            let zero = vdupq_n_u32(0);
+            for (group, dst) in out.iter_mut().enumerate() {
+                st.reset();
+                let base = start + group * 16;
+                let mut carry = init_pos_carry_16x(base);
+                for p in 0..(rows.len() / 2) {
+                    let m = [
+                        build_block_f32(&rows[2 * p], &rows[2 * p + 1], base, &mut carry[0]),
+                        build_block_f32(&rows[2 * p], &rows[2 * p + 1], base + 4, &mut carry[1]),
+                        build_block_f32(&rows[2 * p], &rows[2 * p + 1], base + 8, &mut carry[2]),
+                        build_block_f32(&rows[2 * p], &rows[2 * p + 1], base + 12, &mut carry[3]),
+                    ];
+                    st.push_full_block(&m);
+                }
+                let mut m = [[zero; 16]; 4];
+                let tail_len = if rows.len() % 2 == 1 {
+                    let last = &rows[rows.len() - 1];
+                    for grp in 0..4 {
+                        m[grp][0] = carry[grp][0];
+                        m[grp][1] = carry[grp][1];
+                        m[grp][2..10].copy_from_slice(&load_row_4x_32(last, base + grp * 4));
+                    }
+                    40u32
+                } else {
+                    for grp in 0..4 {
+                        m[grp][0] = carry[grp][0];
+                        m[grp][1] = carry[grp][1];
+                    }
+                    8u32
+                };
+                st.finish(&m, tail_len, dst);
+            }
+        }
+    }
+
+    #[cold]
+    #[inline(never)]
+    fn hash_rows_16x_f16_multi<F: crate::field::Field>(
+        key: &[u32; 8],
+        rows: &[Vec<F>],
+        start: usize,
+        out: &mut [[[u8; OUT_LEN]; 16]],
+    ) {
+        assert!(F::BYTES == 16 && 8 + rows.len() * 16 > CHUNK_LEN);
+        assert!(start + out.len() * 16 <= rows[0].len());
+        unsafe {
+            let mut st = Rows16State::new(key);
+            let zero = vdupq_n_u32(0);
+            let quads = rows.len() / 4;
+            let rem = rows.len() % 4;
+            for (group, dst) in out.iter_mut().enumerate() {
+                st.reset();
+                let base = start + group * 16;
+                let mut carry = init_pos_carry_16x(base);
+                for q in 0..quads {
+                    let slice = &rows[q * 4..q * 4 + 4];
+                    let m = [
+                        build_block_f16(slice, base, &mut carry[0]),
+                        build_block_f16(slice, base + 4, &mut carry[1]),
+                        build_block_f16(slice, base + 8, &mut carry[2]),
+                        build_block_f16(slice, base + 12, &mut carry[3]),
+                    ];
+                    st.push_full_block(&m);
+                }
+                let mut m = [[zero; 16]; 4];
+                for grp in 0..4 {
+                    m[grp][0] = carry[grp][0];
+                    m[grp][1] = carry[grp][1];
+                    for r in 0..rem {
+                        let v = load_row_4x_16(&rows[quads * 4 + r], base + grp * 4);
+                        m[grp][2 + r * 4..6 + r * 4].copy_from_slice(&v);
+                    }
+                }
+                st.finish(&m, (8 + rem * 16) as u32, dst);
+            }
         }
     }
 
     pub fn hash_rows_16x_direct<F: crate::field::Field>(
         key: &[u32; 8],
         rows: &[Vec<F>],
-        base: usize,
-        out: &mut [[u8; OUT_LEN]; 16],
+        start: usize,
+        out: &mut [[[u8; OUT_LEN]; 16]],
     ) {
         assert!(F::BYTES == 16 || F::BYTES == 32);
         assert!(!rows.is_empty());
+        let single = 8 + rows.len() * F::BYTES <= CHUNK_LEN;
         if F::BYTES == 32 {
-            hash_rows_16x_f32(key, rows, base, out);
+            if single {
+                hash_rows_16x_f32_single(key, rows, start, out);
+            } else {
+                hash_rows_16x_f32_multi(key, rows, start, out);
+            }
+        } else if single {
+            hash_rows_16x_f16_single(key, rows, start, out);
         } else {
-            hash_rows_16x_f16(key, rows, base, out);
+            hash_rows_16x_f16_multi(key, rows, start, out);
         }
     }
 
@@ -2136,13 +2278,14 @@ pub(crate) fn hash_challenge_words(key: &[u32; 8], seed: &[u8; 32], counter: u64
 pub(crate) fn hash_rows_16x_direct<F: crate::field::Field>(
     key: &[u32; 8],
     rows: &[Vec<F>],
-    base: usize,
-    out: &mut [[u8; OUT_LEN]; 16],
+    start: usize,
+    out: &mut [[[u8; OUT_LEN]; 16]],
 ) {
-    neon::hash_rows_16x_direct(key, rows, base, out);
+    neon::hash_rows_16x_direct(key, rows, start, out);
 }
 
 #[cfg(all(target_arch = "aarch64", target_feature = "neon", target_endian = "little"))]
+#[inline(never)]
 pub(crate) fn hash_rows_8x_direct<F: crate::field::Field>(
     key: &[u32; 8],
     rows: &[Vec<F>],

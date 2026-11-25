@@ -226,8 +226,8 @@ impl Hasher for Blake3 {
         if F::BYTES == 16 || F::BYTES == 32 {
             const KEY: [u32; 8] = Domain::MerkleLeaf.key_words();
             let (o16, rem16) = out.as_chunks_mut::<16>();
-            for (group, dst) in o16.iter_mut().enumerate() {
-                crate::blake3::hash_rows_16x_direct(&KEY, rows, start + group * 16, dst);
+            if !o16.is_empty() {
+                crate::blake3::hash_rows_16x_direct(&KEY, rows, start, o16);
             }
             let done16 = o16.len() * 16;
             let leaf_bytes = 8 + rows.len() * F::BYTES;
@@ -349,8 +349,8 @@ impl Hasher for Keccak256 {
         if F::BYTES == 16 || F::BYTES == 32 {
             const KEY: [u64; 4] = Domain::MerkleLeaf.key_lanes();
             let (o3, rem3) = out.as_chunks_mut::<3>();
-            for (group, dst) in o3.iter_mut().enumerate() {
-                crate::keccak::hash_rows_3x_direct(&KEY, rows, start + group * 3, dst);
+            if !o3.is_empty() {
+                crate::keccak::hash_rows_3x_direct(&KEY, rows, start, o3);
             }
             let done3 = o3.len() * 3;
             let (o2, rem2) = rem3.as_chunks_mut::<2>();

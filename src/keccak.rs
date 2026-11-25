@@ -547,73 +547,85 @@ mod sha3_extension {
         }
     }
 
+    #[inline(always)]
+    unsafe fn absorb_f32_blocks_3x<F: crate::field::Field>(
+        a: &mut [V; LANES],
+        s: &mut [u64; LANES],
+        rows: &[Vec<F>],
+        base: usize,
+        zero: V,
+    ) -> (usize, usize) {
+        assert!(rows.len() >= 3);
+        unsafe {
+            for (i, row) in rows.iter().enumerate().take(3) {
+                a[5 + 4 * i..9 + 4 * i].copy_from_slice(&load_row_2x_32(row, base));
+                s[5 + 4 * i..9 + 4 * i].copy_from_slice(&load_row_1x_32(row, base + 2));
+            }
+            permute_3x(a, s);
+            let mut idx = 3usize;
+            let mut phase = 0usize;
+            let mut carry_v = [zero; 3];
+            let mut carry_s = [0u64; 3];
+            for _ in 0..(rows.len() / 4 + 2) {
+                let carry_len = (4 - phase) & 3;
+                for i in 0..carry_len {
+                    a[i] = veorq_u64(a[i], carry_v[i]);
+                    s[i] ^= carry_s[i];
+                }
+                if idx + 4 + usize::from(phase == 0) > rows.len() {
+                    return (idx, carry_len);
+                }
+                idx += absorb_f32_phase_3x(a, s, &rows[idx..], base, phase, &mut carry_v, &mut carry_s);
+                permute_3x(a, s);
+                phase = (phase + 1) & 3;
+            }
+            unreachable!("bounded loop finishes all rows")
+        }
+    }
+
+    #[inline(never)]
     fn hash_rows_3x_f32<F: crate::field::Field>(
         key_lanes: &[u64; 4],
         rows: &[Vec<F>],
-        base: usize,
-        out: &mut [[u8; OUT_LEN]; 3],
+        start: usize,
+        out: &mut [[[u8; OUT_LEN]; 3]],
     ) {
         assert!(F::BYTES == 32 && !rows.is_empty());
-        assert!(base + 3 <= rows[0].len());
+        assert!(start + out.len() * 3 <= rows[0].len());
         unsafe {
             let zero = vdupq_n_u64(0);
-            let mut a = [zero; LANES];
-            let mut s = [0u64; LANES];
-            for i in 0..4 {
-                a[i] = vdupq_n_u64(key_lanes[i]);
-                s[i] = key_lanes[i];
-            }
-            a[4] = pair(base as u64, (base + 1) as u64);
-            s[4] = (base + 2) as u64;
-            let mut idx = 0usize;
-            let mut pos = 5usize;
-            if rows.len() >= 3 {
-                for (i, row) in rows.iter().enumerate().take(3) {
-                    let rv = load_row_2x_32(row, base);
-                    let rs = load_row_1x_32(row, base + 2);
-                    a[5 + 4 * i..9 + 4 * i].copy_from_slice(&rv);
-                    s[5 + 4 * i..9 + 4 * i].copy_from_slice(&rs);
+            let kv = [
+                vdupq_n_u64(key_lanes[0]),
+                vdupq_n_u64(key_lanes[1]),
+                vdupq_n_u64(key_lanes[2]),
+                vdupq_n_u64(key_lanes[3]),
+            ];
+            let pad01 = vdupq_n_u64(0x01);
+            let pad80 = vdupq_n_u64(0x8000_0000_0000_0000);
+            for (group, dst) in out.iter_mut().enumerate() {
+                let base = start + group * 3;
+                let mut a = [zero; LANES];
+                let mut s = [0u64; LANES];
+                a[..4].copy_from_slice(&kv);
+                s[..4].copy_from_slice(key_lanes);
+                a[4] = pair(base as u64, (base + 1) as u64);
+                s[4] = (base + 2) as u64;
+                let (idx, mut pos) = if rows.len() >= 3 {
+                    absorb_f32_blocks_3x(&mut a, &mut s, rows, base, zero)
+                } else {
+                    (0, 5)
+                };
+                for row in &rows[idx..] {
+                    xor4_2x(&mut a, pos, load_row_2x_32(row, base));
+                    xor4_1x(&mut s, pos, load_row_1x_32(row, base + 2));
+                    pos += 4;
                 }
-                permute_3x(&mut a, &mut s);
-                idx = 3;
-                let mut phase = 0usize;
-                let mut carry_v = [zero; 3];
-                let mut carry_s = [0u64; 3];
-                let max_blocks = rows.len() / 4 + 2;
-                for _ in 0..max_blocks {
-                    let carry_len = (4 - phase) & 3;
-                    for i in 0..carry_len {
-                        a[i] = veorq_u64(a[i], carry_v[i]);
-                        s[i] ^= carry_s[i];
-                    }
-                    let need = 4 + usize::from(phase == 0);
-                    if idx + need > rows.len() {
-                        pos = carry_len;
-                        break;
-                    }
-                    idx += absorb_f32_phase_3x(
-                        &mut a,
-                        &mut s,
-                        &rows[idx..],
-                        base,
-                        phase,
-                        &mut carry_v,
-                        &mut carry_s,
-                    );
-                    permute_3x(&mut a, &mut s);
-                    phase = (phase + 1) & 3;
-                }
+                a[pos] = veorq_u64(a[pos], pad01);
+                a[RATE_LANES - 1] = veorq_u64(a[RATE_LANES - 1], pad80);
+                s[pos] ^= 0x01;
+                s[RATE_LANES - 1] ^= 0x8000_0000_0000_0000;
+                *dst = permute_to_3_digests(&mut a, &mut s);
             }
-            for row in &rows[idx..] {
-                xor4_2x(&mut a, pos, load_row_2x_32(row, base));
-                xor4_1x(&mut s, pos, load_row_1x_32(row, base + 2));
-                pos += 4;
-            }
-            a[pos] = veorq_u64(a[pos], vdupq_n_u64(0x01));
-            a[RATE_LANES - 1] = veorq_u64(a[RATE_LANES - 1], vdupq_n_u64(0x8000_0000_0000_0000));
-            s[pos] ^= 0x01;
-            s[RATE_LANES - 1] ^= 0x8000_0000_0000_0000;
-            *out = permute_to_3_digests(&mut a, &mut s);
         }
     }
 
@@ -672,54 +684,67 @@ mod sha3_extension {
         }
     }
 
+    #[inline(never)]
     fn hash_rows_3x_f16<F: crate::field::Field>(
         key_lanes: &[u64; 4],
         rows: &[Vec<F>],
-        base: usize,
-        out: &mut [[u8; OUT_LEN]; 3],
+        start: usize,
+        out: &mut [[[u8; OUT_LEN]; 3]],
     ) {
         assert!(F::BYTES == 16 && !rows.is_empty());
-        assert!(base + 3 <= rows[0].len());
+        assert!(start + out.len() * 3 <= rows[0].len());
         unsafe {
             let zero = vdupq_n_u64(0);
-            let mut a = [zero; LANES];
-            let mut s = [0u64; LANES];
-            for i in 0..4 {
-                a[i] = vdupq_n_u64(key_lanes[i]);
-                s[i] = key_lanes[i];
+            let kv = [
+                vdupq_n_u64(key_lanes[0]),
+                vdupq_n_u64(key_lanes[1]),
+                vdupq_n_u64(key_lanes[2]),
+                vdupq_n_u64(key_lanes[3]),
+            ];
+            let pad01 = vdupq_n_u64(0x01);
+            let pad80 = vdupq_n_u64(0x8000_0000_0000_0000);
+            for (group, dst) in out.iter_mut().enumerate() {
+                let base = start + group * 3;
+                let mut a = [zero; LANES];
+                let mut s = [0u64; LANES];
+                a[..4].copy_from_slice(&kv);
+                s[..4].copy_from_slice(key_lanes);
+                a[4] = pair(base as u64, (base + 1) as u64);
+                s[4] = (base + 2) as u64;
+                let (idx, mut pos) = if rows.len() >= 6 {
+                    absorb_f16_blocks_3x(&mut a, &mut s, rows, base, zero)
+                } else {
+                    (0, 5)
+                };
+                for row in &rows[idx..] {
+                    let rv = load_row_2x_16(row, base);
+                    let rs = load_row_1x_16(row, base + 2);
+                    xor2_2x(&mut a, pos, rv);
+                    s[pos] ^= rs[0];
+                    s[pos + 1] ^= rs[1];
+                    pos += 2;
+                }
+                a[pos] = veorq_u64(a[pos], pad01);
+                a[RATE_LANES - 1] = veorq_u64(a[RATE_LANES - 1], pad80);
+                s[pos] ^= 0x01;
+                s[RATE_LANES - 1] ^= 0x8000_0000_0000_0000;
+                *dst = permute_to_3_digests(&mut a, &mut s);
             }
-            a[4] = pair(base as u64, (base + 1) as u64);
-            s[4] = (base + 2) as u64;
-            let (idx, mut pos) =
-                if rows.len() >= 6 { absorb_f16_blocks_3x(&mut a, &mut s, rows, base, zero) } else { (0, 5) };
-            for row in &rows[idx..] {
-                let rv = load_row_2x_16(row, base);
-                let rs = load_row_1x_16(row, base + 2);
-                xor2_2x(&mut a, pos, rv);
-                s[pos] ^= rs[0];
-                s[pos + 1] ^= rs[1];
-                pos += 2;
-            }
-            a[pos] = veorq_u64(a[pos], vdupq_n_u64(0x01));
-            a[RATE_LANES - 1] = veorq_u64(a[RATE_LANES - 1], vdupq_n_u64(0x8000_0000_0000_0000));
-            s[pos] ^= 0x01;
-            s[RATE_LANES - 1] ^= 0x8000_0000_0000_0000;
-            *out = permute_to_3_digests(&mut a, &mut s);
         }
     }
 
     pub fn hash_rows_3x_direct<F: crate::field::Field>(
         key_lanes: &[u64; 4],
         rows: &[Vec<F>],
-        base: usize,
-        out: &mut [[u8; OUT_LEN]; 3],
+        start: usize,
+        out: &mut [[[u8; OUT_LEN]; 3]],
     ) {
         assert!(F::BYTES == 16 || F::BYTES == 32);
         assert!(!rows.is_empty());
         if F::BYTES == 32 {
-            hash_rows_3x_f32(key_lanes, rows, base, out);
+            hash_rows_3x_f32(key_lanes, rows, start, out);
         } else {
-            hash_rows_3x_f16(key_lanes, rows, base, out);
+            hash_rows_3x_f16(key_lanes, rows, start, out);
         }
     }
 
@@ -1265,13 +1290,14 @@ pub fn keccak_f1600(state: &mut [u64; LANES]) {
 pub(crate) fn hash_rows_3x_direct<F: crate::field::Field>(
     key_lanes: &[u64; 4],
     rows: &[Vec<F>],
-    base: usize,
-    out: &mut [[u8; OUT_LEN]; 3],
+    start: usize,
+    out: &mut [[[u8; OUT_LEN]; 3]],
 ) {
-    sha3_extension::hash_rows_3x_direct(key_lanes, rows, base, out);
+    sha3_extension::hash_rows_3x_direct(key_lanes, rows, start, out);
 }
 
 #[cfg(all(target_arch = "aarch64", target_feature = "sha3", target_endian = "little"))]
+#[inline(never)]
 pub(crate) fn hash_rows_2x_direct<F: crate::field::Field>(
     key_lanes: &[u64; 4],
     rows: &[Vec<F>],
