@@ -70,6 +70,9 @@ const L1_BYTES: usize = 65536;
 const RADIX8_OUTER_MIN: usize = 64;
 const SLICE_ELEMS: usize = 1 << 14;
 const SPLIT_HALF_BYTES: usize = 4 << 20;
+const FUSED64_TILE_BYTES: usize = 4096;
+const FUSED64_MIN_HALF_BYTES: usize = 2 << 20;
+const FUSED64_SPLIT_ELEMS: usize = 4096;
 const NOVEL_TILE: usize = 512;
 const TRANSPOSE_MIN_LEN: usize = 4096;
 const TRANSPOSE_MIN_QUERIES: usize = 12;
@@ -77,6 +80,27 @@ const TRANSPOSE_MIN_QUERIES: usize = 12;
 #[inline(always)]
 fn l1_block_len<F: Field>() -> usize {
     (L1_BYTES / F::BYTES).max(2048)
+}
+
+#[inline(always)]
+fn fused64_tile<F: Field>() -> usize {
+    (FUSED64_TILE_BYTES / F::BYTES).max(16)
+}
+
+#[inline(always)]
+fn fused64_oct_stride<F: Field>(tile: usize) -> usize {
+    8 * tile + (128 / F::BYTES).max(1)
+}
+
+#[inline(always)]
+fn use_fused64<F: Field>(half: usize) -> bool {
+    let tile = fused64_tile::<F>();
+    half >= 64 * tile && half * F::BYTES >= FUSED64_MIN_HALF_BYTES
+}
+
+#[inline(always)]
+fn as_uninit_slice_mut<T: Copy>(values: &mut [T]) -> &mut [MaybeUninit<T>] {
+    unsafe { slice::from_raw_parts_mut(values.as_mut_ptr().cast::<MaybeUninit<T>>(), values.len()) }
 }
 
 const fn build_novel_offsets() -> [([usize; BASIS_SIZE], usize); BASIS_SIZE] {
@@ -174,6 +198,21 @@ impl Domain {
         let w1_0 = self.point(start / e);
         (w4, [w2_0, w2_0 ^ p2], [w1_0, w1_0 ^ p2, w1_0 ^ p4, w1_0 ^ p2 ^ p4])
     }
+
+    #[inline(always)]
+    fn radix8_twiddle_pairs(&self, start: usize, e: usize) -> ([(u128, u128); 5], bool) {
+        let w4 = self.point(start / (4 * e));
+        let w2_0 = self.point(start / (2 * e));
+        let w1_0 = self.point(start / e);
+        let pairs = [
+            precompute_mul_pair(w4),
+            precompute_mul_pair(w2_0),
+            precompute_mul_pair(w1_0),
+            self.step_mul[0][0],
+            self.step_mul[1][0],
+        ];
+        (pairs, w4 == 0 && w2_0 == 0 && w1_0 == 0)
+    }
 }
 
 fn copy_to_uninit<T: Copy>(dst: &mut [MaybeUninit<T>], src: &[T]) {
@@ -267,6 +306,131 @@ fn copy_half_radix8_parallel<F: BinaryField>(
     });
 }
 
+fn evaluate_sub_octants<F: BinaryField>(
+    full: &mut [F],
+    start: usize,
+    e2: usize,
+    sub_octants: usize,
+    len: usize,
+    allow_parallel: bool,
+) {
+    assert!((1..=64).contains(&sub_octants) && full.len() == sub_octants * e2);
+    assert!(e2.is_power_of_two() && start < len);
+    if allow_parallel && full.len() >= 4 * PARALLEL_THRESHOLD && sub_octants >= 2 {
+        parallel::for_each_chunk_mut(full, e2, e2, |idx, chunk| {
+            let sub_start = start + idx * e2;
+            if sub_start < len {
+                evaluate_full(chunk, sub_start, len, false);
+            }
+        });
+        return;
+    }
+    for (idx, chunk) in full.chunks_exact_mut(e2).enumerate() {
+        let sub_start = start + idx * e2;
+        if sub_start < len {
+            evaluate_full(chunk, sub_start, len, allow_parallel);
+        }
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn copy_radix64_step1_tile<F: BinaryField>(
+    novel_low: &[F],
+    novel_high: &[F],
+    scratch: &mut [MaybeUninit<F>],
+    octants: usize,
+    e: usize,
+    e2: usize,
+    off: usize,
+    tile: usize,
+    oct_stride: usize,
+    w_eff: u128,
+    a_pairs: &[(u128, u128); 5],
+    a_zero: bool,
+    a_raw: (u128, [u128; 2], [u128; 4]),
+) {
+    assert!((1..=8).contains(&octants) && off + tile <= e2);
+    assert!(scratch.len() >= 8 * oct_stride && 8 * tile <= oct_stride);
+    let (aw4, aw2, aw1) = a_raw;
+    for s in 0..8 {
+        let pos = s * e2 + off;
+        if pos >= novel_high.len() {
+            F::copy_radix8_strided_uninit(
+                &novel_low[pos..],
+                e,
+                &mut scratch[s * tile..],
+                oct_stride,
+                tile,
+                a_pairs,
+                a_zero,
+            );
+        } else {
+            let low_oct: [&[F]; 8] = std::array::from_fn(|k| &novel_low[k * e + pos..k * e + pos + tile]);
+            let high_oct: [&[F]; 8] = std::array::from_fn(|k| {
+                let st = k * e + pos;
+                if st < novel_high.len() { &novel_high[st..novel_high.len().min(st + tile)] } else { &[] }
+            });
+            let mut dst_vec: [&mut [MaybeUninit<F>]; 8] = Default::default();
+            let mut rest = &mut *scratch;
+            for slot in dst_vec.iter_mut().take(octants) {
+                let (head, tail) = rest.split_at_mut(oct_stride);
+                *slot = &mut head[s * tile..s * tile + tile];
+                rest = tail;
+            }
+            F::copy_half_radix8_octants_uninit(
+                low_oct,
+                high_oct,
+                &mut dst_vec[..octants],
+                w_eff,
+                aw4,
+                aw2,
+                aw1,
+            );
+        }
+    }
+}
+
+fn evaluate_half_fused64<F: BinaryField>(
+    novel_low: &[F],
+    novel_high: &[F],
+    dst: &mut [MaybeUninit<F>],
+    scratch: &mut [MaybeUninit<F>],
+    half_index: usize,
+    len: usize,
+    allow_parallel: bool,
+) {
+    let half = novel_low.len();
+    let e = half / 8;
+    let e2 = e / 8;
+    let octants = dst.len() / e;
+    let tile = fused64_tile::<F>();
+    let oct_stride = fused64_oct_stride::<F>(tile);
+    assert!(e2 >= tile && e2.is_multiple_of(tile) && (1..=8).contains(&octants));
+    assert!(dst.len() == octants * e && scratch.len() >= 8 * oct_stride);
+    let start = half_index * half;
+    let domain = Domain::get();
+    let w_eff = domain.point(half_index);
+    let a_raw = domain.radix8_twiddles(start, e);
+    let (a_pairs, a_zero) = domain.radix8_twiddle_pairs(start, e);
+    let b_tw: [([(u128, u128); 5], bool); 8] =
+        std::array::from_fn(|k| domain.radix8_twiddle_pairs(start + k * e, e2));
+    let blocks = e2 / tile;
+    for block in 0..blocks {
+        let off = block * tile;
+        copy_radix64_step1_tile(
+            novel_low, novel_high, scratch, octants, e, e2, off, tile, oct_stride, w_eff, &a_pairs, a_zero,
+            a_raw,
+        );
+        for (k, (b_pairs, b_zero)) in b_tw.iter().enumerate().take(octants) {
+            let src_k =
+                unsafe { slice::from_raw_parts(scratch.as_ptr().add(k * oct_stride).cast::<F>(), 8 * tile) };
+            F::copy_radix8_strided_uninit(src_k, tile, &mut dst[k * e + off..], e2, tile, b_pairs, *b_zero);
+        }
+    }
+    let full = unsafe { slice::from_raw_parts_mut(dst.as_mut_ptr().cast::<F>(), dst.len()) };
+    evaluate_sub_octants(full, start, e2, octants * 8, len, allow_parallel);
+}
+
 fn evaluate_half_from_novel<F: BinaryField>(
     novel_low: &[F],
     novel_high: &[F],
@@ -279,6 +443,12 @@ fn evaluate_half_from_novel<F: BinaryField>(
     let start = half_index * half;
     assert!(half >= 1 && half.is_power_of_two() && start < len);
     assert!(novel_high.len() <= half);
+    if !allow_parallel && use_fused64::<F>(half) {
+        let oct_stride = fused64_oct_stride::<F>(fused64_tile::<F>());
+        let mut scratch = vec![MaybeUninit::uninit(); 8 * oct_stride];
+        evaluate_half_fused64(novel_low, novel_high, dst, &mut scratch, half_index, len, false);
+        return;
+    }
     let domain = Domain::get();
     let w_eff = domain.point(half_index);
     if half >= RADIX8_OUTER_MIN {
@@ -795,8 +965,100 @@ pub(crate) fn encode_parts<F: BinaryField>(parts: &[&[F]], len: usize, allow_par
     values
 }
 
+fn run_half0_fused64_task<F: BinaryField>(
+    subs: &mut [[&mut [F]; 8]; 8],
+    scratch: &mut [MaybeUninit<F>],
+    slice_len: usize,
+    a_tw: &([(u128, u128); 5], bool),
+    b_tw: &[([(u128, u128); 5], bool); 8],
+) {
+    let tile = fused64_tile::<F>();
+    let oct_stride = fused64_oct_stride::<F>(tile);
+    assert!(slice_len.is_multiple_of(tile) && scratch.len() >= 8 * oct_stride);
+    assert_eq!(subs[0][0].len(), slice_len);
+    let (a_pairs, a_zero) = a_tw;
+    let blocks = slice_len / tile;
+    for block in 0..blocks {
+        let local = block * tile;
+        for s in 0..8 {
+            let src8: [&[F]; 8] = std::array::from_fn(|k| &subs[k][s][local..local + tile]);
+            F::copy_radix8_to_strided_uninit(src8, &mut scratch[s * tile..], oct_stride, a_pairs, *a_zero);
+        }
+        for (k, (b_pairs, b_zero)) in b_tw.iter().enumerate() {
+            let src_k =
+                unsafe { slice::from_raw_parts(scratch.as_ptr().add(k * oct_stride).cast::<F>(), 8 * tile) };
+            let [d0, d1, d2, d3, d4, d5, d6, d7] = &mut subs[k];
+            let out8 = [
+                as_uninit_slice_mut(&mut d0[local..local + tile]),
+                as_uninit_slice_mut(&mut d1[local..local + tile]),
+                as_uninit_slice_mut(&mut d2[local..local + tile]),
+                as_uninit_slice_mut(&mut d3[local..local + tile]),
+                as_uninit_slice_mut(&mut d4[local..local + tile]),
+                as_uninit_slice_mut(&mut d5[local..local + tile]),
+                as_uninit_slice_mut(&mut d6[local..local + tile]),
+                as_uninit_slice_mut(&mut d7[local..local + tile]),
+            ];
+            F::copy_radix8_from_strided_uninit(src_k, tile, out8, b_pairs, *b_zero);
+        }
+    }
+}
+
+fn evaluate_batch_half0_fused64<F: BinaryField>(buffers: &mut [Vec<F>], half: usize, len: usize) {
+    let e = half / 8;
+    let e2 = e / 8;
+    let slice_len = FUSED64_SPLIT_ELEMS.min(e2);
+    let slices = e2 / slice_len;
+    let oct_stride = fused64_oct_stride::<F>(fused64_tile::<F>());
+    assert!(!buffers.is_empty() && slices >= 1 && slices * slice_len == e2);
+    assert!(half <= len && half.is_multiple_of(64));
+    let domain = Domain::get();
+    let a_tw = domain.radix8_twiddle_pairs(0, e);
+    let b_tw: [([(u128, u128); 5], bool); 8] =
+        std::array::from_fn(|k| domain.radix8_twiddle_pairs(k * e, e2));
+    {
+        let mut tasks: Vec<[[&mut [F]; 8]; 8]> = Vec::with_capacity(buffers.len() * slices);
+        for buf in buffers.iter_mut() {
+            let h0 = unsafe { slice::from_raw_parts_mut(buf.as_mut_ptr(), half) };
+            let mut iters: [[_; 8]; 8] = split_octants_mut(h0).map(|oct| {
+                let mut subs = oct.chunks_exact_mut(e2);
+                std::array::from_fn(|_| subs.next().expect("sub").chunks_exact_mut(slice_len))
+            });
+            for _ in 0..slices {
+                tasks.push(std::array::from_fn(|k| {
+                    std::array::from_fn(|s| iters[k][s].next().expect("slice"))
+                }));
+            }
+        }
+        parallel::for_each_piece_mut_with(
+            &mut tasks,
+            1,
+            || vec![MaybeUninit::uninit(); 8 * oct_stride],
+            |scratch, _, piece| {
+                for subs in piece {
+                    run_half0_fused64_task(subs, scratch, slice_len, &a_tw, &b_tw);
+                }
+            },
+        );
+    }
+    let mut sub_tasks: Vec<(usize, &mut [F])> = Vec::with_capacity(buffers.len() * 64);
+    for buf in buffers.iter_mut() {
+        let h0 = unsafe { slice::from_raw_parts_mut(buf.as_mut_ptr(), half) };
+        for (idx, chunk) in h0.chunks_exact_mut(e2).enumerate() {
+            sub_tasks.push((idx * e2, chunk));
+        }
+    }
+    parallel::for_each_piece_mut(&mut sub_tasks, 1, |_, piece| {
+        for (start, chunk) in piece {
+            evaluate_full(chunk, *start, len, false);
+        }
+    });
+}
+
 fn evaluate_batch_half0<F: BinaryField>(buffers: &mut [Vec<F>], half: usize, len: usize) {
     assert!(!buffers.is_empty() && half >= 1 && half.is_power_of_two());
+    if use_fused64::<F>(half) && half <= len {
+        return evaluate_batch_half0_fused64(buffers, half, len);
+    }
     if buffers.len() < 2 * parallel::threads() && half >= RADIX8_OUTER_MIN && half <= len {
         let e = half / 8;
         let domain = Domain::get();
@@ -856,6 +1118,162 @@ fn split_octants_mut<F>(values: &mut [F]) -> [&mut [F]; 8] {
 }
 
 type CopySliceTask<'a, F> = (usize, usize, usize, Vec<&'a mut [MaybeUninit<F>]>);
+type SplitFused64Task<'a, F> = (usize, usize, usize, Vec<[&'a mut [MaybeUninit<F>]; 8]>);
+
+fn push_split_fused64_tasks<'a, F: BinaryField>(
+    tasks: &mut Vec<SplitFused64Task<'a, F>>,
+    row_idx: usize,
+    rest_halves: &'a mut [MaybeUninit<F>],
+    half: usize,
+    slice_len: usize,
+) {
+    let e = half / 8;
+    let e2 = e / 8;
+    let slices = e2 / slice_len;
+    assert!(slices >= 1 && slices * slice_len == e2);
+    assert!(half.is_multiple_of(64));
+    for (idx, dst) in rest_halves.chunks_mut(half).enumerate() {
+        let octants = dst.len() / e;
+        let mut oct_iters: Vec<[_; 8]> = dst
+            .chunks_exact_mut(e)
+            .map(|oct| {
+                let mut subs = oct.chunks_exact_mut(e2);
+                std::array::from_fn(|_| subs.next().expect("sub").chunks_exact_mut(slice_len))
+            })
+            .collect();
+        for s in 0..slices {
+            let mut out = Vec::with_capacity(octants);
+            for iters in &mut oct_iters {
+                out.push(std::array::from_fn(|j| iters[j].next().expect("slice")));
+            }
+            tasks.push((row_idx, idx + 1, s * slice_len, out));
+        }
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn run_split_fused64_task<F: BinaryField>(
+    novel_low: &[F],
+    novel_high: &[F],
+    scratch: &mut [MaybeUninit<F>],
+    half_idx: usize,
+    off: usize,
+    dst_subs: &mut [[&mut [MaybeUninit<F>]; 8]],
+    half: usize,
+    slice_len: usize,
+) {
+    let e = half / 8;
+    let e2 = e / 8;
+    let octants = dst_subs.len();
+    let tile = fused64_tile::<F>();
+    let oct_stride = fused64_oct_stride::<F>(tile);
+    assert!((1..=8).contains(&octants) && slice_len.is_multiple_of(tile));
+    assert!(off + slice_len <= e2 && scratch.len() >= 8 * oct_stride);
+    let start = half_idx * half;
+    let domain = Domain::get();
+    let w_eff = domain.point(half_idx);
+    let a_raw = domain.radix8_twiddles(start, e);
+    let (a_pairs, a_zero) = domain.radix8_twiddle_pairs(start, e);
+    let b_tw: [([(u128, u128); 5], bool); 8] =
+        std::array::from_fn(|k| domain.radix8_twiddle_pairs(start + k * e, e2));
+    let blocks = slice_len / tile;
+    for block in 0..blocks {
+        let local = block * tile;
+        copy_radix64_step1_tile(
+            novel_low,
+            novel_high,
+            scratch,
+            octants,
+            e,
+            e2,
+            off + local,
+            tile,
+            oct_stride,
+            w_eff,
+            &a_pairs,
+            a_zero,
+            a_raw,
+        );
+        for (k, sub8) in dst_subs.iter_mut().enumerate() {
+            let (b_pairs, b_zero) = &b_tw[k];
+            let src_k =
+                unsafe { slice::from_raw_parts(scratch.as_ptr().add(k * oct_stride).cast::<F>(), 8 * tile) };
+            let [d0, d1, d2, d3, d4, d5, d6, d7] = sub8;
+            let out8 = [
+                &mut d0[local..local + tile],
+                &mut d1[local..local + tile],
+                &mut d2[local..local + tile],
+                &mut d3[local..local + tile],
+                &mut d4[local..local + tile],
+                &mut d5[local..local + tile],
+                &mut d6[local..local + tile],
+                &mut d7[local..local + tile],
+            ];
+            F::copy_radix8_from_strided_uninit(src_k, tile, out8, b_pairs, *b_zero);
+        }
+    }
+}
+
+fn evaluate_batch_rest_split_fused64<F: BinaryField>(
+    buffers: &mut [Vec<F>],
+    quotients: &[Vec<F>],
+    half: usize,
+    alloc_len: usize,
+    len: usize,
+) {
+    let e2 = half / 64;
+    let slice_len = FUSED64_SPLIT_ELEMS.min(e2);
+    let oct_stride = fused64_oct_stride::<F>(fused64_tile::<F>());
+    assert!(!buffers.is_empty() && e2.is_multiple_of(slice_len));
+    assert_eq!(buffers.len(), quotients.len());
+    {
+        let mut tasks: Vec<SplitFused64Task<'_, F>> = Vec::new();
+        let mut novel_lows: Vec<&[F]> = Vec::with_capacity(buffers.len());
+        for (row_idx, buf) in buffers.iter_mut().enumerate() {
+            let spare = &mut buf.spare_capacity_mut()[..alloc_len];
+            let (first_half, rest_halves) = spare.split_at_mut(half);
+            novel_lows.push(unsafe { slice::from_raw_parts(first_half.as_ptr().cast::<F>(), half) });
+            push_split_fused64_tasks(&mut tasks, row_idx, rest_halves, half, slice_len);
+        }
+        let novel_lows = &novel_lows;
+        parallel::for_each_piece_mut_with(
+            &mut tasks,
+            1,
+            || vec![MaybeUninit::uninit(); 8 * oct_stride],
+            |scratch, _, piece| {
+                for (row_idx, half_idx, off, dst_subs) in piece {
+                    run_split_fused64_task(
+                        novel_lows[*row_idx],
+                        &quotients[*row_idx],
+                        scratch,
+                        *half_idx,
+                        *off,
+                        dst_subs,
+                        half,
+                        slice_len,
+                    );
+                }
+            },
+        );
+    }
+    let mut sub_tasks: Vec<(usize, &mut [F])> = Vec::new();
+    for buf in buffers.iter_mut() {
+        let spare = &mut buf.spare_capacity_mut()[..alloc_len];
+        let rest = &mut spare[half..];
+        let full = unsafe { slice::from_raw_parts_mut(rest.as_mut_ptr().cast::<F>(), rest.len()) };
+        for (idx, chunk) in full.chunks_exact_mut(e2).enumerate() {
+            let start = half + idx * e2;
+            if start < len {
+                sub_tasks.push((start, chunk));
+            }
+        }
+    }
+    parallel::for_each_piece_mut(&mut sub_tasks, 1, |_, piece| {
+        for (start, chunk) in piece {
+            evaluate_full(chunk, *start, len, false);
+        }
+    });
+}
 
 fn evaluate_batch_rest_split<F: BinaryField>(
     buffers: &mut [Vec<F>],
@@ -864,6 +1282,9 @@ fn evaluate_batch_rest_split<F: BinaryField>(
     alloc_len: usize,
     len: usize,
 ) {
+    if use_fused64::<F>(half) {
+        return evaluate_batch_rest_split_fused64(buffers, quotients, half, alloc_len, len);
+    }
     let e = half / 8;
     let slice_len = if e >= 2 * SLICE_ELEMS { SLICE_ELEMS } else { e };
     let slices_per = e / slice_len;
@@ -945,11 +1366,37 @@ fn evaluate_batch_rest_fused<F: BinaryField>(
     }
     assert!(!half_tasks.is_empty());
     let novel_lows = &novel_lows;
-    parallel::for_each_piece_mut(&mut half_tasks, 1, |_, piece| {
-        for (row_idx, half_idx, dst) in piece {
-            evaluate_half_from_novel(novel_lows[*row_idx], &quotients[*row_idx], dst, *half_idx, len, false);
-        }
-    });
+    let fused = use_fused64::<F>(half);
+    let scratch_len = if fused { 8 * fused64_oct_stride::<F>(fused64_tile::<F>()) } else { 0 };
+    parallel::for_each_piece_mut_with(
+        &mut half_tasks,
+        1,
+        || vec![MaybeUninit::uninit(); scratch_len],
+        |scratch, _, piece| {
+            for (row_idx, half_idx, dst) in piece {
+                if fused {
+                    evaluate_half_fused64(
+                        novel_lows[*row_idx],
+                        &quotients[*row_idx],
+                        dst,
+                        scratch,
+                        *half_idx,
+                        len,
+                        false,
+                    );
+                } else {
+                    evaluate_half_from_novel(
+                        novel_lows[*row_idx],
+                        &quotients[*row_idx],
+                        dst,
+                        *half_idx,
+                        len,
+                        false,
+                    );
+                }
+            }
+        },
+    );
 }
 
 fn encode_batch<F: BinaryField, const P: usize>(rows: &[[&[F]; P]], len: usize) -> Vec<Vec<F>> {
@@ -1135,6 +1582,43 @@ fn evaluate_l1<F: BinaryField>(values: &mut [F], start: usize) {
     }
 }
 
+fn radix64_in_place<F: BinaryField>(values: &mut [F], start: usize) {
+    let size = values.len();
+    let e = size / 8;
+    let e2 = e / 8;
+    let tile = fused64_tile::<F>();
+    let oct_stride = fused64_oct_stride::<F>(tile);
+    assert!(size.is_power_of_two() && e2 >= tile && e2.is_multiple_of(tile));
+    let domain = Domain::get();
+    let (a_pairs, a_zero) = domain.radix8_twiddle_pairs(start, e);
+    let b_tw: [([(u128, u128); 5], bool); 8] =
+        std::array::from_fn(|k| domain.radix8_twiddle_pairs(start + k * e, e2));
+    let mut scratch = vec![MaybeUninit::<F>::uninit(); 8 * oct_stride];
+    let blocks = e2 / tile;
+    assert!(blocks >= 1);
+    for block in 0..blocks {
+        let off = block * tile;
+        for s in 0..8 {
+            let pos = s * e2 + off;
+            F::copy_radix8_strided_uninit(
+                &values[pos..],
+                e,
+                &mut scratch[s * tile..],
+                oct_stride,
+                tile,
+                &a_pairs,
+                a_zero,
+            );
+        }
+        for (k, (b_pairs, b_zero)) in b_tw.iter().enumerate() {
+            let src_k =
+                unsafe { slice::from_raw_parts(scratch.as_ptr().add(k * oct_stride).cast::<F>(), 8 * tile) };
+            let dst_k = as_uninit_slice_mut(&mut values[k * e + off..]);
+            F::copy_radix8_strided_uninit(src_k, tile, dst_k, e2, tile, b_pairs, *b_zero);
+        }
+    }
+}
+
 fn evaluate_full<F: BinaryField>(values: &mut [F], start: usize, len: usize, allow_parallel: bool) {
     let size = values.len();
     assert!(size.is_power_of_two() && start < len);
@@ -1143,6 +1627,11 @@ fn evaluate_full<F: BinaryField>(values: &mut [F], start: usize, len: usize, all
     }
     if size <= l1_block_len::<F>() && start + size <= len {
         return evaluate_l1(values, start);
+    }
+    if !allow_parallel && start + size <= len && use_fused64::<F>(size) {
+        radix64_in_place(values, start);
+        evaluate_sub_octants(values, start, size / 64, 64, len, false);
+        return;
     }
     if start + size <= len && size >= RADIX8_OUTER_MIN && (!allow_parallel || size < 8 * PARALLEL_THRESHOLD) {
         radix8_outer_at(values, start);
@@ -1366,19 +1855,8 @@ fn transpose_fft_sparse<F: BinaryField>(
     transpose_combine_halves(lo, hi, has_lo, has_hi, twiddle, allow_parallel)
 }
 
-fn add_transposed_queries<F: BinaryField>(dst: &mut [F], queries: &[(usize, F)]) {
-    let n = dst.len();
-    if n == 0 || queries.is_empty() {
-        return;
-    }
-    if n < TRANSPOSE_MIN_LEN || !n.is_power_of_two() || queries.len() < TRANSPOSE_MIN_QUERIES {
-        for &(pos, scale) in queries {
-            F::add_powers_slice(dst, F::point(pos), scale);
-        }
-        return;
-    }
-    let mut sorted: Vec<(usize, F)> = queries.to_vec();
-    sorted.sort_unstable_by_key(|&(pos, _)| pos);
+fn group_coset_ranges<F>(sorted: &[(usize, F)], n: usize) -> Vec<(usize, usize, usize)> {
+    assert!(!sorted.is_empty() && n > 0);
     let mut coset_ranges: Vec<(usize, usize, usize)> = Vec::new();
     let mut i = 0;
     for _ in 0..sorted.len() {
@@ -1397,13 +1875,47 @@ fn add_transposed_queries<F: BinaryField>(dst: &mut [F], queries: &[(usize, F)])
         i = j;
     }
     assert_eq!(i, sorted.len());
+    coset_ranges
+}
+
+fn add_transposed_queries<F: BinaryField>(dst: &mut [F], queries: &[(usize, F)]) {
+    let n = dst.len();
+    if n == 0 || queries.is_empty() {
+        return;
+    }
+    if n < TRANSPOSE_MIN_LEN || !n.is_power_of_two() || queries.len() < TRANSPOSE_MIN_QUERIES {
+        for &(pos, scale) in queries {
+            F::add_powers_slice(dst, F::point(pos), scale);
+        }
+        return;
+    }
+    let mut sorted: Vec<(usize, F)> = queries.to_vec();
+    sorted.sort_unstable_by_key(|&(pos, _)| pos);
+    let coset_ranges = group_coset_ranges(&sorted, n);
     let allow_inner = coset_ranges.len() < parallel::threads();
-    let mut partials: Vec<Vec<F>> = parallel::map_range(coset_ranges.len(), 1, |idx| {
-        let (coset, s0, s1) = coset_ranges[idx];
-        let mut buf = vec![F::ZERO; n];
-        let _ = transpose_fft_sparse(&mut buf, coset * n, &sorted[s0..s1], allow_inner);
-        buf
-    });
+    let mut partials: Vec<Vec<F>> = parallel::fold_pieces(
+        coset_ranges.len(),
+        1,
+        || None::<(Vec<F>, Option<Vec<F>>)>,
+        |state, range| {
+            for idx in range {
+                let (coset, s0, s1) = coset_ranges[idx];
+                if let Some((acc, scratch_slot)) = state.as_mut() {
+                    let buf = scratch_slot.get_or_insert_with(|| vec![F::ZERO; n]);
+                    let _ = transpose_fft_sparse(buf, coset * n, &sorted[s0..s1], allow_inner);
+                    F::xor_slice(acc, buf);
+                } else {
+                    let mut buf = vec![F::ZERO; n];
+                    let _ = transpose_fft_sparse(&mut buf, coset * n, &sorted[s0..s1], allow_inner);
+                    *state = Some((buf, None));
+                }
+            }
+        },
+    )
+    .into_iter()
+    .flatten()
+    .map(|(acc, _)| acc)
+    .collect();
     assert!(!partials.is_empty());
     let mut combined = partials.swap_remove(0);
     for other in &partials {
@@ -1423,4 +1935,5 @@ fn add_transposed_queries<F: BinaryField>(dst: &mut [F], queries: &[(usize, F)])
             F::xor_slice(piece, &combined[start..start + piece.len()]);
         });
     }
+    assert_eq!(combined.len(), n);
 }
