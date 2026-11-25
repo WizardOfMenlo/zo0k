@@ -23,14 +23,6 @@ struct RawMut(*mut Digest);
 unsafe impl Send for RawMut {}
 unsafe impl Sync for RawMut {}
 
-impl RawMut {
-    #[allow(clippy::mut_from_ref)]
-    unsafe fn slice_mut(&self, start: usize, len: usize, limit: usize) -> &mut [Digest] {
-        assert!(start + len <= limit);
-        unsafe { std::slice::from_raw_parts_mut(self.0.add(start), len) }
-    }
-}
-
 pub fn leaf_digest<H: Hasher, F: Field>(position: usize, column: impl IntoIterator<Item = F>) -> Digest {
     let mut hasher = H::new(Domain::MerkleLeaf);
     hasher.update(&(position as u64).to_le_bytes());
@@ -174,20 +166,16 @@ fn build_subtree_from_depth<H: Hasher>(
 fn hash_level<H: Hasher>(below: &[Digest]) -> Vec<Digest> {
     assert!(below.len() > 1);
     let out_len = below.len().div_ceil(2);
+    let mut level = vec![[0u8; 32]; out_len];
     if below.len() < PARALLEL_THRESHOLD {
-        let mut level = vec![[0u8; 32]; out_len];
         H::hash_nodes(below, &mut level);
         return level;
     }
-    let mut level: Vec<Digest> = Vec::with_capacity(out_len);
-    let dst = RawMut(level.as_mut_ptr());
-    parallel::map_pieces(out_len, 1 << 8, |range| {
-        let child_start = range.start * 2;
-        let child_end = (range.end * 2).min(below.len());
-        let out_slice = unsafe { dst.slice_mut(range.start, range.len(), out_len) };
+    parallel::for_each_piece_mut(&mut level, 1 << 8, |start, out_slice| {
+        let child_start = start * 2;
+        let child_end = ((start + out_slice.len()) * 2).min(below.len());
         H::hash_nodes(&below[child_start..child_end], out_slice);
     });
-    unsafe { level.set_len(out_len) };
     assert!(level.len() == out_len);
     level
 }

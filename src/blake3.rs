@@ -469,16 +469,26 @@ mod neon {
     }
 
     #[inline(always)]
+    unsafe fn load_u32x4(ptr: *const u8) -> V {
+        unsafe { vreinterpretq_u32_u8(vld1q_u8(ptr)) }
+    }
+
+    #[inline(always)]
+    unsafe fn store_u32x4(ptr: *mut u8, v: V) {
+        unsafe { vst1q_u8(ptr, vreinterpretq_u8_u32(v)) }
+    }
+
+    #[inline(always)]
     unsafe fn load_4_blocks(p0: *const u8, p1: *const u8, p2: *const u8, p3: *const u8) -> [V; 16] {
         unsafe {
             let mut m = [vdupq_n_u32(0); 16];
             for group in 0..4 {
                 let off = group * 16;
                 let [w0, w1, w2, w3] = transpose_4x4(
-                    vld1q_u32(p0.add(off) as *const u32),
-                    vld1q_u32(p1.add(off) as *const u32),
-                    vld1q_u32(p2.add(off) as *const u32),
-                    vld1q_u32(p3.add(off) as *const u32),
+                    load_u32x4(p0.add(off)),
+                    load_u32x4(p1.add(off)),
+                    load_u32x4(p2.add(off)),
+                    load_u32x4(p3.add(off)),
                 );
                 m[group * 4] = w0;
                 m[group * 4 + 1] = w1;
@@ -510,8 +520,8 @@ mod neon {
             let lo = transpose_4x4(cv[0], cv[1], cv[2], cv[3]);
             let hi = transpose_4x4(cv[4], cv[5], cv[6], cv[7]);
             for lane in 0..4 {
-                vst1q_u32(out[lane].as_mut_ptr() as *mut u32, lo[lane]);
-                vst1q_u32(out[lane].as_mut_ptr().add(16) as *mut u32, hi[lane]);
+                store_u32x4(out[lane].as_mut_ptr(), lo[lane]);
+                store_u32x4(out[lane].as_mut_ptr().add(16), hi[lane]);
             }
         }
     }
@@ -528,7 +538,7 @@ mod neon {
             for group in 0..4 {
                 let q = transpose_4x4(w[group * 4], w[group * 4 + 1], w[group * 4 + 2], w[group * 4 + 3]);
                 for (lane, &vec) in q.iter().enumerate() {
-                    vst1q_u32(out.as_mut_ptr().add(lane * BLOCK_LEN + group * 16) as *mut u32, vec);
+                    store_u32x4(out.as_mut_ptr().add(lane * BLOCK_LEN + group * 16), vec);
                 }
             }
         }
@@ -1091,16 +1101,16 @@ mod neon {
         unsafe {
             let ptr = raw.as_ptr();
             let lo = transpose_4x4(
-                vld1q_u32(ptr as *const u32),
-                vld1q_u32(ptr.add(32) as *const u32),
-                vld1q_u32(ptr.add(64) as *const u32),
-                vld1q_u32(ptr.add(96) as *const u32),
+                load_u32x4(ptr),
+                load_u32x4(ptr.add(32)),
+                load_u32x4(ptr.add(64)),
+                load_u32x4(ptr.add(96)),
             );
             let hi = transpose_4x4(
-                vld1q_u32(ptr.add(16) as *const u32),
-                vld1q_u32(ptr.add(48) as *const u32),
-                vld1q_u32(ptr.add(80) as *const u32),
-                vld1q_u32(ptr.add(112) as *const u32),
+                load_u32x4(ptr.add(16)),
+                load_u32x4(ptr.add(48)),
+                load_u32x4(ptr.add(80)),
+                load_u32x4(ptr.add(112)),
             );
             [lo[0], lo[1], lo[2], lo[3], hi[0], hi[1], hi[2], hi[3]]
         }
@@ -1116,10 +1126,10 @@ mod neon {
         unsafe {
             let ptr = raw.as_ptr();
             transpose_4x4(
-                vld1q_u32(ptr as *const u32),
-                vld1q_u32(ptr.add(16) as *const u32),
-                vld1q_u32(ptr.add(32) as *const u32),
-                vld1q_u32(ptr.add(48) as *const u32),
+                load_u32x4(ptr),
+                load_u32x4(ptr.add(16)),
+                load_u32x4(ptr.add(32)),
+                load_u32x4(ptr.add(48)),
             )
         }
     }
