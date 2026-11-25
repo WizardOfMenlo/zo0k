@@ -7,7 +7,14 @@ use std::ptr;
 const PARALLEL_THRESHOLD: usize = 1 << 10;
 const SUBTREE_HEIGHT: usize = 9;
 const SUBTREE_LEAVES: usize = 1 << SUBTREE_HEIGHT;
-const LEAF_TILE_MAX: usize = 8;
+const SUBTREE_PIECE_MIN: usize = 4;
+const PRUNE_LEAVES_SMALL: usize = 1 << 15;
+const PRUNE_LEAVES_LARGE: usize = 1 << 18;
+const PRUNE_SKIP_NARROW: usize = 5;
+const PRUNE_SKIP_WIDE: usize = 3;
+const PRUNE_LEAF_NARROW_MAX: usize = 1024;
+const OPEN_PARALLEL_WORK_MIN: usize = 8192;
+const LEAF_TILE_MAX: usize = 24;
 const LEAF_TILE_BYTES_MAX: usize = 16384;
 
 #[derive(Clone, Copy)]
@@ -36,8 +43,14 @@ pub fn leaf_digest<H: Hasher, F: Field>(position: usize, column: impl IntoIterat
 
 fn leaf_tile_len(leaf_len_bytes: usize) -> usize {
     assert!(leaf_len_bytes >= 8);
-    let tile = if LEAF_TILE_MAX * leaf_len_bytes <= LEAF_TILE_BYTES_MAX { LEAF_TILE_MAX } else { 4 };
-    assert!(tile == 4 || tile == LEAF_TILE_MAX);
+    let tile = if LEAF_TILE_MAX * leaf_len_bytes <= LEAF_TILE_BYTES_MAX {
+        LEAF_TILE_MAX
+    } else if 8 * leaf_len_bytes <= LEAF_TILE_BYTES_MAX {
+        8
+    } else {
+        4
+    };
+    assert!(tile == 4 || tile == 8 || tile == LEAF_TILE_MAX);
     tile
 }
 
@@ -97,6 +110,19 @@ fn level_lengths(len: usize, levels_count: usize) -> Vec<usize> {
     lens
 }
 
+fn choose_skip_levels(len: usize, leaf_len_bytes: usize) -> usize {
+    assert!(len > 0 && leaf_len_bytes >= 8);
+    let skip = if len < PRUNE_LEAVES_SMALL {
+        0
+    } else if len >= PRUNE_LEAVES_LARGE && leaf_len_bytes <= PRUNE_LEAF_NARROW_MAX {
+        PRUNE_SKIP_NARROW
+    } else {
+        PRUNE_SKIP_WIDE
+    };
+    assert!(skip <= SUBTREE_HEIGHT);
+    skip
+}
+
 fn write_disjoint(dst: RawMut, start: usize, limit: usize, src: &[Digest]) {
     assert!(start + src.len() <= limit);
     assert!(!src.is_empty());
@@ -105,17 +131,18 @@ fn write_disjoint(dst: RawMut, start: usize, limit: usize, src: &[Digest]) {
     }
 }
 
-fn build_subtree_levels<H: Hasher>(
+fn build_subtree_from_depth<H: Hasher>(
     subtree: usize,
     mut cur_len: usize,
+    first_depth: usize,
     buf_a: &mut [Digest; SUBTREE_LEAVES],
     buf_b: &mut [Digest; SUBTREE_LEAVES / 2],
     ptrs: &[(RawMut, usize)],
     write_first_depth: usize,
 ) {
     assert!(cur_len > 0 && cur_len <= SUBTREE_LEAVES);
-    assert!(ptrs.len() == SUBTREE_HEIGHT + 1);
-    for depth in 0..SUBTREE_HEIGHT {
+    assert!(first_depth <= SUBTREE_HEIGHT && ptrs.len() == SUBTREE_HEIGHT + 1);
+    for depth in first_depth..SUBTREE_HEIGHT {
         let next_len = cur_len.div_ceil(2);
         let shift = SUBTREE_HEIGHT - depth - 1;
         let start = subtree << shift;
@@ -139,27 +166,63 @@ fn build_subtree_levels<H: Hasher>(
 fn hash_level<H: Hasher>(below: &[Digest]) -> Vec<Digest> {
     assert!(below.len() > 1);
     let out_len = below.len().div_ceil(2);
+    let mut level = vec![[0u8; 32]; out_len];
     if below.len() < PARALLEL_THRESHOLD {
-        let mut level = vec![[0u8; 32]; out_len];
         H::hash_nodes(below, &mut level);
         return level;
     }
-    let mut level: Vec<Digest> = Vec::with_capacity(out_len);
-    let dst = RawMut(level.as_mut_ptr());
-    parallel::map_pieces(out_len, 1 << 8, |range| {
-        let child_start = range.start * 2;
-        let child_end = (range.end * 2).min(below.len());
-        let mut local = vec![[0u8; 32]; range.len()];
-        H::hash_nodes(&below[child_start..child_end], &mut local);
-        write_disjoint(dst, range.start, out_len, &local);
+    parallel::for_each_piece_mut(&mut level, 1 << 8, |start, out_slice| {
+        let child_start = start * 2;
+        let child_end = ((start + out_slice.len()) * 2).min(below.len());
+        H::hash_nodes(&below[child_start..child_end], out_slice);
     });
-    unsafe { level.set_len(out_len) };
     assert!(level.len() == out_len);
     level
 }
 
+fn append_subtree_pass<H: Hasher>(levels: &mut Vec<Vec<Digest>>) {
+    let base_idx = levels.len() - 1;
+    let len = levels[base_idx].len();
+    assert!(len >= SUBTREE_LEAVES * 2);
+    let lens = level_lengths(len, SUBTREE_HEIGHT + 1);
+    for &level_len in &lens[1..] {
+        levels.push(Vec::with_capacity(level_len));
+    }
+    let mut ptrs: Vec<(RawMut, usize)> = Vec::with_capacity(SUBTREE_HEIGHT + 1);
+    ptrs.push((RawMut(ptr::null_mut()), 0));
+    for (level, &n) in levels[base_idx + 1..].iter_mut().zip(&lens[1..]) {
+        ptrs.push((RawMut(level.as_mut_ptr()), n));
+    }
+    let below_ref: &[Digest] = &levels[base_idx];
+    let num_subtrees = len.div_ceil(SUBTREE_LEAVES);
+    parallel::map_pieces(num_subtrees, SUBTREE_PIECE_MIN, |range| {
+        let mut buf_a = [[0u8; 32]; SUBTREE_LEAVES];
+        let mut buf_b = [[0u8; 32]; SUBTREE_LEAVES / 2];
+        for subtree in range {
+            let start = subtree << SUBTREE_HEIGHT;
+            let end = ((subtree + 1) << SUBTREE_HEIGHT).min(len);
+            let cur_len = end - start;
+            let next_len = cur_len.div_ceil(2);
+            H::hash_nodes(&below_ref[start..end], &mut buf_b[..next_len]);
+            let dst_start = subtree << (SUBTREE_HEIGHT - 1);
+            write_disjoint(ptrs[1].0, dst_start, ptrs[1].1, &buf_b[..next_len]);
+            build_subtree_from_depth::<H>(subtree, next_len, 1, &mut buf_a, &mut buf_b, &ptrs, 1);
+        }
+    });
+    for (level, &n) in levels[base_idx + 1..].iter_mut().zip(&lens[1..]) {
+        unsafe { level.set_len(n) };
+    }
+    assert!(levels.last().expect("new top level").len() == lens[SUBTREE_HEIGHT]);
+}
+
 fn finish_levels<H: Hasher>(levels: &mut Vec<Vec<Digest>>) {
     assert!(!levels.is_empty());
+    for _ in 0..8 {
+        if levels.last().expect("at least one level").len() < SUBTREE_LEAVES * 2 {
+            break;
+        }
+        append_subtree_pass::<H>(levels);
+    }
     for _ in 0..64 {
         let below_len = levels.last().expect("at least one level").len();
         if below_len <= 1 {
@@ -171,45 +234,59 @@ fn finish_levels<H: Hasher>(levels: &mut Vec<Vec<Digest>>) {
     assert!(levels.last().expect("root level exists").len() == 1);
 }
 
+struct LocalSubtree {
+    nodes: Vec<Digest>,
+    offsets: [usize; SUBTREE_HEIGHT],
+}
+
+fn build_local_tree<H: Hasher, F: Field>(
+    rows: &[Vec<F>],
+    block: usize,
+    skip_levels: usize,
+    num_leaves: usize,
+    scratch: &mut Vec<u8>,
+) -> LocalSubtree {
+    assert!((1..=SUBTREE_HEIGHT).contains(&skip_levels));
+    let start = block << skip_levels;
+    let end = ((block + 1) << skip_levels).min(num_leaves);
+    assert!(start < end);
+    let mut cur_len = end - start;
+    let mut offsets = [0usize; SUBTREE_HEIGHT];
+    let mut total = cur_len;
+    let mut w = cur_len;
+    for offset in offsets.iter_mut().take(skip_levels).skip(1) {
+        *offset = total;
+        w = w.div_ceil(2);
+        total += w;
+    }
+    let mut nodes = vec![[0u8; 32]; total];
+    H::hash_rows_range(rows, start, cur_len, scratch, &mut nodes[..cur_len]);
+    for depth in 1..skip_levels {
+        let prev_off = offsets[depth - 1];
+        let next_off = offsets[depth];
+        let next_len = cur_len.div_ceil(2);
+        let (head, tail) = nodes.split_at_mut(next_off);
+        H::hash_nodes(&head[prev_off..prev_off + cur_len], &mut tail[..next_len]);
+        cur_len = next_len;
+    }
+    assert!(nodes.len() == total);
+    LocalSubtree { nodes, offsets }
+}
+
 pub struct MerkleTree {
     levels: Vec<Vec<Digest>>,
+    num_leaves: usize,
+    skip_levels: usize,
 }
 
 impl MerkleTree {
     pub fn new<H: Hasher>(leaves: Vec<Digest>) -> Self {
         assert!(!leaves.is_empty());
-        if leaves.len() < SUBTREE_LEAVES * 2 {
-            let mut levels = vec![leaves];
-            finish_levels::<H>(&mut levels);
-            return Self { levels };
-        }
-        let len = leaves.len();
-        let lens = level_lengths(len, SUBTREE_HEIGHT + 1);
-        let mut levels: Vec<Vec<Digest>> = Vec::with_capacity(SUBTREE_HEIGHT + 1);
-        levels.push(leaves);
-        for &level_len in &lens[1..] {
-            levels.push(Vec::with_capacity(level_len));
-        }
-        let ptrs: Vec<(RawMut, usize)> =
-            levels.iter_mut().zip(&lens).map(|(level, &n)| (RawMut(level.as_mut_ptr()), n)).collect();
-        let leaves_ref: &[Digest] = &levels[0];
-        let num_subtrees = len.div_ceil(SUBTREE_LEAVES);
-        parallel::map_pieces(num_subtrees, 1, |range| {
-            let mut buf_a = [[0u8; 32]; SUBTREE_LEAVES];
-            let mut buf_b = [[0u8; 32]; SUBTREE_LEAVES / 2];
-            for subtree in range {
-                let start = subtree << SUBTREE_HEIGHT;
-                let end = ((subtree + 1) << SUBTREE_HEIGHT).min(len);
-                let cur_len = end - start;
-                buf_a[..cur_len].copy_from_slice(&leaves_ref[start..end]);
-                build_subtree_levels::<H>(subtree, cur_len, &mut buf_a, &mut buf_b, &ptrs, 1);
-            }
-        });
-        for (level, &n) in levels[1..].iter_mut().zip(&lens[1..]) {
-            unsafe { level.set_len(n) };
-        }
+        let num_leaves = leaves.len();
+        let mut levels = vec![leaves];
         finish_levels::<H>(&mut levels);
-        Self { levels }
+        assert!(levels[0].len() == num_leaves);
+        Self { levels, num_leaves, skip_levels: 0 }
     }
 
     pub(crate) fn from_rows<H: Hasher, F: Field>(rows: &[Vec<F>]) -> Self {
@@ -223,12 +300,17 @@ impl MerkleTree {
             H::hash_rows_range(rows, 0, len, &mut scratch, &mut leaves);
             return Self::new::<H>(leaves);
         }
+        let skip_levels = choose_skip_levels(len, 8 + rows.len() * F::BYTES);
         let lens = level_lengths(len, SUBTREE_HEIGHT + 1);
-        let mut levels: Vec<Vec<Digest>> = lens.iter().map(|&n| Vec::with_capacity(n)).collect();
-        let ptrs: Vec<(RawMut, usize)> =
-            levels.iter_mut().zip(&lens).map(|(level, &n)| (RawMut(level.as_mut_ptr()), n)).collect();
+        let mut levels: Vec<Vec<Digest>> =
+            lens[skip_levels..].iter().map(|&n| Vec::with_capacity(n)).collect();
+        let mut ptrs: Vec<(RawMut, usize)> = vec![(RawMut(ptr::null_mut()), 0); skip_levels];
+        for (level, &n) in levels.iter_mut().zip(&lens[skip_levels..]) {
+            ptrs.push((RawMut(level.as_mut_ptr()), n));
+        }
+        assert!(ptrs.len() == SUBTREE_HEIGHT + 1);
         let num_subtrees = len.div_ceil(SUBTREE_LEAVES);
-        parallel::map_pieces(num_subtrees, 1, |range| {
+        parallel::map_pieces(num_subtrees, SUBTREE_PIECE_MIN, |range| {
             let mut scratch = Vec::new();
             let mut buf_a = [[0u8; 32]; SUBTREE_LEAVES];
             let mut buf_b = [[0u8; 32]; SUBTREE_LEAVES / 2];
@@ -237,15 +319,25 @@ impl MerkleTree {
                 let end = ((subtree + 1) << SUBTREE_HEIGHT).min(len);
                 let cur_len = end - start;
                 H::hash_rows_range(rows, start, cur_len, &mut scratch, &mut buf_a[..cur_len]);
-                write_disjoint(ptrs[0].0, start, ptrs[0].1, &buf_a[..cur_len]);
-                build_subtree_levels::<H>(subtree, cur_len, &mut buf_a, &mut buf_b, &ptrs, 1);
+                if skip_levels == 0 {
+                    write_disjoint(ptrs[0].0, start, ptrs[0].1, &buf_a[..cur_len]);
+                }
+                build_subtree_from_depth::<H>(
+                    subtree,
+                    cur_len,
+                    0,
+                    &mut buf_a,
+                    &mut buf_b,
+                    &ptrs,
+                    skip_levels,
+                );
             }
         });
-        for (level, &n) in levels.iter_mut().zip(&lens) {
+        for (level, &n) in levels.iter_mut().zip(&lens[skip_levels..]) {
             unsafe { level.set_len(n) };
         }
         finish_levels::<H>(&mut levels);
-        Self { levels }
+        Self { levels, num_leaves: len, skip_levels }
     }
 
     pub fn root(&self) -> Digest {
@@ -253,8 +345,63 @@ impl MerkleTree {
     }
 
     pub fn open(&self, positions: &[usize]) -> Vec<Digest> {
+        assert!(self.skip_levels == 0);
         let mut opening = Vec::new();
         let mut known = positions.to_vec();
+        for level in &self.levels[..self.levels.len() - 1] {
+            known = parents(&known, level.len(), |child, is_known| {
+                if !is_known {
+                    opening.push(level[child]);
+                }
+            });
+        }
+        opening
+    }
+
+    pub(crate) fn open_with_rows<H: Hasher, F: Field>(
+        &self,
+        rows: &[Vec<F>],
+        positions: &[usize],
+    ) -> Vec<Digest> {
+        assert!(positions.windows(2).all(|pair| pair[0] < pair[1]));
+        assert!(positions.last().is_none_or(|&last| last < self.num_leaves));
+        if self.skip_levels == 0 || positions.is_empty() {
+            return self.open(positions);
+        }
+        let k = self.skip_levels;
+        let mut blocks: Vec<usize> = positions.iter().map(|&p| p >> k).collect();
+        blocks.dedup();
+        let work = blocks.len().saturating_mul(1usize << k).saturating_mul(rows.len());
+        let local_trees: Vec<LocalSubtree> = if work >= OPEN_PARALLEL_WORK_MIN {
+            parallel::map(&blocks, |&block| {
+                let mut scratch = Vec::new();
+                build_local_tree::<H, F>(rows, block, k, self.num_leaves, &mut scratch)
+            })
+        } else {
+            let mut scratch = Vec::new();
+            blocks
+                .iter()
+                .map(|&block| build_local_tree::<H, F>(rows, block, k, self.num_leaves, &mut scratch))
+                .collect()
+        };
+        let mut opening = Vec::new();
+        let mut known = positions.to_vec();
+        let mut width = self.num_leaves;
+        for shift in (1..=k).rev() {
+            let depth = k - shift;
+            let mask = (1usize << shift) - 1;
+            known = parents(&known, width, |child, is_known| {
+                if !is_known {
+                    let blk = child >> shift;
+                    let off = child & mask;
+                    let bi = blocks.binary_search(&blk).expect("block was computed");
+                    let tree = &local_trees[bi];
+                    opening.push(tree.nodes[tree.offsets[depth] + off]);
+                }
+            });
+            width = width.div_ceil(2);
+        }
+        assert!(width == self.levels[0].len());
         for level in &self.levels[..self.levels.len() - 1] {
             known = parents(&known, level.len(), |child, is_known| {
                 if !is_known {

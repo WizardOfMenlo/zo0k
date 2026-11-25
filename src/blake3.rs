@@ -3,81 +3,79 @@ pub const OUT_LEN: usize = 32;
 pub const BLOCK_LEN: usize = 64;
 pub const CHUNK_LEN: usize = 1024;
 
-const CV_STACK_LEN_MAX: usize = 54;
-const CV_STACK_INLINE_LEN_MAX: usize = 8;
-
 const CHUNK_START: u32 = 1 << 0;
 const CHUNK_END: u32 = 1 << 1;
 const PARENT: u32 = 1 << 2;
 const ROOT: u32 = 1 << 3;
 const KEYED_HASH: u32 = 1 << 4;
-const FLAGS_ALL: u32 = CHUNK_START | CHUNK_END | PARENT | ROOT | KEYED_HASH;
+const CV_STACK_LEN_MAX: usize = 54;
 
 const IV: [u32; 8] =
     [0x6A09E667, 0xBB67AE85, 0x3C6EF372, 0xA54FF53A, 0x510E527F, 0x9B05688C, 0x1F83D9AB, 0x5BE0CD19];
 
 const MSG_PERMUTATION: [usize; 16] = [2, 6, 3, 10, 7, 0, 4, 13, 1, 11, 12, 5, 9, 14, 15, 8];
 
-const ROUNDS: usize = 7;
-
-const MSG_SCHEDULE: [[usize; 16]; ROUNDS] = message_schedule();
-
-const fn message_schedule() -> [[usize; 16]; ROUNDS] {
-    let mut schedule = [[0; 16]; ROUNDS];
+const MSG_SCHEDULE: [[usize; 16]; 7] = {
+    let mut table = [[0usize; 16]; 7];
     let mut word = 0;
     while word < 16 {
-        schedule[0][word] = word;
+        table[0][word] = word;
         word += 1;
     }
     let mut round = 1;
-    while round < ROUNDS {
+    while round < 7 {
         let mut word = 0;
         while word < 16 {
-            schedule[round][word] = schedule[round - 1][MSG_PERMUTATION[word]];
+            table[round][word] = table[round - 1][MSG_PERMUTATION[word]];
             word += 1;
         }
         round += 1;
     }
-    schedule
-}
+    table
+};
 
 #[inline(always)]
-fn g(state: &mut [u32; 16], a: usize, b: usize, c: usize, d: usize, x: u32, y: u32) {
-    state[a] = state[a].wrapping_add(x).wrapping_add(state[b]);
+fn g(state: &mut [u32; 16], a: usize, b: usize, c: usize, d: usize, mx: u32, my: u32) {
+    state[a] = state[a].wrapping_add(state[b]).wrapping_add(mx);
     state[d] = (state[d] ^ state[a]).rotate_right(16);
     state[c] = state[c].wrapping_add(state[d]);
     state[b] = (state[b] ^ state[c]).rotate_right(12);
-    state[a] = state[a].wrapping_add(y).wrapping_add(state[b]);
+    state[a] = state[a].wrapping_add(state[b]).wrapping_add(my);
     state[d] = (state[d] ^ state[a]).rotate_right(8);
     state[c] = state[c].wrapping_add(state[d]);
     state[b] = (state[b] ^ state[c]).rotate_right(7);
 }
 
 #[inline(always)]
-fn round(state: &mut [u32; 16], message: &[u32; 16], schedule: &[usize; 16]) {
-    g(state, 0, 4, 8, 12, message[schedule[0]], message[schedule[1]]);
-    g(state, 1, 5, 9, 13, message[schedule[2]], message[schedule[3]]);
-    g(state, 2, 6, 10, 14, message[schedule[4]], message[schedule[5]]);
-    g(state, 3, 7, 11, 15, message[schedule[6]], message[schedule[7]]);
-    g(state, 0, 5, 10, 15, message[schedule[8]], message[schedule[9]]);
-    g(state, 1, 6, 11, 12, message[schedule[10]], message[schedule[11]]);
-    g(state, 2, 7, 8, 13, message[schedule[12]], message[schedule[13]]);
-    g(state, 3, 4, 9, 14, message[schedule[14]], message[schedule[15]]);
+fn round(state: &mut [u32; 16], m: &[u32; 16], schedule: &[usize; 16]) {
+    g(state, 0, 4, 8, 12, m[schedule[0]], m[schedule[1]]);
+    g(state, 1, 5, 9, 13, m[schedule[2]], m[schedule[3]]);
+    g(state, 2, 6, 10, 14, m[schedule[4]], m[schedule[5]]);
+    g(state, 3, 7, 11, 15, m[schedule[6]], m[schedule[7]]);
+    g(state, 0, 5, 10, 15, m[schedule[8]], m[schedule[9]]);
+    g(state, 1, 6, 11, 12, m[schedule[10]], m[schedule[11]]);
+    g(state, 2, 7, 8, 13, m[schedule[12]], m[schedule[13]]);
+    g(state, 3, 4, 9, 14, m[schedule[14]], m[schedule[15]]);
 }
 
-#[inline(always)]
-fn compress(cv: &[u32; 8], message: &[u32; 16], counter: u64, block_len: u32, flags: u32) -> [u32; 16] {
-    assert!(block_len as usize <= BLOCK_LEN);
-    assert!(flags & !FLAGS_ALL == 0);
+fn compress(
+    chaining_value: &[u32; 8],
+    block_words: &[u32; 16],
+    counter: u64,
+    block_len: u32,
+    flags: u32,
+) -> [u32; 16] {
+    assert!(block_len <= BLOCK_LEN as u32);
+    const { assert!(MSG_SCHEDULE.len() == 7) };
     let mut state = [
-        cv[0],
-        cv[1],
-        cv[2],
-        cv[3],
-        cv[4],
-        cv[5],
-        cv[6],
-        cv[7],
+        chaining_value[0],
+        chaining_value[1],
+        chaining_value[2],
+        chaining_value[3],
+        chaining_value[4],
+        chaining_value[5],
+        chaining_value[6],
+        chaining_value[7],
         IV[0],
         IV[1],
         IV[2],
@@ -87,39 +85,39 @@ fn compress(cv: &[u32; 8], message: &[u32; 16], counter: u64, block_len: u32, fl
         block_len,
         flags,
     ];
-    round(&mut state, message, &MSG_SCHEDULE[0]);
-    round(&mut state, message, &MSG_SCHEDULE[1]);
-    round(&mut state, message, &MSG_SCHEDULE[2]);
-    round(&mut state, message, &MSG_SCHEDULE[3]);
-    round(&mut state, message, &MSG_SCHEDULE[4]);
-    round(&mut state, message, &MSG_SCHEDULE[5]);
-    round(&mut state, message, &MSG_SCHEDULE[6]);
-    for word in 0..8 {
-        state[word] ^= state[word + 8];
-        state[word + 8] ^= cv[word];
+    for schedule in &MSG_SCHEDULE {
+        round(&mut state, block_words, schedule);
+    }
+    for i in 0..8 {
+        state[i] ^= state[i + 8];
+        state[i + 8] ^= chaining_value[i];
     }
     state
 }
 
 #[inline(always)]
-fn compress_cv(cv: &[u32; 8], message: &[u32; 16], counter: u64, block_len: u32, flags: u32) -> [u32; 8] {
-    let state = compress(cv, message, counter, block_len, flags);
-    let mut cv_next = [0; 8];
-    cv_next.copy_from_slice(&state[..8]);
-    cv_next
+fn first_8_words(compression_output: [u32; 16]) -> [u32; 8] {
+    compression_output[0..8].try_into().expect("eight words")
 }
 
 #[inline(always)]
 fn words_from_block(block: &[u8; BLOCK_LEN]) -> [u32; 16] {
-    let mut words = [0; 16];
-    for (word, bytes) in words.iter_mut().zip(block.as_chunks::<4>().0) {
-        *word = u32::from_le_bytes(*bytes);
+    let mut words = [0u32; 16];
+    for (word, chunk) in words.iter_mut().zip(block.as_chunks::<4>().0) {
+        *word = u32::from_le_bytes(*chunk);
     }
     words
 }
 
+#[inline(always)]
+fn words_from_partial_block(block: &[u8]) -> [u32; 16] {
+    assert!(block.len() <= BLOCK_LEN);
+    let mut padded = [0u8; BLOCK_LEN];
+    padded[..block.len()].copy_from_slice(block);
+    words_from_block(&padded)
+}
+
 pub(crate) const fn words_from_key(key: &[u8; KEY_LEN]) -> [u32; 8] {
-    const { assert!(KEY_LEN == 32) };
     let mut words = [0u32; 8];
     let mut index = 0;
     while index < 8 {
@@ -131,25 +129,64 @@ pub(crate) const fn words_from_key(key: &[u8; KEY_LEN]) -> [u32; 8] {
 }
 
 #[inline(always)]
-fn hash_from_cv(cv: [u32; 8]) -> [u8; OUT_LEN] {
-    let mut hash = [0; OUT_LEN];
-    for (bytes, word) in hash.as_chunks_mut::<4>().0.iter_mut().zip(cv) {
-        *bytes = word.to_le_bytes();
+fn bytes_from_words(words: &[u32; 8]) -> [u8; OUT_LEN] {
+    let mut out = [0u8; OUT_LEN];
+    for (dst, &word) in out.as_chunks_mut::<4>().0.iter_mut().zip(words) {
+        *dst = word.to_le_bytes();
     }
-    hash
+    out
+}
+
+#[inline(always)]
+fn compress_chunk_scalar(
+    key: &[u32; 8],
+    chunk: &[u8],
+    chunk_counter: u64,
+    flags: u32,
+    extra_end_flags: u32,
+) -> [u32; 8] {
+    assert!(chunk.len() <= CHUNK_LEN);
+    let mut cv = *key;
+    let mut offset = 0;
+    let full_len = chunk.len().saturating_sub(1) / BLOCK_LEN * BLOCK_LEN;
+    while offset < full_len {
+        let block: &[u8; BLOCK_LEN] = chunk[offset..offset + BLOCK_LEN].try_into().expect("full block");
+        let block_flags = flags | if offset == 0 { CHUNK_START } else { 0 };
+        cv = first_8_words(compress(
+            &cv,
+            &words_from_block(block),
+            chunk_counter,
+            BLOCK_LEN as u32,
+            block_flags,
+        ));
+        offset += BLOCK_LEN;
+    }
+    let tail = &chunk[offset..];
+    assert!(tail.len() <= BLOCK_LEN);
+    let end_flags = flags | if offset == 0 { CHUNK_START } else { 0 } | CHUNK_END | extra_end_flags;
+    first_8_words(compress(&cv, &words_from_partial_block(tail), chunk_counter, tail.len() as u32, end_flags))
+}
+
+#[inline(always)]
+fn parent_cv(left_child_cv: &[u32; 8], right_child_cv: &[u32; 8], key: &[u32; 8], flags: u32) -> [u32; 8] {
+    let mut block_words = [0u32; 16];
+    block_words[..8].copy_from_slice(left_child_cv);
+    block_words[8..].copy_from_slice(right_child_cv);
+    first_8_words(compress(key, &block_words, 0, BLOCK_LEN as u32, flags | PARENT))
 }
 
 #[cfg(all(target_arch = "aarch64", target_feature = "neon", target_endian = "little"))]
 mod neon {
     use super::{
-        BLOCK_LEN, CHUNK_END, CHUNK_LEN, CHUNK_START, CV_STACK_LEN_MAX, FLAGS_ALL, IV, KEYED_HASH,
-        MSG_SCHEDULE, OUT_LEN, Output, PARENT, ROOT,
+        BLOCK_LEN, CHUNK_END, CHUNK_LEN, CHUNK_START, CV_STACK_LEN_MAX, IV, KEYED_HASH, MSG_SCHEDULE,
+        OUT_LEN, PARENT, ROOT,
     };
     use std::arch::aarch64::*;
 
     type V = uint32x4_t;
 
     const ROT8_MASK: [u8; 16] = [1, 2, 3, 0, 5, 6, 7, 4, 9, 10, 11, 8, 13, 14, 15, 12];
+    const CHUNK_BLOCKS: usize = CHUNK_LEN / BLOCK_LEN;
 
     #[inline(always)]
     unsafe fn rotr16(x: V) -> V {
@@ -172,29 +209,30 @@ mod neon {
     }
 
     #[inline(always)]
-    unsafe fn transpose4(r0: V, r1: V, r2: V, r3: V) -> [V; 4] {
+    unsafe fn transpose_4x4(a: V, b: V, c: V, d: V) -> [V; 4] {
         unsafe {
-            let t0 = vtrn1q_u32(r0, r1);
-            let t1 = vtrn2q_u32(r0, r1);
-            let t2 = vtrn1q_u32(r2, r3);
-            let t3 = vtrn2q_u32(r2, r3);
-            let c0 = vreinterpretq_u32_u64(vzip1q_u64(vreinterpretq_u64_u32(t0), vreinterpretq_u64_u32(t2)));
-            let c1 = vreinterpretq_u32_u64(vzip1q_u64(vreinterpretq_u64_u32(t1), vreinterpretq_u64_u32(t3)));
-            let c2 = vreinterpretq_u32_u64(vzip2q_u64(vreinterpretq_u64_u32(t0), vreinterpretq_u64_u32(t2)));
-            let c3 = vreinterpretq_u32_u64(vzip2q_u64(vreinterpretq_u64_u32(t1), vreinterpretq_u64_u32(t3)));
-            [c0, c1, c2, c3]
+            let ab_lo = vreinterpretq_u64_u32(vzip1q_u32(a, b));
+            let ab_hi = vreinterpretq_u64_u32(vzip2q_u32(a, b));
+            let cd_lo = vreinterpretq_u64_u32(vzip1q_u32(c, d));
+            let cd_hi = vreinterpretq_u64_u32(vzip2q_u32(c, d));
+            [
+                vreinterpretq_u32_u64(vzip1q_u64(ab_lo, cd_lo)),
+                vreinterpretq_u32_u64(vzip2q_u64(ab_lo, cd_lo)),
+                vreinterpretq_u32_u64(vzip1q_u64(ab_hi, cd_hi)),
+                vreinterpretq_u32_u64(vzip2q_u64(ab_hi, cd_hi)),
+            ]
         }
     }
 
     #[inline(always)]
-    unsafe fn g_4x(s: &mut [V; 16], idx: [usize; 4], x: V, y: V, rot8: uint8x16_t) {
-        let [a, b, c, d] = idx;
+    #[allow(clippy::too_many_arguments)]
+    unsafe fn g4(s: &mut [V; 16], a: usize, b: usize, c: usize, d: usize, mx: V, my: V, rot8: uint8x16_t) {
         unsafe {
-            s[a] = vaddq_u32(vaddq_u32(s[a], x), s[b]);
+            s[a] = vaddq_u32(vaddq_u32(s[a], mx), s[b]);
             s[d] = rotr16(veorq_u32(s[d], s[a]));
             s[c] = vaddq_u32(s[c], s[d]);
             s[b] = rotr12(veorq_u32(s[b], s[c]));
-            s[a] = vaddq_u32(vaddq_u32(s[a], y), s[b]);
+            s[a] = vaddq_u32(vaddq_u32(s[a], my), s[b]);
             s[d] = rotr8(veorq_u32(s[d], s[a]), rot8);
             s[c] = vaddq_u32(s[c], s[d]);
             s[b] = rotr7(veorq_u32(s[b], s[c]));
@@ -202,33 +240,93 @@ mod neon {
     }
 
     #[inline(always)]
-    unsafe fn round_4x(s: &mut [V; 16], m: &[V; 16], sched: &[usize; 16], rot8: uint8x16_t) {
+    #[allow(clippy::too_many_arguments)]
+    unsafe fn g8(
+        s0: &mut [V; 16],
+        s1: &mut [V; 16],
+        a: usize,
+        b: usize,
+        c: usize,
+        d: usize,
+        x0: V,
+        y0: V,
+        x1: V,
+        y1: V,
+        rot8: uint8x16_t,
+    ) {
         unsafe {
-            g_4x(s, [0, 4, 8, 12], m[sched[0]], m[sched[1]], rot8);
-            g_4x(s, [1, 5, 9, 13], m[sched[2]], m[sched[3]], rot8);
-            g_4x(s, [2, 6, 10, 14], m[sched[4]], m[sched[5]], rot8);
-            g_4x(s, [3, 7, 11, 15], m[sched[6]], m[sched[7]], rot8);
-            g_4x(s, [0, 5, 10, 15], m[sched[8]], m[sched[9]], rot8);
-            g_4x(s, [1, 6, 11, 12], m[sched[10]], m[sched[11]], rot8);
-            g_4x(s, [2, 7, 8, 13], m[sched[12]], m[sched[13]], rot8);
-            g_4x(s, [3, 4, 9, 14], m[sched[14]], m[sched[15]], rot8);
+            s0[a] = vaddq_u32(vaddq_u32(s0[a], x0), s0[b]);
+            s1[a] = vaddq_u32(vaddq_u32(s1[a], x1), s1[b]);
+            s0[d] = rotr16(veorq_u32(s0[d], s0[a]));
+            s1[d] = rotr16(veorq_u32(s1[d], s1[a]));
+            s0[c] = vaddq_u32(s0[c], s0[d]);
+            s1[c] = vaddq_u32(s1[c], s1[d]);
+            s0[b] = rotr12(veorq_u32(s0[b], s0[c]));
+            s1[b] = rotr12(veorq_u32(s1[b], s1[c]));
+            s0[a] = vaddq_u32(vaddq_u32(s0[a], y0), s0[b]);
+            s1[a] = vaddq_u32(vaddq_u32(s1[a], y1), s1[b]);
+            s0[d] = rotr8(veorq_u32(s0[d], s0[a]), rot8);
+            s1[d] = rotr8(veorq_u32(s1[d], s1[a]), rot8);
+            s0[c] = vaddq_u32(s0[c], s0[d]);
+            s1[c] = vaddq_u32(s1[c], s1[d]);
+            s0[b] = rotr7(veorq_u32(s0[b], s0[c]));
+            s1[b] = rotr7(veorq_u32(s1[b], s1[c]));
         }
     }
 
     #[inline(always)]
-    unsafe fn compress_core_4x(
-        cv: &[V; 8],
-        m: &[V; 16],
-        counter_lo: V,
-        counter_hi: V,
-        block_len: u32,
-        flags: u32,
-    ) -> [V; 16] {
-        assert!(block_len as usize <= BLOCK_LEN);
-        assert!(flags & !FLAGS_ALL == 0);
+    #[allow(clippy::too_many_arguments)]
+    unsafe fn g16(
+        s: &mut [[V; 16]; 4],
+        a: usize,
+        b: usize,
+        c: usize,
+        d: usize,
+        m: &[[V; 16]; 4],
+        wx: usize,
+        wy: usize,
+        rot8: uint8x16_t,
+    ) {
         unsafe {
-            let rot8 = vld1q_u8(ROT8_MASK.as_ptr());
-            let mut s = [
+            s[0][a] = vaddq_u32(vaddq_u32(s[0][a], m[0][wx]), s[0][b]);
+            s[1][a] = vaddq_u32(vaddq_u32(s[1][a], m[1][wx]), s[1][b]);
+            s[2][a] = vaddq_u32(vaddq_u32(s[2][a], m[2][wx]), s[2][b]);
+            s[3][a] = vaddq_u32(vaddq_u32(s[3][a], m[3][wx]), s[3][b]);
+            s[0][d] = rotr16(veorq_u32(s[0][d], s[0][a]));
+            s[1][d] = rotr16(veorq_u32(s[1][d], s[1][a]));
+            s[2][d] = rotr16(veorq_u32(s[2][d], s[2][a]));
+            s[3][d] = rotr16(veorq_u32(s[3][d], s[3][a]));
+            s[0][c] = vaddq_u32(s[0][c], s[0][d]);
+            s[1][c] = vaddq_u32(s[1][c], s[1][d]);
+            s[2][c] = vaddq_u32(s[2][c], s[2][d]);
+            s[3][c] = vaddq_u32(s[3][c], s[3][d]);
+            s[0][b] = rotr12(veorq_u32(s[0][b], s[0][c]));
+            s[1][b] = rotr12(veorq_u32(s[1][b], s[1][c]));
+            s[2][b] = rotr12(veorq_u32(s[2][b], s[2][c]));
+            s[3][b] = rotr12(veorq_u32(s[3][b], s[3][c]));
+            s[0][a] = vaddq_u32(vaddq_u32(s[0][a], m[0][wy]), s[0][b]);
+            s[1][a] = vaddq_u32(vaddq_u32(s[1][a], m[1][wy]), s[1][b]);
+            s[2][a] = vaddq_u32(vaddq_u32(s[2][a], m[2][wy]), s[2][b]);
+            s[3][a] = vaddq_u32(vaddq_u32(s[3][a], m[3][wy]), s[3][b]);
+            s[0][d] = rotr8(veorq_u32(s[0][d], s[0][a]), rot8);
+            s[1][d] = rotr8(veorq_u32(s[1][d], s[1][a]), rot8);
+            s[2][d] = rotr8(veorq_u32(s[2][d], s[2][a]), rot8);
+            s[3][d] = rotr8(veorq_u32(s[3][d], s[3][a]), rot8);
+            s[0][c] = vaddq_u32(s[0][c], s[0][d]);
+            s[1][c] = vaddq_u32(s[1][c], s[1][d]);
+            s[2][c] = vaddq_u32(s[2][c], s[2][d]);
+            s[3][c] = vaddq_u32(s[3][c], s[3][d]);
+            s[0][b] = rotr7(veorq_u32(s[0][b], s[0][c]));
+            s[1][b] = rotr7(veorq_u32(s[1][b], s[1][c]));
+            s[2][b] = rotr7(veorq_u32(s[2][b], s[2][c]));
+            s[3][b] = rotr7(veorq_u32(s[3][b], s[3][c]));
+        }
+    }
+
+    #[inline(always)]
+    unsafe fn init_state(cv: &[V; 8], t_lo: V, t_hi: V, len: u32, flags: u32) -> [V; 16] {
+        unsafe {
+            [
                 cv[0],
                 cv[1],
                 cv[2],
@@ -241,98 +339,16 @@ mod neon {
                 vdupq_n_u32(IV[1]),
                 vdupq_n_u32(IV[2]),
                 vdupq_n_u32(IV[3]),
-                counter_lo,
-                counter_hi,
-                vdupq_n_u32(block_len),
+                t_lo,
+                t_hi,
+                vdupq_n_u32(len),
                 vdupq_n_u32(flags),
-            ];
-            round_4x(&mut s, m, &MSG_SCHEDULE[0], rot8);
-            round_4x(&mut s, m, &MSG_SCHEDULE[1], rot8);
-            round_4x(&mut s, m, &MSG_SCHEDULE[2], rot8);
-            round_4x(&mut s, m, &MSG_SCHEDULE[3], rot8);
-            round_4x(&mut s, m, &MSG_SCHEDULE[4], rot8);
-            round_4x(&mut s, m, &MSG_SCHEDULE[5], rot8);
-            round_4x(&mut s, m, &MSG_SCHEDULE[6], rot8);
-            s
-        }
-    }
-
-    #[inline(always)]
-    unsafe fn compress_cv_4x(
-        cv: &[V; 8],
-        m: &[V; 16],
-        counter_lo: V,
-        counter_hi: V,
-        block_len: u32,
-        flags: u32,
-    ) -> [V; 8] {
-        unsafe {
-            let s = compress_core_4x(cv, m, counter_lo, counter_hi, block_len, flags);
-            [
-                veorq_u32(s[0], s[8]),
-                veorq_u32(s[1], s[9]),
-                veorq_u32(s[2], s[10]),
-                veorq_u32(s[3], s[11]),
-                veorq_u32(s[4], s[12]),
-                veorq_u32(s[5], s[13]),
-                veorq_u32(s[6], s[14]),
-                veorq_u32(s[7], s[15]),
             ]
         }
     }
 
     #[inline(always)]
-    unsafe fn load_full_block_4x(ptrs: [*const u8; 4]) -> [V; 16] {
-        unsafe {
-            let mut m = [vdupq_n_u32(0); 16];
-            for group in 0..4 {
-                let off = group * 16;
-                let r0 = vreinterpretq_u32_u8(vld1q_u8(ptrs[0].add(off)));
-                let r1 = vreinterpretq_u32_u8(vld1q_u8(ptrs[1].add(off)));
-                let r2 = vreinterpretq_u32_u8(vld1q_u8(ptrs[2].add(off)));
-                let r3 = vreinterpretq_u32_u8(vld1q_u8(ptrs[3].add(off)));
-                let cols = transpose4(r0, r1, r2, r3);
-                m[group * 4] = cols[0];
-                m[group * 4 + 1] = cols[1];
-                m[group * 4 + 2] = cols[2];
-                m[group * 4 + 3] = cols[3];
-            }
-            m
-        }
-    }
-
-    #[inline(always)]
-    unsafe fn load_partial_block_4x(inputs: [&[u8]; 4], offset: usize, len_bytes: usize) -> [V; 16] {
-        assert!(len_bytes <= BLOCK_LEN);
-        assert!(inputs.iter().all(|slice| offset + len_bytes <= slice.len()));
-        let mut padded = [[0u8; BLOCK_LEN]; 4];
-        for lane in 0..4 {
-            padded[lane][..len_bytes].copy_from_slice(&inputs[lane][offset..offset + len_bytes]);
-        }
-        unsafe {
-            load_full_block_4x([
-                padded[0].as_ptr(),
-                padded[1].as_ptr(),
-                padded[2].as_ptr(),
-                padded[3].as_ptr(),
-            ])
-        }
-    }
-
-    #[inline(always)]
-    unsafe fn store_cv_4x(cv: &[V; 8], out: &mut [[u8; OUT_LEN]; 4]) {
-        unsafe {
-            let lo = transpose4(cv[0], cv[1], cv[2], cv[3]);
-            let hi = transpose4(cv[4], cv[5], cv[6], cv[7]);
-            for lane in 0..4 {
-                vst1q_u8(out[lane].as_mut_ptr(), vreinterpretq_u8_u32(lo[lane]));
-                vst1q_u8(out[lane].as_mut_ptr().add(16), vreinterpretq_u8_u32(hi[lane]));
-            }
-        }
-    }
-
-    #[inline(always)]
-    unsafe fn key_splat(key: &[u32; 8]) -> [V; 8] {
+    unsafe fn broadcast_key(key: &[u32; 8]) -> [V; 8] {
         unsafe {
             [
                 vdupq_n_u32(key[0]),
@@ -348,771 +364,1534 @@ mod neon {
     }
 
     #[inline(always)]
-    unsafe fn parent_cv_4x(key_v: &[V; 8], left: &[V; 8], right: &[V; 8], flags: u32) -> [V; 8] {
-        unsafe {
-            let m = [
-                left[0], left[1], left[2], left[3], left[4], left[5], left[6], left[7], right[0], right[1],
-                right[2], right[3], right[4], right[5], right[6], right[7],
-            ];
-            let zero = vdupq_n_u32(0);
-            compress_cv_4x(key_v, &m, zero, zero, BLOCK_LEN as u32, flags | PARENT)
-        }
-    }
-
-    #[inline(always)]
-    unsafe fn compress_chunk_4x(
-        key_v: &[V; 8],
-        inputs: [&[u8]; 4],
-        base_offset: usize,
-        chunk_len: usize,
-        chunk_counter: u64,
-        base_flags: u32,
-        root_flag: u32,
-    ) -> [V; 8] {
-        assert!(chunk_len <= CHUNK_LEN);
-        assert!(inputs.iter().all(|slice| base_offset + chunk_len <= slice.len()));
-        unsafe {
-            let counter_lo = vdupq_n_u32(chunk_counter as u32);
-            let counter_hi = vdupq_n_u32((chunk_counter >> 32) as u32);
-            let mut cv = *key_v;
-            if chunk_len == 0 {
-                let m = [vdupq_n_u32(0); 16];
-                let flags = base_flags | CHUNK_START | CHUNK_END | root_flag;
-                return compress_cv_4x(&cv, &m, counter_lo, counter_hi, 0, flags);
-            }
-            let full_blocks = (chunk_len - 1) / BLOCK_LEN;
-            for block in 0..full_blocks {
-                let off = base_offset + block * BLOCK_LEN;
-                let ptrs = [
-                    inputs[0].as_ptr().add(off),
-                    inputs[1].as_ptr().add(off),
-                    inputs[2].as_ptr().add(off),
-                    inputs[3].as_ptr().add(off),
-                ];
-                let m = load_full_block_4x(ptrs);
-                let start = if block == 0 { CHUNK_START } else { 0 };
-                cv = compress_cv_4x(&cv, &m, counter_lo, counter_hi, BLOCK_LEN as u32, base_flags | start);
-            }
-            let last_off = base_offset + full_blocks * BLOCK_LEN;
-            let last_len = chunk_len - full_blocks * BLOCK_LEN;
-            let start = if full_blocks == 0 { CHUNK_START } else { 0 };
-            let flags = base_flags | start | CHUNK_END | root_flag;
-            if last_len == 8 {
-                let mut m = [vdupq_n_u32(0); 16];
-                let mut w0 = [0u32; 4];
-                let mut w1 = [0u32; 4];
-                for lane in 0..4 {
-                    let s = &inputs[lane][last_off..last_off + 8];
-                    w0[lane] = u32::from_le_bytes([s[0], s[1], s[2], s[3]]);
-                    w1[lane] = u32::from_le_bytes([s[4], s[5], s[6], s[7]]);
-                }
-                m[0] = vld1q_u32(w0.as_ptr());
-                m[1] = vld1q_u32(w1.as_ptr());
-                return compress_cv_4x(&cv, &m, counter_lo, counter_hi, 8, flags);
-            }
-            let m = if last_len == BLOCK_LEN {
-                load_full_block_4x([
-                    inputs[0].as_ptr().add(last_off),
-                    inputs[1].as_ptr().add(last_off),
-                    inputs[2].as_ptr().add(last_off),
-                    inputs[3].as_ptr().add(last_off),
-                ])
-            } else {
-                load_partial_block_4x(inputs, last_off, last_len)
-            };
-            compress_cv_4x(&cv, &m, counter_lo, counter_hi, last_len as u32, flags)
-        }
-    }
-
-    pub fn keyed_hash_parent_4x(key: &[u32; 8], children: &[[u8; 32]; 8], out: &mut [[u8; OUT_LEN]; 4]) {
-        const { assert!(OUT_LEN == 32 && BLOCK_LEN == 64) };
-        unsafe {
-            let key_v = key_splat(key);
-            let base = children.as_ptr().cast::<u8>();
-            let m = load_full_block_4x([base, base.add(64), base.add(128), base.add(192)]);
-            let zero = vdupq_n_u32(0);
-            let flags = KEYED_HASH | CHUNK_START | CHUNK_END | ROOT;
-            let cv = compress_cv_4x(&key_v, &m, zero, zero, BLOCK_LEN as u32, flags);
-            store_cv_4x(&cv, out);
-        }
-    }
-
-    #[cold]
-    #[inline(never)]
-    fn keyed_hash_4x_multi_chunk(key: &[u32; 8], inputs: [&[u8]; 4], out: &mut [[u8; OUT_LEN]; 4]) {
-        let len_bytes = inputs[0].len();
-        assert!(len_bytes > CHUNK_LEN);
-        assert!(inputs.iter().all(|slice| slice.len() == len_bytes));
-        unsafe {
-            let key_v = key_splat(key);
-            let chunks_total = len_bytes.div_ceil(CHUNK_LEN);
-            assert!(chunks_total >= 2);
-            let mut stack = [[vdupq_n_u32(0); 8]; CV_STACK_LEN_MAX];
-            let mut stack_len = 0usize;
-            for chunk_index in 0..chunks_total - 1 {
-                let off = chunk_index * CHUNK_LEN;
-                let mut cv =
-                    compress_chunk_4x(&key_v, inputs, off, CHUNK_LEN, chunk_index as u64, KEYED_HASH, 0);
-                let mut total = (chunk_index + 1) as u64;
-                while total & 1 == 0 {
-                    stack_len -= 1;
-                    cv = parent_cv_4x(&key_v, &stack[stack_len], &cv, KEYED_HASH);
-                    total >>= 1;
-                }
-                assert!(stack_len < CV_STACK_LEN_MAX);
-                stack[stack_len] = cv;
-                stack_len += 1;
-            }
-            let last_index = chunks_total - 1;
-            let last_off = last_index * CHUNK_LEN;
-            let last_len = len_bytes - last_off;
-            let mut cv =
-                compress_chunk_4x(&key_v, inputs, last_off, last_len, last_index as u64, KEYED_HASH, 0);
-            while stack_len > 1 {
-                stack_len -= 1;
-                cv = parent_cv_4x(&key_v, &stack[stack_len], &cv, KEYED_HASH);
-            }
-            assert!(stack_len == 1);
-            cv = parent_cv_4x(&key_v, &stack[0], &cv, KEYED_HASH | ROOT);
-            store_cv_4x(&cv, out);
-        }
-    }
-
-    pub fn keyed_hash_4x(key: &[u32; 8], inputs: [&[u8]; 4], out: &mut [[u8; OUT_LEN]; 4]) {
-        let len_bytes = inputs[0].len();
-        assert!(inputs.iter().all(|slice| slice.len() == len_bytes));
-        assert!(len_bytes <= usize::MAX - CHUNK_LEN);
-        if len_bytes > CHUNK_LEN {
-            keyed_hash_4x_multi_chunk(key, inputs, out);
-            return;
-        }
-        unsafe {
-            let key_v = key_splat(key);
-            let cv = compress_chunk_4x(&key_v, inputs, 0, len_bytes, 0, KEYED_HASH, ROOT);
-            store_cv_4x(&cv, out);
-        }
-    }
-
-    #[inline(always)]
-    unsafe fn counter_vecs(first: u64) -> (V, V) {
-        let lo = [first as u32, (first + 1) as u32, (first + 2) as u32, (first + 3) as u32];
-        let hi = [
-            (first >> 32) as u32,
-            ((first + 1) >> 32) as u32,
-            ((first + 2) >> 32) as u32,
-            ((first + 3) >> 32) as u32,
-        ];
-        unsafe { (vld1q_u32(lo.as_ptr()), vld1q_u32(hi.as_ptr())) }
-    }
-
-    #[inline(always)]
-    unsafe fn load_block_at(inputs: [&[u8]; 4], off: usize) -> [V; 16] {
-        unsafe {
-            load_full_block_4x([
-                inputs[0].as_ptr().add(off),
-                inputs[1].as_ptr().add(off),
-                inputs[2].as_ptr().add(off),
-                inputs[3].as_ptr().add(off),
-            ])
-        }
-    }
-
-    #[inline(always)]
-    unsafe fn unpack_cv_4x(cv: &[V; 8], out: &mut [[u32; 8]; 4]) {
-        unsafe {
-            let lo_words = transpose4(cv[0], cv[1], cv[2], cv[3]);
-            let hi_words = transpose4(cv[4], cv[5], cv[6], cv[7]);
-            for lane in 0..4 {
-                vst1q_u32(out[lane].as_mut_ptr(), lo_words[lane]);
-                vst1q_u32(out[lane].as_mut_ptr().add(4), hi_words[lane]);
-            }
-        }
-    }
-
-    pub fn compress_4_chunks(
-        key: &[u32; 8],
-        input: &[u8; 4 * CHUNK_LEN],
-        first_counter: u64,
+    unsafe fn compress_cv_4x(
+        cv: &mut [V; 8],
+        m: &[V; 16],
+        counter: u64,
+        len: u32,
         flags: u32,
-    ) -> [[u32; 8]; 4] {
-        assert!(flags & !KEYED_HASH == 0);
-        assert!(first_counter <= u64::MAX - 4);
-        unsafe {
-            let mut cv = key_splat(key);
-            let (counter_lo, counter_hi) = counter_vecs(first_counter);
-            let base = input.as_ptr();
-            for block in 0..(CHUNK_LEN / BLOCK_LEN) {
-                let off = block * BLOCK_LEN;
-                let ptrs = [
-                    base.add(off),
-                    base.add(CHUNK_LEN + off),
-                    base.add(2 * CHUNK_LEN + off),
-                    base.add(3 * CHUNK_LEN + off),
-                ];
-                let m = load_full_block_4x(ptrs);
-                let edge = if block == 0 {
-                    CHUNK_START
-                } else if block + 1 == CHUNK_LEN / BLOCK_LEN {
-                    CHUNK_END
-                } else {
-                    0
-                };
-                cv = compress_cv_4x(&cv, &m, counter_lo, counter_hi, BLOCK_LEN as u32, flags | edge);
-            }
-            let mut out = [[0u32; 8]; 4];
-            unpack_cv_4x(&cv, &mut out);
-            out
-        }
-    }
-
-    pub fn compress_8_chunks(
-        key: &[u32; 8],
-        input: &[u8; 8 * CHUNK_LEN],
-        first_counter: u64,
-        flags: u32,
-    ) -> [[u32; 8]; 8] {
-        assert!(flags & !KEYED_HASH == 0);
-        assert!(first_counter <= u64::MAX - 8);
-        unsafe {
-            let mut cv0 = key_splat(key);
-            let mut cv1 = cv0;
-            let (lo0, hi0) = counter_vecs(first_counter);
-            let (lo1, hi1) = counter_vecs(first_counter + 4);
-            let rot8 = vld1q_u8(ROT8_MASK.as_ptr());
-            let base = input.as_ptr();
-            for block in 0..(CHUNK_LEN / BLOCK_LEN) {
-                let off = block * BLOCK_LEN;
-                let m0 = load_full_block_4x([
-                    base.add(off),
-                    base.add(CHUNK_LEN + off),
-                    base.add(2 * CHUNK_LEN + off),
-                    base.add(3 * CHUNK_LEN + off),
-                ]);
-                let m1 = load_full_block_4x([
-                    base.add(4 * CHUNK_LEN + off),
-                    base.add(5 * CHUNK_LEN + off),
-                    base.add(6 * CHUNK_LEN + off),
-                    base.add(7 * CHUNK_LEN + off),
-                ]);
-                let edge = if block == 0 {
-                    CHUNK_START
-                } else if block + 1 == CHUNK_LEN / BLOCK_LEN {
-                    CHUNK_END
-                } else {
-                    0
-                };
-                let mut s0 = init_state_4x(&cv0, BLOCK_LEN as u32, flags | edge);
-                let mut s1 = init_state_4x(&cv1, BLOCK_LEN as u32, flags | edge);
-                s0[12] = lo0;
-                s0[13] = hi0;
-                s1[12] = lo1;
-                s1[13] = hi1;
-                round_8x(&mut s0, &mut s1, &m0, &m1, &MSG_SCHEDULE[0], rot8);
-                round_8x(&mut s0, &mut s1, &m0, &m1, &MSG_SCHEDULE[1], rot8);
-                round_8x(&mut s0, &mut s1, &m0, &m1, &MSG_SCHEDULE[2], rot8);
-                round_8x(&mut s0, &mut s1, &m0, &m1, &MSG_SCHEDULE[3], rot8);
-                round_8x(&mut s0, &mut s1, &m0, &m1, &MSG_SCHEDULE[4], rot8);
-                round_8x(&mut s0, &mut s1, &m0, &m1, &MSG_SCHEDULE[5], rot8);
-                round_8x(&mut s0, &mut s1, &m0, &m1, &MSG_SCHEDULE[6], rot8);
-                cv0 = finish_cv(&s0);
-                cv1 = finish_cv(&s1);
-            }
-            let mut out = [[0u32; 8]; 8];
-            let (out0, out1) = out.split_at_mut(4);
-            unpack_cv_4x(&cv0, out0.try_into().expect("four cvs"));
-            unpack_cv_4x(&cv1, out1.try_into().expect("four cvs"));
-            out
-        }
-    }
-
-    #[inline(always)]
-    fn pow_check_4(w0: V, w1: V, base_nonce: u64, bits: u32) -> Option<u64> {
-        let mut a0 = [0u32; 4];
-        let mut a1 = [0u32; 4];
-        unsafe {
-            vst1q_u32(a0.as_mut_ptr(), w0);
-            vst1q_u32(a1.as_mut_ptr(), w1);
-        }
-        for lane in 0..4 {
-            let head = ((a0[lane].swap_bytes() as u64) << 32) | (a1[lane].swap_bytes() as u64);
-            if head.leading_zeros() >= bits {
-                return Some(base_nonce + lane as u64);
-            }
-        }
-        None
-    }
-
-    #[inline(always)]
-    unsafe fn g_8x(
-        s0: &mut [V; 16],
-        s1: &mut [V; 16],
-        idx: [usize; 4],
-        m0: [V; 2],
-        m1: [V; 2],
         rot8: uint8x16_t,
     ) {
-        let [a, b, c, d] = idx;
+        assert!(len <= BLOCK_LEN as u32);
+        const { assert!(MSG_SCHEDULE.len() == 7) };
         unsafe {
-            s0[a] = vaddq_u32(vaddq_u32(s0[a], m0[0]), s0[b]);
-            s1[a] = vaddq_u32(vaddq_u32(s1[a], m1[0]), s1[b]);
-            s0[d] = rotr16(veorq_u32(s0[d], s0[a]));
-            s1[d] = rotr16(veorq_u32(s1[d], s1[a]));
-            s0[c] = vaddq_u32(s0[c], s0[d]);
-            s1[c] = vaddq_u32(s1[c], s1[d]);
-            s0[b] = rotr12(veorq_u32(s0[b], s0[c]));
-            s1[b] = rotr12(veorq_u32(s1[b], s1[c]));
-            s0[a] = vaddq_u32(vaddq_u32(s0[a], m0[1]), s0[b]);
-            s1[a] = vaddq_u32(vaddq_u32(s1[a], m1[1]), s1[b]);
-            s0[d] = rotr8(veorq_u32(s0[d], s0[a]), rot8);
-            s1[d] = rotr8(veorq_u32(s1[d], s1[a]), rot8);
-            s0[c] = vaddq_u32(s0[c], s0[d]);
-            s1[c] = vaddq_u32(s1[c], s1[d]);
-            s0[b] = rotr7(veorq_u32(s0[b], s0[c]));
-            s1[b] = rotr7(veorq_u32(s1[b], s1[c]));
+            let mut s =
+                init_state(cv, vdupq_n_u32(counter as u32), vdupq_n_u32((counter >> 32) as u32), len, flags);
+            for sc in &MSG_SCHEDULE {
+                g4(&mut s, 0, 4, 8, 12, m[sc[0]], m[sc[1]], rot8);
+                g4(&mut s, 1, 5, 9, 13, m[sc[2]], m[sc[3]], rot8);
+                g4(&mut s, 2, 6, 10, 14, m[sc[4]], m[sc[5]], rot8);
+                g4(&mut s, 3, 7, 11, 15, m[sc[6]], m[sc[7]], rot8);
+                g4(&mut s, 0, 5, 10, 15, m[sc[8]], m[sc[9]], rot8);
+                g4(&mut s, 1, 6, 11, 12, m[sc[10]], m[sc[11]], rot8);
+                g4(&mut s, 2, 7, 8, 13, m[sc[12]], m[sc[13]], rot8);
+                g4(&mut s, 3, 4, 9, 14, m[sc[14]], m[sc[15]], rot8);
+            }
+            for i in 0..8 {
+                cv[i] = veorq_u32(s[i], s[i + 8]);
+            }
         }
     }
 
     #[inline(always)]
-    unsafe fn round_8x(
-        s0: &mut [V; 16],
-        s1: &mut [V; 16],
-        m0: &[V; 16],
-        m1: &[V; 16],
-        sched: &[usize; 16],
-        rot8: uint8x16_t,
-    ) {
-        unsafe {
-            g_8x(s0, s1, [0, 4, 8, 12], [m0[sched[0]], m0[sched[1]]], [m1[sched[0]], m1[sched[1]]], rot8);
-            g_8x(s0, s1, [1, 5, 9, 13], [m0[sched[2]], m0[sched[3]]], [m1[sched[2]], m1[sched[3]]], rot8);
-            g_8x(s0, s1, [2, 6, 10, 14], [m0[sched[4]], m0[sched[5]]], [m1[sched[4]], m1[sched[5]]], rot8);
-            g_8x(s0, s1, [3, 7, 11, 15], [m0[sched[6]], m0[sched[7]]], [m1[sched[6]], m1[sched[7]]], rot8);
-            g_8x(s0, s1, [0, 5, 10, 15], [m0[sched[8]], m0[sched[9]]], [m1[sched[8]], m1[sched[9]]], rot8);
-            g_8x(
-                s0,
-                s1,
-                [1, 6, 11, 12],
-                [m0[sched[10]], m0[sched[11]]],
-                [m1[sched[10]], m1[sched[11]]],
-                rot8,
-            );
-            g_8x(s0, s1, [2, 7, 8, 13], [m0[sched[12]], m0[sched[13]]], [m1[sched[12]], m1[sched[13]]], rot8);
-            g_8x(s0, s1, [3, 4, 9, 14], [m0[sched[14]], m0[sched[15]]], [m1[sched[14]], m1[sched[15]]], rot8);
-        }
-    }
-
-    #[inline(always)]
-    unsafe fn init_state_4x(cv: &[V; 8], block_len: u32, flags: u32) -> [V; 16] {
-        unsafe {
-            let zero = vdupq_n_u32(0);
-            [
-                cv[0],
-                cv[1],
-                cv[2],
-                cv[3],
-                cv[4],
-                cv[5],
-                cv[6],
-                cv[7],
-                vdupq_n_u32(IV[0]),
-                vdupq_n_u32(IV[1]),
-                vdupq_n_u32(IV[2]),
-                vdupq_n_u32(IV[3]),
-                zero,
-                zero,
-                vdupq_n_u32(block_len),
-                vdupq_n_u32(flags),
-            ]
-        }
-    }
-
-    #[inline(always)]
-    unsafe fn finish_cv(s: &[V; 16]) -> [V; 8] {
-        unsafe {
-            [
-                veorq_u32(s[0], s[8]),
-                veorq_u32(s[1], s[9]),
-                veorq_u32(s[2], s[10]),
-                veorq_u32(s[3], s[11]),
-                veorq_u32(s[4], s[12]),
-                veorq_u32(s[5], s[13]),
-                veorq_u32(s[6], s[14]),
-                veorq_u32(s[7], s[15]),
-            ]
-        }
-    }
-
-    #[inline(always)]
+    #[allow(clippy::too_many_arguments)]
     unsafe fn compress_cv_8x(
-        cv0: &[V; 8],
-        cv1: &[V; 8],
+        cv0: &mut [V; 8],
+        cv1: &mut [V; 8],
         m0: &[V; 16],
         m1: &[V; 16],
-        block_len: u32,
+        counter: u64,
+        len: u32,
         flags: u32,
-    ) -> ([V; 8], [V; 8]) {
-        assert!(block_len as usize <= BLOCK_LEN);
-        assert!(flags & !FLAGS_ALL == 0);
+        rot8: uint8x16_t,
+    ) {
+        assert!(len <= BLOCK_LEN as u32);
+        const { assert!(MSG_SCHEDULE.len() == 7) };
         unsafe {
-            let rot8 = vld1q_u8(ROT8_MASK.as_ptr());
-            let mut s0 = init_state_4x(cv0, block_len, flags);
-            let mut s1 = init_state_4x(cv1, block_len, flags);
-            round_8x(&mut s0, &mut s1, m0, m1, &MSG_SCHEDULE[0], rot8);
-            round_8x(&mut s0, &mut s1, m0, m1, &MSG_SCHEDULE[1], rot8);
-            round_8x(&mut s0, &mut s1, m0, m1, &MSG_SCHEDULE[2], rot8);
-            round_8x(&mut s0, &mut s1, m0, m1, &MSG_SCHEDULE[3], rot8);
-            round_8x(&mut s0, &mut s1, m0, m1, &MSG_SCHEDULE[4], rot8);
-            round_8x(&mut s0, &mut s1, m0, m1, &MSG_SCHEDULE[5], rot8);
-            round_8x(&mut s0, &mut s1, m0, m1, &MSG_SCHEDULE[6], rot8);
-            (finish_cv(&s0), finish_cv(&s1))
-        }
-    }
-
-    pub fn keyed_hash_parent_8x(key: &[u32; 8], children: &[[u8; 32]; 16], out: &mut [[u8; OUT_LEN]; 8]) {
-        const { assert!(OUT_LEN == 32 && BLOCK_LEN == 64) };
-        unsafe {
-            let key_v = key_splat(key);
-            let base = children.as_ptr().cast::<u8>();
-            let m0 = load_full_block_4x([base, base.add(64), base.add(128), base.add(192)]);
-            let m1 = load_full_block_4x([base.add(256), base.add(320), base.add(384), base.add(448)]);
-            let flags = KEYED_HASH | CHUNK_START | CHUNK_END | ROOT;
-            let (cv0, cv1) = compress_cv_8x(&key_v, &key_v, &m0, &m1, BLOCK_LEN as u32, flags);
-            let (out0, out1) = out.split_at_mut(4);
-            store_cv_4x(&cv0, out0.try_into().expect("four digests"));
-            store_cv_4x(&cv1, out1.try_into().expect("four digests"));
+            let t_lo = vdupq_n_u32(counter as u32);
+            let t_hi = vdupq_n_u32((counter >> 32) as u32);
+            let mut s0 = init_state(cv0, t_lo, t_hi, len, flags);
+            let mut s1 = init_state(cv1, t_lo, t_hi, len, flags);
+            for sc in &MSG_SCHEDULE {
+                g8(&mut s0, &mut s1, 0, 4, 8, 12, m0[sc[0]], m0[sc[1]], m1[sc[0]], m1[sc[1]], rot8);
+                g8(&mut s0, &mut s1, 1, 5, 9, 13, m0[sc[2]], m0[sc[3]], m1[sc[2]], m1[sc[3]], rot8);
+                g8(&mut s0, &mut s1, 2, 6, 10, 14, m0[sc[4]], m0[sc[5]], m1[sc[4]], m1[sc[5]], rot8);
+                g8(&mut s0, &mut s1, 3, 7, 11, 15, m0[sc[6]], m0[sc[7]], m1[sc[6]], m1[sc[7]], rot8);
+                g8(&mut s0, &mut s1, 0, 5, 10, 15, m0[sc[8]], m0[sc[9]], m1[sc[8]], m1[sc[9]], rot8);
+                g8(&mut s0, &mut s1, 1, 6, 11, 12, m0[sc[10]], m0[sc[11]], m1[sc[10]], m1[sc[11]], rot8);
+                g8(&mut s0, &mut s1, 2, 7, 8, 13, m0[sc[12]], m0[sc[13]], m1[sc[12]], m1[sc[13]], rot8);
+                g8(&mut s0, &mut s1, 3, 4, 9, 14, m0[sc[14]], m0[sc[15]], m1[sc[14]], m1[sc[15]], rot8);
+            }
+            for i in 0..8 {
+                cv0[i] = veorq_u32(s0[i], s0[i + 8]);
+                cv1[i] = veorq_u32(s1[i], s1[i + 8]);
+            }
         }
     }
 
     #[inline(always)]
-    unsafe fn load_8byte_block_4x(inputs: [&[u8]; 4], offset: usize) -> [V; 16] {
-        assert!(inputs.iter().all(|slice| offset + 8 <= slice.len()));
-        let mut w0 = [0u32; 4];
-        let mut w1 = [0u32; 4];
-        for lane in 0..4 {
-            let s = &inputs[lane][offset..offset + 8];
-            w0[lane] = u32::from_le_bytes([s[0], s[1], s[2], s[3]]);
-            w1[lane] = u32::from_le_bytes([s[4], s[5], s[6], s[7]]);
+    unsafe fn compress_cv_16x(
+        cv: &mut [[V; 8]; 4],
+        m: &[[V; 16]; 4],
+        counter: u64,
+        len: u32,
+        flags: u32,
+        rot8: uint8x16_t,
+    ) {
+        assert!(len <= BLOCK_LEN as u32);
+        const { assert!(MSG_SCHEDULE.len() == 7) };
+        unsafe {
+            let t_lo = vdupq_n_u32(counter as u32);
+            let t_hi = vdupq_n_u32((counter >> 32) as u32);
+            let mut s = [
+                init_state(&cv[0], t_lo, t_hi, len, flags),
+                init_state(&cv[1], t_lo, t_hi, len, flags),
+                init_state(&cv[2], t_lo, t_hi, len, flags),
+                init_state(&cv[3], t_lo, t_hi, len, flags),
+            ];
+            for sc in &MSG_SCHEDULE {
+                g16(&mut s, 0, 4, 8, 12, m, sc[0], sc[1], rot8);
+                g16(&mut s, 1, 5, 9, 13, m, sc[2], sc[3], rot8);
+                g16(&mut s, 2, 6, 10, 14, m, sc[4], sc[5], rot8);
+                g16(&mut s, 3, 7, 11, 15, m, sc[6], sc[7], rot8);
+                g16(&mut s, 0, 5, 10, 15, m, sc[8], sc[9], rot8);
+                g16(&mut s, 1, 6, 11, 12, m, sc[10], sc[11], rot8);
+                g16(&mut s, 2, 7, 8, 13, m, sc[12], sc[13], rot8);
+                g16(&mut s, 3, 4, 9, 14, m, sc[14], sc[15], rot8);
+            }
+            for i in 0..8 {
+                cv[0][i] = veorq_u32(s[0][i], s[0][i + 8]);
+                cv[1][i] = veorq_u32(s[1][i], s[1][i + 8]);
+                cv[2][i] = veorq_u32(s[2][i], s[2][i + 8]);
+                cv[3][i] = veorq_u32(s[3][i], s[3][i + 8]);
+            }
         }
+    }
+
+    #[inline(always)]
+    unsafe fn load_u32x4(ptr: *const u8) -> V {
+        unsafe { vreinterpretq_u32_u8(vld1q_u8(ptr)) }
+    }
+
+    #[inline(always)]
+    unsafe fn store_u32x4(ptr: *mut u8, v: V) {
+        unsafe { vst1q_u8(ptr, vreinterpretq_u8_u32(v)) }
+    }
+
+    #[inline(always)]
+    unsafe fn load_4_blocks(p0: *const u8, p1: *const u8, p2: *const u8, p3: *const u8) -> [V; 16] {
         unsafe {
             let mut m = [vdupq_n_u32(0); 16];
-            m[0] = vld1q_u32(w0.as_ptr());
-            m[1] = vld1q_u32(w1.as_ptr());
+            for group in 0..4 {
+                let off = group * 16;
+                let [w0, w1, w2, w3] = transpose_4x4(
+                    load_u32x4(p0.add(off)),
+                    load_u32x4(p1.add(off)),
+                    load_u32x4(p2.add(off)),
+                    load_u32x4(p3.add(off)),
+                );
+                m[group * 4] = w0;
+                m[group * 4 + 1] = w1;
+                m[group * 4 + 2] = w2;
+                m[group * 4 + 3] = w3;
+            }
             m
         }
     }
 
     #[inline(always)]
-    unsafe fn load_row_8x_32<F: crate::field::Field>(row: &[F], base: usize) -> ([V; 8], [V; 8]) {
-        assert!(F::BYTES == 32);
-        assert!(base + 8 <= row.len());
-        let mut raw0 = [0u8; 128];
-        let mut raw1 = [0u8; 128];
-        for lane in 0..4 {
-            row[base + lane].write_bytes(&mut raw0[lane * 32..(lane + 1) * 32]);
-            row[base + 4 + lane].write_bytes(&mut raw1[lane * 32..(lane + 1) * 32]);
+    unsafe fn load_4_partial_blocks(b0: &[u8], b1: &[u8], b2: &[u8], b3: &[u8]) -> [V; 16] {
+        let len = b0.len();
+        assert!(len <= BLOCK_LEN && b1.len() == len && b2.len() == len && b3.len() == len);
+        let mut p0 = [0u8; BLOCK_LEN];
+        let mut p1 = [0u8; BLOCK_LEN];
+        let mut p2 = [0u8; BLOCK_LEN];
+        let mut p3 = [0u8; BLOCK_LEN];
+        p0[..len].copy_from_slice(b0);
+        p1[..len].copy_from_slice(b1);
+        p2[..len].copy_from_slice(b2);
+        p3[..len].copy_from_slice(b3);
+        unsafe { load_4_blocks(p0.as_ptr(), p1.as_ptr(), p2.as_ptr(), p3.as_ptr()) }
+    }
+
+    #[inline(always)]
+    unsafe fn store_4_digests(cv: &[V; 8], out: &mut [[u8; OUT_LEN]; 4]) {
+        unsafe {
+            let lo = transpose_4x4(cv[0], cv[1], cv[2], cv[3]);
+            let hi = transpose_4x4(cv[4], cv[5], cv[6], cv[7]);
+            for lane in 0..4 {
+                store_u32x4(out[lane].as_mut_ptr(), lo[lane]);
+                store_u32x4(out[lane].as_mut_ptr().add(16), hi[lane]);
+            }
+        }
+    }
+
+    #[inline(always)]
+    unsafe fn store_16_words_4x(s: &[V; 16], base_cv: &[V; 8], out: &mut [u8]) {
+        assert!(out.len() == 4 * BLOCK_LEN);
+        unsafe {
+            let mut w = [vdupq_n_u32(0); 16];
+            for i in 0..8 {
+                w[i] = veorq_u32(s[i], s[i + 8]);
+                w[i + 8] = veorq_u32(s[i + 8], base_cv[i]);
+            }
+            for group in 0..4 {
+                let q = transpose_4x4(w[group * 4], w[group * 4 + 1], w[group * 4 + 2], w[group * 4 + 3]);
+                for (lane, &vec) in q.iter().enumerate() {
+                    store_u32x4(out.as_mut_ptr().add(lane * BLOCK_LEN + group * 16), vec);
+                }
+            }
+        }
+    }
+
+    pub fn root_blocks_16x(
+        cv_words: &[u32; 8],
+        block_words: &[u32; 16],
+        start_counter: u64,
+        block_len: u32,
+        flags: u32,
+        out: &mut [u8],
+    ) {
+        assert!(out.len() == 16 * BLOCK_LEN);
+        assert!(block_len <= BLOCK_LEN as u32);
+        unsafe {
+            let rot8 = vld1q_u8(ROT8_MASK.as_ptr());
+            let base_cv = broadcast_key(cv_words);
+            let mut m0 = [vdupq_n_u32(0); 16];
+            for (dst, &word) in m0.iter_mut().zip(block_words) {
+                *dst = vdupq_n_u32(word);
+            }
+            let m = [m0, m0, m0, m0];
+            let mut s = [[vdupq_n_u32(0); 16]; 4];
+            for (grp, st) in s.iter_mut().enumerate() {
+                let base = start_counter.wrapping_add((grp * 4) as u64);
+                let lo = [
+                    base as u32,
+                    base.wrapping_add(1) as u32,
+                    base.wrapping_add(2) as u32,
+                    base.wrapping_add(3) as u32,
+                ];
+                let hi = [
+                    (base >> 32) as u32,
+                    (base.wrapping_add(1) >> 32) as u32,
+                    (base.wrapping_add(2) >> 32) as u32,
+                    (base.wrapping_add(3) >> 32) as u32,
+                ];
+                *st = init_state(&base_cv, vld1q_u32(lo.as_ptr()), vld1q_u32(hi.as_ptr()), block_len, flags);
+            }
+            for sc in &MSG_SCHEDULE {
+                g16(&mut s, 0, 4, 8, 12, &m, sc[0], sc[1], rot8);
+                g16(&mut s, 1, 5, 9, 13, &m, sc[2], sc[3], rot8);
+                g16(&mut s, 2, 6, 10, 14, &m, sc[4], sc[5], rot8);
+                g16(&mut s, 3, 7, 11, 15, &m, sc[6], sc[7], rot8);
+                g16(&mut s, 0, 5, 10, 15, &m, sc[8], sc[9], rot8);
+                g16(&mut s, 1, 6, 11, 12, &m, sc[10], sc[11], rot8);
+                g16(&mut s, 2, 7, 8, 13, &m, sc[12], sc[13], rot8);
+                g16(&mut s, 3, 4, 9, 14, &m, sc[14], sc[15], rot8);
+            }
+            for (grp, st) in s.iter().enumerate() {
+                store_16_words_4x(st, &base_cv, &mut out[grp * 4 * BLOCK_LEN..(grp + 1) * 4 * BLOCK_LEN]);
+            }
+        }
+    }
+
+    #[inline(always)]
+    unsafe fn load_16_chunk_blocks(ptr: *const u8, off: usize) -> [[V; 16]; 4] {
+        unsafe {
+            [
+                load_4_blocks(
+                    ptr.add(off),
+                    ptr.add(CHUNK_LEN + off),
+                    ptr.add(2 * CHUNK_LEN + off),
+                    ptr.add(3 * CHUNK_LEN + off),
+                ),
+                load_4_blocks(
+                    ptr.add(4 * CHUNK_LEN + off),
+                    ptr.add(5 * CHUNK_LEN + off),
+                    ptr.add(6 * CHUNK_LEN + off),
+                    ptr.add(7 * CHUNK_LEN + off),
+                ),
+                load_4_blocks(
+                    ptr.add(8 * CHUNK_LEN + off),
+                    ptr.add(9 * CHUNK_LEN + off),
+                    ptr.add(10 * CHUNK_LEN + off),
+                    ptr.add(11 * CHUNK_LEN + off),
+                ),
+                load_4_blocks(
+                    ptr.add(12 * CHUNK_LEN + off),
+                    ptr.add(13 * CHUNK_LEN + off),
+                    ptr.add(14 * CHUNK_LEN + off),
+                    ptr.add(15 * CHUNK_LEN + off),
+                ),
+            ]
+        }
+    }
+
+    pub fn compress_16_chunks(
+        key: &[u32; 8],
+        chunks: &[u8],
+        start_counter: u64,
+        flags: u32,
+        out: &mut [[u32; 8]; 16],
+    ) {
+        assert!(chunks.len() == 16 * CHUNK_LEN);
+        const { assert!(CHUNK_BLOCKS == 16) };
+        unsafe {
+            let rot8 = vld1q_u8(ROT8_MASK.as_ptr());
+            let mut cv = [broadcast_key(key); 4];
+            let mut t_lo = [vdupq_n_u32(0); 4];
+            let mut t_hi = [vdupq_n_u32(0); 4];
+            for grp in 0..4 {
+                let b = start_counter + (grp * 4) as u64;
+                let lo = [b as u32, (b + 1) as u32, (b + 2) as u32, (b + 3) as u32];
+                let hi = [
+                    (b >> 32) as u32,
+                    ((b + 1) >> 32) as u32,
+                    ((b + 2) >> 32) as u32,
+                    ((b + 3) >> 32) as u32,
+                ];
+                t_lo[grp] = vld1q_u32(lo.as_ptr());
+                t_hi[grp] = vld1q_u32(hi.as_ptr());
+            }
+            let ptr = chunks.as_ptr();
+            for block in 0..CHUNK_BLOCKS {
+                let m = load_16_chunk_blocks(ptr, block * BLOCK_LEN);
+                let mut bflags = flags;
+                if block == 0 {
+                    bflags |= CHUNK_START;
+                }
+                if block == CHUNK_BLOCKS - 1 {
+                    bflags |= CHUNK_END;
+                }
+                let mut s = [
+                    init_state(&cv[0], t_lo[0], t_hi[0], BLOCK_LEN as u32, bflags),
+                    init_state(&cv[1], t_lo[1], t_hi[1], BLOCK_LEN as u32, bflags),
+                    init_state(&cv[2], t_lo[2], t_hi[2], BLOCK_LEN as u32, bflags),
+                    init_state(&cv[3], t_lo[3], t_hi[3], BLOCK_LEN as u32, bflags),
+                ];
+                for sc in &MSG_SCHEDULE {
+                    g16(&mut s, 0, 4, 8, 12, &m, sc[0], sc[1], rot8);
+                    g16(&mut s, 1, 5, 9, 13, &m, sc[2], sc[3], rot8);
+                    g16(&mut s, 2, 6, 10, 14, &m, sc[4], sc[5], rot8);
+                    g16(&mut s, 3, 7, 11, 15, &m, sc[6], sc[7], rot8);
+                    g16(&mut s, 0, 5, 10, 15, &m, sc[8], sc[9], rot8);
+                    g16(&mut s, 1, 6, 11, 12, &m, sc[10], sc[11], rot8);
+                    g16(&mut s, 2, 7, 8, 13, &m, sc[12], sc[13], rot8);
+                    g16(&mut s, 3, 4, 9, 14, &m, sc[14], sc[15], rot8);
+                }
+                for (c, st) in cv.iter_mut().zip(&s) {
+                    for i in 0..8 {
+                        c[i] = veorq_u32(st[i], st[i + 8]);
+                    }
+                }
+            }
+            for (grp, c) in cv.iter().enumerate() {
+                let lo = transpose_4x4(c[0], c[1], c[2], c[3]);
+                let hi = transpose_4x4(c[4], c[5], c[6], c[7]);
+                for lane in 0..4 {
+                    vst1q_u32(out[grp * 4 + lane].as_mut_ptr(), lo[lane]);
+                    vst1q_u32(out[grp * 4 + lane].as_mut_ptr().add(4), hi[lane]);
+                }
+            }
+        }
+    }
+
+    pub fn keyed_hash_parent_16x(key: &[u32; 8], children: &[[u8; 32]; 32], out: &mut [[u8; OUT_LEN]; 16]) {
+        const { assert!(BLOCK_LEN == 64 && OUT_LEN == 32) };
+        unsafe {
+            let rot8 = vld1q_u8(ROT8_MASK.as_ptr());
+            let key_v = broadcast_key(key);
+            let mut cv = [key_v; 4];
+            let m = [
+                load_4_blocks(
+                    children[0].as_ptr(),
+                    children[2].as_ptr(),
+                    children[4].as_ptr(),
+                    children[6].as_ptr(),
+                ),
+                load_4_blocks(
+                    children[8].as_ptr(),
+                    children[10].as_ptr(),
+                    children[12].as_ptr(),
+                    children[14].as_ptr(),
+                ),
+                load_4_blocks(
+                    children[16].as_ptr(),
+                    children[18].as_ptr(),
+                    children[20].as_ptr(),
+                    children[22].as_ptr(),
+                ),
+                load_4_blocks(
+                    children[24].as_ptr(),
+                    children[26].as_ptr(),
+                    children[28].as_ptr(),
+                    children[30].as_ptr(),
+                ),
+            ];
+            compress_cv_16x(
+                &mut cv,
+                &m,
+                0,
+                BLOCK_LEN as u32,
+                KEYED_HASH | CHUNK_START | CHUNK_END | ROOT,
+                rot8,
+            );
+            let chunks = out.as_chunks_mut::<4>().0;
+            for grp in 0..4 {
+                store_4_digests(&cv[grp], &mut chunks[grp]);
+            }
+        }
+    }
+
+    pub fn keyed_hash_parent_8x(key: &[u32; 8], children: &[[u8; 32]; 16], out: &mut [[u8; OUT_LEN]; 8]) {
+        const { assert!(BLOCK_LEN == 64 && OUT_LEN == 32) };
+        unsafe {
+            let rot8 = vld1q_u8(ROT8_MASK.as_ptr());
+            let key_v = broadcast_key(key);
+            let mut cv0 = key_v;
+            let mut cv1 = key_v;
+            let m0 = load_4_blocks(
+                children[0].as_ptr(),
+                children[2].as_ptr(),
+                children[4].as_ptr(),
+                children[6].as_ptr(),
+            );
+            let m1 = load_4_blocks(
+                children[8].as_ptr(),
+                children[10].as_ptr(),
+                children[12].as_ptr(),
+                children[14].as_ptr(),
+            );
+            compress_cv_8x(
+                &mut cv0,
+                &mut cv1,
+                &m0,
+                &m1,
+                0,
+                BLOCK_LEN as u32,
+                KEYED_HASH | CHUNK_START | CHUNK_END | ROOT,
+                rot8,
+            );
+            let chunks = out.as_chunks_mut::<4>().0;
+            store_4_digests(&cv0, &mut chunks[0]);
+            store_4_digests(&cv1, &mut chunks[1]);
+        }
+    }
+
+    pub fn keyed_hash_parent_4x(key: &[u32; 8], children: &[[u8; 32]; 8], out: &mut [[u8; OUT_LEN]; 4]) {
+        const { assert!(BLOCK_LEN == 64 && OUT_LEN == 32) };
+        unsafe {
+            let rot8 = vld1q_u8(ROT8_MASK.as_ptr());
+            let mut cv = broadcast_key(key);
+            let m = load_4_blocks(
+                children[0].as_ptr(),
+                children[2].as_ptr(),
+                children[4].as_ptr(),
+                children[6].as_ptr(),
+            );
+            compress_cv_4x(
+                &mut cv,
+                &m,
+                0,
+                BLOCK_LEN as u32,
+                KEYED_HASH | CHUNK_START | CHUNK_END | ROOT,
+                rot8,
+            );
+            store_4_digests(&cv, out);
+        }
+    }
+
+    #[inline(always)]
+    unsafe fn parent_cv_16x(
+        left: &[[V; 8]; 4],
+        right: &[[V; 8]; 4],
+        key_v: &[V; 8],
+        flags: u32,
+        rot8: uint8x16_t,
+    ) -> [[V; 8]; 4] {
+        unsafe {
+            let mut m = [[vdupq_n_u32(0); 16]; 4];
+            for grp in 0..4 {
+                m[grp][..8].copy_from_slice(&left[grp]);
+                m[grp][8..].copy_from_slice(&right[grp]);
+            }
+            let mut cv = [*key_v; 4];
+            compress_cv_16x(&mut cv, &m, 0, BLOCK_LEN as u32, flags | PARENT, rot8);
+            cv
+        }
+    }
+
+    #[inline(always)]
+    unsafe fn push_chunk_cv_16x(
+        stack: &mut [[[V; 8]; 4]; CV_STACK_LEN_MAX],
+        stack_len: &mut usize,
+        mut cv: [[V; 8]; 4],
+        completed_chunks: u64,
+        key_v: &[V; 8],
+        rot8: uint8x16_t,
+    ) {
+        let mut merges = completed_chunks.trailing_zeros();
+        while merges > 0 {
+            assert!(*stack_len > 0);
+            *stack_len -= 1;
+            cv = unsafe { parent_cv_16x(&stack[*stack_len], &cv, key_v, KEYED_HASH, rot8) };
+            merges -= 1;
+        }
+        assert!(*stack_len < CV_STACK_LEN_MAX);
+        stack[*stack_len] = cv;
+        *stack_len += 1;
+    }
+
+    #[inline(always)]
+    unsafe fn finish_stack_16x(
+        stack: &mut [[[V; 8]; 4]; CV_STACK_LEN_MAX],
+        mut stack_len: usize,
+        key_v: &[V; 8],
+        rot8: uint8x16_t,
+    ) -> [[V; 8]; 4] {
+        assert!((1..=CV_STACK_LEN_MAX).contains(&stack_len));
+        let mut right = stack[stack_len - 1];
+        stack_len -= 1;
+        while stack_len > 1 {
+            stack_len -= 1;
+            right = unsafe { parent_cv_16x(&stack[stack_len], &right, key_v, KEYED_HASH, rot8) };
+        }
+        assert!(stack_len == 1);
+        unsafe { parent_cv_16x(&stack[0], &right, key_v, KEYED_HASH | ROOT, rot8) }
+    }
+
+    #[inline(always)]
+    unsafe fn load_16_blocks_at(inputs: &[&[u8]; 16], off: usize) -> [[V; 16]; 4] {
+        unsafe {
+            [
+                load_4_blocks(
+                    inputs[0].as_ptr().add(off),
+                    inputs[1].as_ptr().add(off),
+                    inputs[2].as_ptr().add(off),
+                    inputs[3].as_ptr().add(off),
+                ),
+                load_4_blocks(
+                    inputs[4].as_ptr().add(off),
+                    inputs[5].as_ptr().add(off),
+                    inputs[6].as_ptr().add(off),
+                    inputs[7].as_ptr().add(off),
+                ),
+                load_4_blocks(
+                    inputs[8].as_ptr().add(off),
+                    inputs[9].as_ptr().add(off),
+                    inputs[10].as_ptr().add(off),
+                    inputs[11].as_ptr().add(off),
+                ),
+                load_4_blocks(
+                    inputs[12].as_ptr().add(off),
+                    inputs[13].as_ptr().add(off),
+                    inputs[14].as_ptr().add(off),
+                    inputs[15].as_ptr().add(off),
+                ),
+            ]
+        }
+    }
+
+    #[inline(always)]
+    unsafe fn load_16_partial_blocks(inputs: &[&[u8]; 16], start: usize, end: usize) -> [[V; 16]; 4] {
+        unsafe {
+            [
+                load_4_partial_blocks(
+                    &inputs[0][start..end],
+                    &inputs[1][start..end],
+                    &inputs[2][start..end],
+                    &inputs[3][start..end],
+                ),
+                load_4_partial_blocks(
+                    &inputs[4][start..end],
+                    &inputs[5][start..end],
+                    &inputs[6][start..end],
+                    &inputs[7][start..end],
+                ),
+                load_4_partial_blocks(
+                    &inputs[8][start..end],
+                    &inputs[9][start..end],
+                    &inputs[10][start..end],
+                    &inputs[11][start..end],
+                ),
+                load_4_partial_blocks(
+                    &inputs[12][start..end],
+                    &inputs[13][start..end],
+                    &inputs[14][start..end],
+                    &inputs[15][start..end],
+                ),
+            ]
+        }
+    }
+
+    #[inline(always)]
+    unsafe fn compress_chunk_16x(
+        key_v: &[V; 8],
+        inputs: &[&[u8]; 16],
+        cstart: usize,
+        cend: usize,
+        chunk_idx: u64,
+        extra_end_flags: u32,
+        rot8: uint8x16_t,
+    ) -> [[V; 8]; 4] {
+        let clen = cend - cstart;
+        assert!(clen <= CHUNK_LEN);
+        unsafe {
+            let mut cv = [*key_v; 4];
+            let full_len = clen.saturating_sub(1) / BLOCK_LEN * BLOCK_LEN;
+            let mut off = 0;
+            while off < full_len {
+                let m = load_16_blocks_at(inputs, cstart + off);
+                let flags = KEYED_HASH | if off == 0 { CHUNK_START } else { 0 };
+                compress_cv_16x(&mut cv, &m, chunk_idx, BLOCK_LEN as u32, flags, rot8);
+                off += BLOCK_LEN;
+            }
+            let m = load_16_partial_blocks(inputs, cstart + off, cend);
+            let end_flags = KEYED_HASH | if off == 0 { CHUNK_START } else { 0 } | CHUNK_END | extra_end_flags;
+            compress_cv_16x(&mut cv, &m, chunk_idx, (clen - off) as u32, end_flags, rot8);
+            cv
+        }
+    }
+
+    #[cold]
+    #[inline(never)]
+    fn keyed_hash_16x_multi(key: &[u32; 8], inputs: &[&[u8]; 16], out: &mut [[u8; OUT_LEN]; 16]) {
+        let len = inputs[0].len();
+        assert!(len > CHUNK_LEN && inputs.iter().all(|s| s.len() == len));
+        unsafe {
+            let rot8 = vld1q_u8(ROT8_MASK.as_ptr());
+            let key_v = broadcast_key(key);
+            let total_chunks = len.div_ceil(CHUNK_LEN);
+            let mut stack = [[[vdupq_n_u32(0); 8]; 4]; CV_STACK_LEN_MAX];
+            let mut stack_len = 0usize;
+            for chunk_idx in 0..total_chunks {
+                let cstart = chunk_idx * CHUNK_LEN;
+                let cend = (cstart + CHUNK_LEN).min(len);
+                let cv = compress_chunk_16x(&key_v, inputs, cstart, cend, chunk_idx as u64, 0, rot8);
+                if chunk_idx + 1 < total_chunks {
+                    push_chunk_cv_16x(&mut stack, &mut stack_len, cv, (chunk_idx + 1) as u64, &key_v, rot8);
+                } else {
+                    stack[stack_len] = cv;
+                    stack_len += 1;
+                }
+            }
+            let root = finish_stack_16x(&mut stack, stack_len, &key_v, rot8);
+            let chunks = out.as_chunks_mut::<4>().0;
+            for (c, dst) in root.iter().zip(chunks.iter_mut()) {
+                store_4_digests(c, dst);
+            }
+        }
+    }
+
+    pub fn keyed_hash_16x(key: &[u32; 8], inputs: &[&[u8]; 16], out: &mut [[u8; OUT_LEN]; 16]) {
+        let len = inputs[0].len();
+        assert!(inputs.iter().all(|s| s.len() == len));
+        if len > CHUNK_LEN {
+            keyed_hash_16x_multi(key, inputs, out);
+            return;
         }
         unsafe {
-            let p0 = raw0.as_ptr();
-            let lo0 = transpose4(
-                vreinterpretq_u32_u8(vld1q_u8(p0)),
-                vreinterpretq_u32_u8(vld1q_u8(p0.add(32))),
-                vreinterpretq_u32_u8(vld1q_u8(p0.add(64))),
-                vreinterpretq_u32_u8(vld1q_u8(p0.add(96))),
+            let rot8 = vld1q_u8(ROT8_MASK.as_ptr());
+            let key_v = broadcast_key(key);
+            let root = compress_chunk_16x(&key_v, inputs, 0, len, 0, ROOT, rot8);
+            let chunks = out.as_chunks_mut::<4>().0;
+            for (c, dst) in root.iter().zip(chunks.iter_mut()) {
+                store_4_digests(c, dst);
+            }
+        }
+    }
+
+    pub fn keyed_hash_8x(key: &[u32; 8], inputs: [&[u8]; 8], out: &mut [[u8; OUT_LEN]; 8]) {
+        let len = inputs[0].len();
+        assert!(inputs.iter().all(|s| s.len() == len));
+        if len > CHUNK_LEN {
+            for (dst, input) in out.iter_mut().zip(inputs) {
+                *dst = super::keyed_hash_words(key, input);
+            }
+            return;
+        }
+        unsafe {
+            let rot8 = vld1q_u8(ROT8_MASK.as_ptr());
+            let key_v = broadcast_key(key);
+            let mut cv0 = key_v;
+            let mut cv1 = key_v;
+            let full_len = len.saturating_sub(1) / BLOCK_LEN * BLOCK_LEN;
+            let mut off = 0;
+            while off < full_len {
+                let m0 = load_4_blocks(
+                    inputs[0].as_ptr().add(off),
+                    inputs[1].as_ptr().add(off),
+                    inputs[2].as_ptr().add(off),
+                    inputs[3].as_ptr().add(off),
+                );
+                let m1 = load_4_blocks(
+                    inputs[4].as_ptr().add(off),
+                    inputs[5].as_ptr().add(off),
+                    inputs[6].as_ptr().add(off),
+                    inputs[7].as_ptr().add(off),
+                );
+                let flags = KEYED_HASH | if off == 0 { CHUNK_START } else { 0 };
+                compress_cv_8x(&mut cv0, &mut cv1, &m0, &m1, 0, BLOCK_LEN as u32, flags, rot8);
+                off += BLOCK_LEN;
+            }
+            let m0 = load_4_partial_blocks(
+                &inputs[0][off..],
+                &inputs[1][off..],
+                &inputs[2][off..],
+                &inputs[3][off..],
             );
-            let hi0 = transpose4(
-                vreinterpretq_u32_u8(vld1q_u8(p0.add(16))),
-                vreinterpretq_u32_u8(vld1q_u8(p0.add(48))),
-                vreinterpretq_u32_u8(vld1q_u8(p0.add(80))),
-                vreinterpretq_u32_u8(vld1q_u8(p0.add(112))),
+            let m1 = load_4_partial_blocks(
+                &inputs[4][off..],
+                &inputs[5][off..],
+                &inputs[6][off..],
+                &inputs[7][off..],
             );
-            let p1 = raw1.as_ptr();
-            let lo1 = transpose4(
-                vreinterpretq_u32_u8(vld1q_u8(p1)),
-                vreinterpretq_u32_u8(vld1q_u8(p1.add(32))),
-                vreinterpretq_u32_u8(vld1q_u8(p1.add(64))),
-                vreinterpretq_u32_u8(vld1q_u8(p1.add(96))),
+            let end_flags = KEYED_HASH | if off == 0 { CHUNK_START } else { 0 } | CHUNK_END | ROOT;
+            compress_cv_8x(&mut cv0, &mut cv1, &m0, &m1, 0, (len - off) as u32, end_flags, rot8);
+            let chunks = out.as_chunks_mut::<4>().0;
+            store_4_digests(&cv0, &mut chunks[0]);
+            store_4_digests(&cv1, &mut chunks[1]);
+        }
+    }
+
+    pub fn keyed_hash_4x(key: &[u32; 8], inputs: [&[u8]; 4], out: &mut [[u8; OUT_LEN]; 4]) {
+        let len = inputs[0].len();
+        assert!(inputs.iter().all(|s| s.len() == len));
+        if len > CHUNK_LEN {
+            for (dst, input) in out.iter_mut().zip(inputs) {
+                *dst = super::keyed_hash_words(key, input);
+            }
+            return;
+        }
+        unsafe {
+            let rot8 = vld1q_u8(ROT8_MASK.as_ptr());
+            let mut cv = broadcast_key(key);
+            let full_len = len.saturating_sub(1) / BLOCK_LEN * BLOCK_LEN;
+            let mut off = 0;
+            while off < full_len {
+                let m = load_4_blocks(
+                    inputs[0].as_ptr().add(off),
+                    inputs[1].as_ptr().add(off),
+                    inputs[2].as_ptr().add(off),
+                    inputs[3].as_ptr().add(off),
+                );
+                let flags = KEYED_HASH | if off == 0 { CHUNK_START } else { 0 };
+                compress_cv_4x(&mut cv, &m, 0, BLOCK_LEN as u32, flags, rot8);
+                off += BLOCK_LEN;
+            }
+            let m = load_4_partial_blocks(
+                &inputs[0][off..],
+                &inputs[1][off..],
+                &inputs[2][off..],
+                &inputs[3][off..],
             );
-            let hi1 = transpose4(
-                vreinterpretq_u32_u8(vld1q_u8(p1.add(16))),
-                vreinterpretq_u32_u8(vld1q_u8(p1.add(48))),
-                vreinterpretq_u32_u8(vld1q_u8(p1.add(80))),
-                vreinterpretq_u32_u8(vld1q_u8(p1.add(112))),
+            let end_flags = KEYED_HASH | if off == 0 { CHUNK_START } else { 0 } | CHUNK_END | ROOT;
+            compress_cv_4x(&mut cv, &m, 0, (len - off) as u32, end_flags, rot8);
+            store_4_digests(&cv, out);
+        }
+    }
+
+    #[inline(always)]
+    unsafe fn load_row_4x_32<F: crate::field::Field>(row: &[F], base: usize) -> [V; 8] {
+        assert!(F::BYTES == 32 && base + 4 <= row.len());
+        let mut raw = [0u8; 128];
+        for lane in 0..4 {
+            row[base + lane].write_bytes(&mut raw[lane * 32..lane * 32 + 32]);
+        }
+        unsafe {
+            let ptr = raw.as_ptr();
+            let lo = transpose_4x4(
+                load_u32x4(ptr),
+                load_u32x4(ptr.add(32)),
+                load_u32x4(ptr.add(64)),
+                load_u32x4(ptr.add(96)),
             );
-            (
-                [lo0[0], lo0[1], lo0[2], lo0[3], hi0[0], hi0[1], hi0[2], hi0[3]],
-                [lo1[0], lo1[1], lo1[2], lo1[3], hi1[0], hi1[1], hi1[2], hi1[3]],
+            let hi = transpose_4x4(
+                load_u32x4(ptr.add(16)),
+                load_u32x4(ptr.add(48)),
+                load_u32x4(ptr.add(80)),
+                load_u32x4(ptr.add(112)),
+            );
+            [lo[0], lo[1], lo[2], lo[3], hi[0], hi[1], hi[2], hi[3]]
+        }
+    }
+
+    #[inline(always)]
+    unsafe fn load_row_4x_16<F: crate::field::Field>(row: &[F], base: usize) -> [V; 4] {
+        assert!(F::BYTES == 16 && base + 4 <= row.len());
+        let mut raw = [0u8; 64];
+        for lane in 0..4 {
+            row[base + lane].write_bytes(&mut raw[lane * 16..lane * 16 + 16]);
+        }
+        unsafe {
+            let ptr = raw.as_ptr();
+            transpose_4x4(
+                load_u32x4(ptr),
+                load_u32x4(ptr.add(16)),
+                load_u32x4(ptr.add(32)),
+                load_u32x4(ptr.add(48)),
             )
         }
     }
 
     #[inline(always)]
-    unsafe fn load_row_8x_16<F: crate::field::Field>(row: &[F], base: usize) -> ([V; 4], [V; 4]) {
-        assert!(F::BYTES == 16);
-        assert!(base + 8 <= row.len());
-        let mut raw0 = [0u8; 64];
-        let mut raw1 = [0u8; 64];
-        for lane in 0..4 {
-            row[base + lane].write_bytes(&mut raw0[lane * 16..(lane + 1) * 16]);
-            row[base + 4 + lane].write_bytes(&mut raw1[lane * 16..(lane + 1) * 16]);
-        }
+    unsafe fn init_pos_carry_16x(base: usize) -> [[V; 2]; 4] {
         unsafe {
-            let p0 = raw0.as_ptr();
-            let w0 = transpose4(
-                vreinterpretq_u32_u8(vld1q_u8(p0)),
-                vreinterpretq_u32_u8(vld1q_u8(p0.add(16))),
-                vreinterpretq_u32_u8(vld1q_u8(p0.add(32))),
-                vreinterpretq_u32_u8(vld1q_u8(p0.add(48))),
-            );
-            let p1 = raw1.as_ptr();
-            let w1 = transpose4(
-                vreinterpretq_u32_u8(vld1q_u8(p1)),
-                vreinterpretq_u32_u8(vld1q_u8(p1.add(16))),
-                vreinterpretq_u32_u8(vld1q_u8(p1.add(32))),
-                vreinterpretq_u32_u8(vld1q_u8(p1.add(48))),
-            );
-            (w0, w1)
+            let mut carry = [[vdupq_n_u32(0); 2]; 4];
+            for (grp, slot) in carry.iter_mut().enumerate() {
+                let b = (base + grp * 4) as u64;
+                let lo = [b as u32, (b + 1) as u32, (b + 2) as u32, (b + 3) as u32];
+                let hi = [
+                    (b >> 32) as u32,
+                    ((b + 1) >> 32) as u32,
+                    ((b + 2) >> 32) as u32,
+                    ((b + 3) >> 32) as u32,
+                ];
+                *slot = [vld1q_u32(lo.as_ptr()), vld1q_u32(hi.as_ptr())];
+            }
+            carry
         }
     }
 
-    pub fn hash_rows_8x_f32<F: crate::field::Field>(
-        key: &[u32; 8],
+    #[inline(always)]
+    unsafe fn init_pos_carry_8x(base: usize) -> [[V; 2]; 2] {
+        unsafe {
+            let b0 = base as u64;
+            let b1 = (base + 4) as u64;
+            let lo0 = [b0 as u32, (b0 + 1) as u32, (b0 + 2) as u32, (b0 + 3) as u32];
+            let hi0 = [
+                (b0 >> 32) as u32,
+                ((b0 + 1) >> 32) as u32,
+                ((b0 + 2) >> 32) as u32,
+                ((b0 + 3) >> 32) as u32,
+            ];
+            let lo1 = [b1 as u32, (b1 + 1) as u32, (b1 + 2) as u32, (b1 + 3) as u32];
+            let hi1 = [
+                (b1 >> 32) as u32,
+                ((b1 + 1) >> 32) as u32,
+                ((b1 + 2) >> 32) as u32,
+                ((b1 + 3) >> 32) as u32,
+            ];
+            [
+                [vld1q_u32(lo0.as_ptr()), vld1q_u32(hi0.as_ptr())],
+                [vld1q_u32(lo1.as_ptr()), vld1q_u32(hi1.as_ptr())],
+            ]
+        }
+    }
+
+    #[inline(always)]
+    unsafe fn build_block_f32<F: crate::field::Field>(
+        r0: &[F],
+        r1: &[F],
+        base: usize,
+        carry: &mut [V; 2],
+    ) -> [V; 16] {
+        unsafe {
+            let a = load_row_4x_32(r0, base);
+            let b = load_row_4x_32(r1, base);
+            let m = [
+                carry[0], carry[1], a[0], a[1], a[2], a[3], a[4], a[5], a[6], a[7], b[0], b[1], b[2], b[3],
+                b[4], b[5],
+            ];
+            *carry = [b[6], b[7]];
+            m
+        }
+    }
+
+    #[inline(always)]
+    unsafe fn build_block_f16<F: crate::field::Field>(
         rows: &[Vec<F>],
         base: usize,
-        out: &mut [[u8; OUT_LEN]; 8],
+        carry: &mut [V; 2],
+    ) -> [V; 16] {
+        assert!(rows.len() >= 4);
+        unsafe {
+            let r0 = load_row_4x_16(&rows[0], base);
+            let r1 = load_row_4x_16(&rows[1], base);
+            let r2 = load_row_4x_16(&rows[2], base);
+            let r3 = load_row_4x_16(&rows[3], base);
+            let m = [
+                carry[0], carry[1], r0[0], r0[1], r0[2], r0[3], r1[0], r1[1], r1[2], r1[3], r2[0], r2[1],
+                r2[2], r2[3], r3[0], r3[1],
+            ];
+            *carry = [r3[2], r3[3]];
+            m
+        }
+    }
+
+    struct Rows16State {
+        cv: [[V; 8]; 4],
+        stack: [[[V; 8]; 4]; CV_STACK_LEN_MAX],
+        stack_len: usize,
+        block_in_chunk: usize,
+        chunk_counter: u64,
+        key_v: [V; 8],
+        rot8: uint8x16_t,
+    }
+
+    impl Rows16State {
+        #[inline(always)]
+        unsafe fn new(key: &[u32; 8]) -> Self {
+            unsafe {
+                let rot8 = vld1q_u8(ROT8_MASK.as_ptr());
+                let key_v = broadcast_key(key);
+                Self {
+                    cv: [key_v; 4],
+                    stack: [[[vdupq_n_u32(0); 8]; 4]; CV_STACK_LEN_MAX],
+                    stack_len: 0,
+                    block_in_chunk: 0,
+                    chunk_counter: 0,
+                    key_v,
+                    rot8,
+                }
+            }
+        }
+
+        #[inline(always)]
+        unsafe fn push_full_block(&mut self, m: &[[V; 16]; 4]) {
+            let mut flags = KEYED_HASH;
+            if self.block_in_chunk == 0 {
+                flags |= CHUNK_START;
+            }
+            let is_end = self.block_in_chunk == CHUNK_BLOCKS - 1;
+            if is_end {
+                flags |= CHUNK_END;
+            }
+            unsafe {
+                compress_cv_16x(&mut self.cv, m, self.chunk_counter, BLOCK_LEN as u32, flags, self.rot8)
+            };
+            if is_end {
+                self.chunk_counter += 1;
+                unsafe {
+                    push_chunk_cv_16x(
+                        &mut self.stack,
+                        &mut self.stack_len,
+                        self.cv,
+                        self.chunk_counter,
+                        &self.key_v,
+                        self.rot8,
+                    );
+                }
+                self.cv = [self.key_v; 4];
+                self.block_in_chunk = 0;
+            } else {
+                self.block_in_chunk += 1;
+            }
+        }
+
+        #[inline(always)]
+        fn reset(&mut self) {
+            self.cv = [self.key_v; 4];
+            self.stack_len = 0;
+            self.block_in_chunk = 0;
+            self.chunk_counter = 0;
+        }
+
+        #[inline(always)]
+        unsafe fn finish(&mut self, m: &[[V; 16]; 4], tail_len: u32, out: &mut [[u8; OUT_LEN]; 16]) {
+            let mut flags = KEYED_HASH | CHUNK_END;
+            if self.block_in_chunk == 0 {
+                flags |= CHUNK_START;
+            }
+            if self.stack_len == 0 {
+                flags |= ROOT;
+            }
+            unsafe {
+                compress_cv_16x(&mut self.cv, m, self.chunk_counter, tail_len, flags, self.rot8);
+                let final_cv = if self.stack_len == 0 {
+                    self.cv
+                } else {
+                    self.stack[self.stack_len] = self.cv;
+                    finish_stack_16x(&mut self.stack, self.stack_len + 1, &self.key_v, self.rot8)
+                };
+                let chunks = out.as_chunks_mut::<4>().0;
+                for (c, dst) in final_cv.iter().zip(chunks.iter_mut()) {
+                    store_4_digests(c, dst);
+                }
+            }
+        }
+    }
+
+    #[inline(never)]
+    fn hash_rows_16x_f32_single<F: crate::field::Field>(
+        key: &[u32; 8],
+        rows: &[Vec<F>],
+        start: usize,
+        out: &mut [[[u8; OUT_LEN]; 16]],
     ) {
         assert!(F::BYTES == 32 && !rows.is_empty());
-        assert!(8 + rows.len() * 32 <= CHUNK_LEN);
+        assert!(8 + rows.len() * 32 <= CHUNK_LEN && start + out.len() * 16 <= rows[0].len());
         unsafe {
-            let mut cv0 = key_splat(key);
-            let mut cv1 = cv0;
-            let (mut c0_lo, mut c0_hi) = counter_vecs(base as u64);
-            let (mut c1_lo, mut c1_hi) = counter_vecs((base + 4) as u64);
-            let pairs = rows.len() / 2;
-            for pair in 0..pairs {
-                let (a0, a1) = load_row_8x_32(&rows[2 * pair], base);
-                let (b0, b1) = load_row_8x_32(&rows[2 * pair + 1], base);
-                let m0 = [
-                    c0_lo, c0_hi, a0[0], a0[1], a0[2], a0[3], a0[4], a0[5], a0[6], a0[7], b0[0], b0[1],
-                    b0[2], b0[3], b0[4], b0[5],
-                ];
-                let m1 = [
-                    c1_lo, c1_hi, a1[0], a1[1], a1[2], a1[3], a1[4], a1[5], a1[6], a1[7], b1[0], b1[1],
-                    b1[2], b1[3], b1[4], b1[5],
-                ];
-                let start = if pair == 0 { CHUNK_START } else { 0 };
-                (cv0, cv1) = compress_cv_8x(&cv0, &cv1, &m0, &m1, BLOCK_LEN as u32, KEYED_HASH | start);
-                (c0_lo, c0_hi) = (b0[6], b0[7]);
-                (c1_lo, c1_hi) = (b1[6], b1[7]);
-            }
+            let rot8 = vld1q_u8(ROT8_MASK.as_ptr());
             let zero = vdupq_n_u32(0);
-            let start = if pairs == 0 { CHUNK_START } else { 0 };
-            let flags = KEYED_HASH | start | CHUNK_END | ROOT;
-            let (cv0, cv1) = if rows.len().is_multiple_of(2) {
-                let m0 = [
-                    c0_lo, c0_hi, zero, zero, zero, zero, zero, zero, zero, zero, zero, zero, zero, zero,
-                    zero, zero,
-                ];
-                let m1 = [
-                    c1_lo, c1_hi, zero, zero, zero, zero, zero, zero, zero, zero, zero, zero, zero, zero,
-                    zero, zero,
-                ];
-                compress_cv_8x(&cv0, &cv1, &m0, &m1, 8, flags)
-            } else {
-                let (a0, a1) = load_row_8x_32(&rows[rows.len() - 1], base);
-                let m0 = [
-                    c0_lo, c0_hi, a0[0], a0[1], a0[2], a0[3], a0[4], a0[5], a0[6], a0[7], zero, zero, zero,
-                    zero, zero, zero,
-                ];
-                let m1 = [
-                    c1_lo, c1_hi, a1[0], a1[1], a1[2], a1[3], a1[4], a1[5], a1[6], a1[7], zero, zero, zero,
-                    zero, zero, zero,
-                ];
-                compress_cv_8x(&cv0, &cv1, &m0, &m1, 40, flags)
-            };
-            let (out0, out1) = out.split_at_mut(4);
-            store_cv_4x(&cv0, out0.try_into().expect("four digests"));
-            store_cv_4x(&cv1, out1.try_into().expect("four digests"));
+            let key_v = broadcast_key(key);
+            let pairs = rows.len() / 2;
+            let odd = rows.len() % 2 == 1;
+            for (group, dst) in out.iter_mut().enumerate() {
+                let base = start + group * 16;
+                let mut cv = [key_v; 4];
+                let mut carry = init_pos_carry_16x(base);
+                for p in 0..pairs {
+                    let m = [
+                        build_block_f32(&rows[2 * p], &rows[2 * p + 1], base, &mut carry[0]),
+                        build_block_f32(&rows[2 * p], &rows[2 * p + 1], base + 4, &mut carry[1]),
+                        build_block_f32(&rows[2 * p], &rows[2 * p + 1], base + 8, &mut carry[2]),
+                        build_block_f32(&rows[2 * p], &rows[2 * p + 1], base + 12, &mut carry[3]),
+                    ];
+                    let flags = KEYED_HASH | if p == 0 { CHUNK_START } else { 0 };
+                    compress_cv_16x(&mut cv, &m, 0, BLOCK_LEN as u32, flags, rot8);
+                }
+                let mut m = [[zero; 16]; 4];
+                let tail_len = if odd {
+                    let last = &rows[rows.len() - 1];
+                    for grp in 0..4 {
+                        m[grp][0] = carry[grp][0];
+                        m[grp][1] = carry[grp][1];
+                        m[grp][2..10].copy_from_slice(&load_row_4x_32(last, base + grp * 4));
+                    }
+                    40u32
+                } else {
+                    for grp in 0..4 {
+                        m[grp][0] = carry[grp][0];
+                        m[grp][1] = carry[grp][1];
+                    }
+                    8u32
+                };
+                let flags = KEYED_HASH | if pairs == 0 { CHUNK_START } else { 0 } | CHUNK_END | ROOT;
+                compress_cv_16x(&mut cv, &m, 0, tail_len, flags, rot8);
+                let chunks = dst.as_chunks_mut::<4>().0;
+                for (c, d) in cv.iter().zip(chunks.iter_mut()) {
+                    store_4_digests(c, d);
+                }
+            }
         }
     }
 
-    pub fn hash_rows_8x_f16<F: crate::field::Field>(
+    #[inline(never)]
+    fn hash_rows_16x_f16_single<F: crate::field::Field>(
+        key: &[u32; 8],
+        rows: &[Vec<F>],
+        start: usize,
+        out: &mut [[[u8; OUT_LEN]; 16]],
+    ) {
+        assert!(F::BYTES == 16 && !rows.is_empty());
+        assert!(8 + rows.len() * 16 <= CHUNK_LEN && start + out.len() * 16 <= rows[0].len());
+        unsafe {
+            let rot8 = vld1q_u8(ROT8_MASK.as_ptr());
+            let zero = vdupq_n_u32(0);
+            let key_v = broadcast_key(key);
+            let quads = rows.len() / 4;
+            let rem = rows.len() % 4;
+            for (group, dst) in out.iter_mut().enumerate() {
+                let base = start + group * 16;
+                let mut cv = [key_v; 4];
+                let mut carry = init_pos_carry_16x(base);
+                for q in 0..quads {
+                    let slice = &rows[q * 4..q * 4 + 4];
+                    let m = [
+                        build_block_f16(slice, base, &mut carry[0]),
+                        build_block_f16(slice, base + 4, &mut carry[1]),
+                        build_block_f16(slice, base + 8, &mut carry[2]),
+                        build_block_f16(slice, base + 12, &mut carry[3]),
+                    ];
+                    let flags = KEYED_HASH | if q == 0 { CHUNK_START } else { 0 };
+                    compress_cv_16x(&mut cv, &m, 0, BLOCK_LEN as u32, flags, rot8);
+                }
+                let mut m = [[zero; 16]; 4];
+                for grp in 0..4 {
+                    m[grp][0] = carry[grp][0];
+                    m[grp][1] = carry[grp][1];
+                    for r in 0..rem {
+                        let v = load_row_4x_16(&rows[quads * 4 + r], base + grp * 4);
+                        m[grp][2 + r * 4..6 + r * 4].copy_from_slice(&v);
+                    }
+                }
+                let flags = KEYED_HASH | if quads == 0 { CHUNK_START } else { 0 } | CHUNK_END | ROOT;
+                compress_cv_16x(&mut cv, &m, 0, (8 + rem * 16) as u32, flags, rot8);
+                let chunks = dst.as_chunks_mut::<4>().0;
+                for (c, d) in cv.iter().zip(chunks.iter_mut()) {
+                    store_4_digests(c, d);
+                }
+            }
+        }
+    }
+
+    #[cold]
+    #[inline(never)]
+    fn hash_rows_16x_f32_multi<F: crate::field::Field>(
+        key: &[u32; 8],
+        rows: &[Vec<F>],
+        start: usize,
+        out: &mut [[[u8; OUT_LEN]; 16]],
+    ) {
+        assert!(F::BYTES == 32 && 8 + rows.len() * 32 > CHUNK_LEN);
+        assert!(start + out.len() * 16 <= rows[0].len());
+        unsafe {
+            let mut st = Rows16State::new(key);
+            let zero = vdupq_n_u32(0);
+            for (group, dst) in out.iter_mut().enumerate() {
+                st.reset();
+                let base = start + group * 16;
+                let mut carry = init_pos_carry_16x(base);
+                for p in 0..(rows.len() / 2) {
+                    let m = [
+                        build_block_f32(&rows[2 * p], &rows[2 * p + 1], base, &mut carry[0]),
+                        build_block_f32(&rows[2 * p], &rows[2 * p + 1], base + 4, &mut carry[1]),
+                        build_block_f32(&rows[2 * p], &rows[2 * p + 1], base + 8, &mut carry[2]),
+                        build_block_f32(&rows[2 * p], &rows[2 * p + 1], base + 12, &mut carry[3]),
+                    ];
+                    st.push_full_block(&m);
+                }
+                let mut m = [[zero; 16]; 4];
+                let tail_len = if rows.len() % 2 == 1 {
+                    let last = &rows[rows.len() - 1];
+                    for grp in 0..4 {
+                        m[grp][0] = carry[grp][0];
+                        m[grp][1] = carry[grp][1];
+                        m[grp][2..10].copy_from_slice(&load_row_4x_32(last, base + grp * 4));
+                    }
+                    40u32
+                } else {
+                    for grp in 0..4 {
+                        m[grp][0] = carry[grp][0];
+                        m[grp][1] = carry[grp][1];
+                    }
+                    8u32
+                };
+                st.finish(&m, tail_len, dst);
+            }
+        }
+    }
+
+    #[cold]
+    #[inline(never)]
+    fn hash_rows_16x_f16_multi<F: crate::field::Field>(
+        key: &[u32; 8],
+        rows: &[Vec<F>],
+        start: usize,
+        out: &mut [[[u8; OUT_LEN]; 16]],
+    ) {
+        assert!(F::BYTES == 16 && 8 + rows.len() * 16 > CHUNK_LEN);
+        assert!(start + out.len() * 16 <= rows[0].len());
+        unsafe {
+            let mut st = Rows16State::new(key);
+            let zero = vdupq_n_u32(0);
+            let quads = rows.len() / 4;
+            let rem = rows.len() % 4;
+            for (group, dst) in out.iter_mut().enumerate() {
+                st.reset();
+                let base = start + group * 16;
+                let mut carry = init_pos_carry_16x(base);
+                for q in 0..quads {
+                    let slice = &rows[q * 4..q * 4 + 4];
+                    let m = [
+                        build_block_f16(slice, base, &mut carry[0]),
+                        build_block_f16(slice, base + 4, &mut carry[1]),
+                        build_block_f16(slice, base + 8, &mut carry[2]),
+                        build_block_f16(slice, base + 12, &mut carry[3]),
+                    ];
+                    st.push_full_block(&m);
+                }
+                let mut m = [[zero; 16]; 4];
+                for grp in 0..4 {
+                    m[grp][0] = carry[grp][0];
+                    m[grp][1] = carry[grp][1];
+                    for r in 0..rem {
+                        let v = load_row_4x_16(&rows[quads * 4 + r], base + grp * 4);
+                        m[grp][2 + r * 4..6 + r * 4].copy_from_slice(&v);
+                    }
+                }
+                st.finish(&m, (8 + rem * 16) as u32, dst);
+            }
+        }
+    }
+
+    pub fn hash_rows_16x_direct<F: crate::field::Field>(
+        key: &[u32; 8],
+        rows: &[Vec<F>],
+        start: usize,
+        out: &mut [[[u8; OUT_LEN]; 16]],
+    ) {
+        assert!(F::BYTES == 16 || F::BYTES == 32);
+        assert!(!rows.is_empty());
+        let single = 8 + rows.len() * F::BYTES <= CHUNK_LEN;
+        if F::BYTES == 32 {
+            if single {
+                hash_rows_16x_f32_single(key, rows, start, out);
+            } else {
+                hash_rows_16x_f32_multi(key, rows, start, out);
+            }
+        } else if single {
+            hash_rows_16x_f16_single(key, rows, start, out);
+        } else {
+            hash_rows_16x_f16_multi(key, rows, start, out);
+        }
+    }
+
+    fn hash_rows_8x_f32<F: crate::field::Field>(
         key: &[u32; 8],
         rows: &[Vec<F>],
         base: usize,
         out: &mut [[u8; OUT_LEN]; 8],
     ) {
-        assert!(F::BYTES == 16 && !rows.is_empty());
-        assert!(8 + rows.len() * 16 <= CHUNK_LEN);
+        assert!(F::BYTES == 32 && 8 + rows.len() * 32 <= CHUNK_LEN);
+        assert!(base + 8 <= rows[0].len());
         unsafe {
-            let mut cv0 = key_splat(key);
-            let mut cv1 = cv0;
-            let (mut c0_lo, mut c0_hi) = counter_vecs(base as u64);
-            let (mut c1_lo, mut c1_hi) = counter_vecs((base + 4) as u64);
-            let quads = rows.len() / 4;
-            for quad in 0..quads {
-                let (r0a, r0b) = load_row_8x_16(&rows[4 * quad], base);
-                let (r1a, r1b) = load_row_8x_16(&rows[4 * quad + 1], base);
-                let (r2a, r2b) = load_row_8x_16(&rows[4 * quad + 2], base);
-                let (r3a, r3b) = load_row_8x_16(&rows[4 * quad + 3], base);
-                let m0 = [
-                    c0_lo, c0_hi, r0a[0], r0a[1], r0a[2], r0a[3], r1a[0], r1a[1], r1a[2], r1a[3], r2a[0],
-                    r2a[1], r2a[2], r2a[3], r3a[0], r3a[1],
-                ];
-                let m1 = [
-                    c1_lo, c1_hi, r0b[0], r0b[1], r0b[2], r0b[3], r1b[0], r1b[1], r1b[2], r1b[3], r2b[0],
-                    r2b[1], r2b[2], r2b[3], r3b[0], r3b[1],
-                ];
-                let start = if quad == 0 { CHUNK_START } else { 0 };
-                (cv0, cv1) = compress_cv_8x(&cv0, &cv1, &m0, &m1, BLOCK_LEN as u32, KEYED_HASH | start);
-                (c0_lo, c0_hi) = (r3a[2], r3a[3]);
-                (c1_lo, c1_hi) = (r3b[2], r3b[3]);
-            }
-            let zero = vdupq_n_u32(0);
-            let start = if quads == 0 { CHUNK_START } else { 0 };
-            let flags = KEYED_HASH | start | CHUNK_END | ROOT;
-            let rem = rows.len() % 4;
-            let (cv0, cv1) = if rem == 0 {
-                let m0 = [
-                    c0_lo, c0_hi, zero, zero, zero, zero, zero, zero, zero, zero, zero, zero, zero, zero,
-                    zero, zero,
-                ];
-                let m1 = [
-                    c1_lo, c1_hi, zero, zero, zero, zero, zero, zero, zero, zero, zero, zero, zero, zero,
-                    zero, zero,
-                ];
-                compress_cv_8x(&cv0, &cv1, &m0, &m1, 8, flags)
-            } else {
-                let mut m0 = [zero; 16];
-                let mut m1 = [zero; 16];
-                (m0[0], m0[1]) = (c0_lo, c0_hi);
-                (m1[0], m1[1]) = (c1_lo, c1_hi);
-                for extra in 0..rem {
-                    let (ra, rb) = load_row_8x_16(&rows[4 * quads + extra], base);
-                    let dst = 2 + 4 * extra;
-                    m0[dst..dst + 4].copy_from_slice(&ra);
-                    m1[dst..dst + 4].copy_from_slice(&rb);
-                }
-                compress_cv_8x(&cv0, &cv1, &m0, &m1, (8 + 16 * rem) as u32, flags)
-            };
-            let (out0, out1) = out.split_at_mut(4);
-            store_cv_4x(&cv0, out0.try_into().expect("four digests"));
-            store_cv_4x(&cv1, out1.try_into().expect("four digests"));
-        }
-    }
-
-    pub fn keyed_hash_8x(key: &[u32; 8], inputs: [&[u8]; 8], out: &mut [[u8; OUT_LEN]; 8]) {
-        let len_bytes = inputs[0].len();
-        assert!(inputs.iter().all(|slice| slice.len() == len_bytes));
-        assert!(len_bytes <= usize::MAX - CHUNK_LEN);
-        let in0 = [inputs[0], inputs[1], inputs[2], inputs[3]];
-        let in1 = [inputs[4], inputs[5], inputs[6], inputs[7]];
-        if len_bytes == 0 || len_bytes > CHUNK_LEN {
-            let (out0, out1) = out.split_at_mut(4);
-            keyed_hash_4x(key, in0, out0.try_into().expect("four digests"));
-            keyed_hash_4x(key, in1, out1.try_into().expect("four digests"));
-            return;
-        }
-        unsafe {
-            let mut cv0 = key_splat(key);
-            let mut cv1 = cv0;
-            let full_blocks = (len_bytes - 1) / BLOCK_LEN;
-            for block in 0..full_blocks {
-                let off = block * BLOCK_LEN;
-                let m0 = load_block_at(in0, off);
-                let m1 = load_block_at(in1, off);
-                let start = if block == 0 { CHUNK_START } else { 0 };
-                (cv0, cv1) = compress_cv_8x(&cv0, &cv1, &m0, &m1, BLOCK_LEN as u32, KEYED_HASH | start);
-            }
-            let last_off = full_blocks * BLOCK_LEN;
-            let last_len = len_bytes - last_off;
-            let start = if full_blocks == 0 { CHUNK_START } else { 0 };
-            let flags = KEYED_HASH | start | CHUNK_END | ROOT;
-            let (cv0, cv1) = if last_len == 8 {
-                let m0 = load_8byte_block_4x(in0, last_off);
-                let m1 = load_8byte_block_4x(in1, last_off);
-                compress_cv_8x(&cv0, &cv1, &m0, &m1, 8, flags)
-            } else if last_len == BLOCK_LEN {
-                let m0 = load_block_at(in0, last_off);
-                let m1 = load_block_at(in1, last_off);
-                compress_cv_8x(&cv0, &cv1, &m0, &m1, BLOCK_LEN as u32, flags)
-            } else {
-                let m0 = load_partial_block_4x(in0, last_off, last_len);
-                let m1 = load_partial_block_4x(in1, last_off, last_len);
-                compress_cv_8x(&cv0, &cv1, &m0, &m1, last_len as u32, flags)
-            };
-            let (out0, out1) = out.split_at_mut(4);
-            store_cv_4x(&cv0, out0.try_into().expect("four digests"));
-            store_cv_4x(&cv1, out1.try_into().expect("four digests"));
-        }
-    }
-
-    #[inline(always)]
-    unsafe fn store_root_block_4x(mut s: [V; 16], cv: &[V; 8], dst: *mut u8) {
-        unsafe {
-            for word in 0..8 {
-                s[word] = veorq_u32(s[word], s[word + 8]);
-                s[word + 8] = veorq_u32(s[word + 8], cv[word]);
-            }
-            for group in 0..4 {
-                let cols = transpose4(s[group * 4], s[group * 4 + 1], s[group * 4 + 2], s[group * 4 + 3]);
-                for (lane, &col) in cols.iter().enumerate() {
-                    vst1q_u8(dst.add(lane * BLOCK_LEN + group * 16), vreinterpretq_u8_u32(col));
-                }
-            }
-        }
-    }
-
-    pub fn root_blocks_8x(output: &Output, first_counter: u64, dst: &mut [u8; 8 * BLOCK_LEN]) {
-        assert!(output.flags & ROOT == 0);
-        assert!(first_counter <= u64::MAX - 7);
-        unsafe {
-            let cv = key_splat(&output.cv_input);
             let rot8 = vld1q_u8(ROT8_MASK.as_ptr());
-            let mut m = [vdupq_n_u32(0); 16];
-            for word in 0..16 {
-                m[word] = vdupq_n_u32(output.message[word]);
+            let zero = vdupq_n_u32(0);
+            let mut cv0 = broadcast_key(key);
+            let mut cv1 = cv0;
+            let mut carry = init_pos_carry_8x(base);
+            let mut first = true;
+            for p in 0..(rows.len() / 2) {
+                let m0 = build_block_f32(&rows[2 * p], &rows[2 * p + 1], base, &mut carry[0]);
+                let m1 = build_block_f32(&rows[2 * p], &rows[2 * p + 1], base + 4, &mut carry[1]);
+                let flags = KEYED_HASH | if first { CHUNK_START } else { 0 };
+                compress_cv_8x(&mut cv0, &mut cv1, &m0, &m1, 0, BLOCK_LEN as u32, flags, rot8);
+                first = false;
             }
-            let (lo0, hi0) = counter_vecs(first_counter);
-            let (lo1, hi1) = counter_vecs(first_counter + 4);
-            let mut s0 = init_state_4x(&cv, output.block_len, output.flags | ROOT);
-            let mut s1 = s0;
-            s0[12] = lo0;
-            s0[13] = hi0;
-            s1[12] = lo1;
-            s1[13] = hi1;
-            round_8x(&mut s0, &mut s1, &m, &m, &MSG_SCHEDULE[0], rot8);
-            round_8x(&mut s0, &mut s1, &m, &m, &MSG_SCHEDULE[1], rot8);
-            round_8x(&mut s0, &mut s1, &m, &m, &MSG_SCHEDULE[2], rot8);
-            round_8x(&mut s0, &mut s1, &m, &m, &MSG_SCHEDULE[3], rot8);
-            round_8x(&mut s0, &mut s1, &m, &m, &MSG_SCHEDULE[4], rot8);
-            round_8x(&mut s0, &mut s1, &m, &m, &MSG_SCHEDULE[5], rot8);
-            round_8x(&mut s0, &mut s1, &m, &m, &MSG_SCHEDULE[6], rot8);
-            store_root_block_4x(s0, &cv, dst.as_mut_ptr());
-            store_root_block_4x(s1, &cv, dst.as_mut_ptr().add(4 * BLOCK_LEN));
+            let (mut m0, mut m1) = ([zero; 16], [zero; 16]);
+            m0[0] = carry[0][0];
+            m0[1] = carry[0][1];
+            m1[0] = carry[1][0];
+            m1[1] = carry[1][1];
+            let tail_len = if rows.len() % 2 == 1 {
+                let last = &rows[rows.len() - 1];
+                m0[2..10].copy_from_slice(&load_row_4x_32(last, base));
+                m1[2..10].copy_from_slice(&load_row_4x_32(last, base + 4));
+                40u32
+            } else {
+                8u32
+            };
+            let flags = KEYED_HASH | if first { CHUNK_START } else { 0 } | CHUNK_END | ROOT;
+            compress_cv_8x(&mut cv0, &mut cv1, &m0, &m1, 0, tail_len, flags, rot8);
+            let chunks = out.as_chunks_mut::<4>().0;
+            store_4_digests(&cv0, &mut chunks[0]);
+            store_4_digests(&cv1, &mut chunks[1]);
+        }
+    }
+
+    fn hash_rows_8x_f16<F: crate::field::Field>(
+        key: &[u32; 8],
+        rows: &[Vec<F>],
+        base: usize,
+        out: &mut [[u8; OUT_LEN]; 8],
+    ) {
+        assert!(F::BYTES == 16 && 8 + rows.len() * 16 <= CHUNK_LEN);
+        assert!(base + 8 <= rows[0].len());
+        unsafe {
+            let rot8 = vld1q_u8(ROT8_MASK.as_ptr());
+            let zero = vdupq_n_u32(0);
+            let mut cv0 = broadcast_key(key);
+            let mut cv1 = cv0;
+            let mut carry = init_pos_carry_8x(base);
+            let mut first = true;
+            let quads = rows.len() / 4;
+            for q in 0..quads {
+                let slice = &rows[q * 4..q * 4 + 4];
+                let m0 = build_block_f16(slice, base, &mut carry[0]);
+                let m1 = build_block_f16(slice, base + 4, &mut carry[1]);
+                let flags = KEYED_HASH | if first { CHUNK_START } else { 0 };
+                compress_cv_8x(&mut cv0, &mut cv1, &m0, &m1, 0, BLOCK_LEN as u32, flags, rot8);
+                first = false;
+            }
+            let rem = rows.len() % 4;
+            let (mut m0, mut m1) = ([zero; 16], [zero; 16]);
+            m0[0] = carry[0][0];
+            m0[1] = carry[0][1];
+            m1[0] = carry[1][0];
+            m1[1] = carry[1][1];
+            for r in 0..rem {
+                let row = &rows[quads * 4 + r];
+                m0[2 + r * 4..6 + r * 4].copy_from_slice(&load_row_4x_16(row, base));
+                m1[2 + r * 4..6 + r * 4].copy_from_slice(&load_row_4x_16(row, base + 4));
+            }
+            let flags = KEYED_HASH | if first { CHUNK_START } else { 0 } | CHUNK_END | ROOT;
+            compress_cv_8x(&mut cv0, &mut cv1, &m0, &m1, 0, (8 + rem * 16) as u32, flags, rot8);
+            let chunks = out.as_chunks_mut::<4>().0;
+            store_4_digests(&cv0, &mut chunks[0]);
+            store_4_digests(&cv1, &mut chunks[1]);
+        }
+    }
+
+    pub fn hash_rows_8x_direct<F: crate::field::Field>(
+        key: &[u32; 8],
+        rows: &[Vec<F>],
+        base: usize,
+        out: &mut [[u8; OUT_LEN]; 8],
+    ) {
+        assert!(F::BYTES == 16 || F::BYTES == 32);
+        assert!(8 + rows.len() * F::BYTES <= CHUNK_LEN);
+        if F::BYTES == 32 {
+            hash_rows_8x_f32(key, rows, base, out);
+        } else {
+            hash_rows_8x_f16(key, rows, base, out);
         }
     }
 
     #[inline(always)]
-    unsafe fn compress_pow_8x(
-        init: &[V; 16],
-        m0: &[V; 16],
-        m1: &[V; 16],
+    #[allow(clippy::too_many_arguments)]
+    unsafe fn g16_pow<const WX: usize, const WY: usize>(
+        s: &mut [[V; 16]; 4],
+        a: usize,
+        b: usize,
+        c: usize,
+        d: usize,
+        seed: &[V; 8],
+        nonces: &[V; 4],
         rot8: uint8x16_t,
-    ) -> ([V; 16], [V; 16]) {
-        let mut s0 = *init;
-        let mut s1 = *init;
+    ) {
         unsafe {
-            round_8x(&mut s0, &mut s1, m0, m1, &MSG_SCHEDULE[0], rot8);
-            round_8x(&mut s0, &mut s1, m0, m1, &MSG_SCHEDULE[1], rot8);
-            round_8x(&mut s0, &mut s1, m0, m1, &MSG_SCHEDULE[2], rot8);
-            round_8x(&mut s0, &mut s1, m0, m1, &MSG_SCHEDULE[3], rot8);
-            round_8x(&mut s0, &mut s1, m0, m1, &MSG_SCHEDULE[4], rot8);
-            round_8x(&mut s0, &mut s1, m0, m1, &MSG_SCHEDULE[5], rot8);
-            round_8x(&mut s0, &mut s1, m0, m1, &MSG_SCHEDULE[6], rot8);
+            for (st, &nn) in s.iter_mut().zip(nonces) {
+                st[a] = if WX < 8 {
+                    vaddq_u32(vaddq_u32(st[a], seed[WX]), st[b])
+                } else if WX == 8 {
+                    vaddq_u32(vaddq_u32(st[a], nn), st[b])
+                } else {
+                    vaddq_u32(st[a], st[b])
+                };
+            }
+            for st in s.iter_mut() {
+                st[d] = rotr16(veorq_u32(st[d], st[a]));
+            }
+            for st in s.iter_mut() {
+                st[c] = vaddq_u32(st[c], st[d]);
+            }
+            for st in s.iter_mut() {
+                st[b] = rotr12(veorq_u32(st[b], st[c]));
+            }
+            for (st, &nn) in s.iter_mut().zip(nonces) {
+                st[a] = if WY < 8 {
+                    vaddq_u32(vaddq_u32(st[a], seed[WY]), st[b])
+                } else if WY == 8 {
+                    vaddq_u32(vaddq_u32(st[a], nn), st[b])
+                } else {
+                    vaddq_u32(st[a], st[b])
+                };
+            }
+            for st in s.iter_mut() {
+                st[d] = rotr8(veorq_u32(st[d], st[a]), rot8);
+            }
+            for st in s.iter_mut() {
+                st[c] = vaddq_u32(st[c], st[d]);
+            }
+            for st in s.iter_mut() {
+                st[b] = rotr7(veorq_u32(st[b], st[c]));
+            }
         }
-        (s0, s1)
     }
 
-    pub fn find_pow_nonce_4x(
+    macro_rules! round16_pow {
+        ($r:expr, $s:expr, $seed:expr, $n:expr, $rot8:expr) => {
+            g16_pow::<{ MSG_SCHEDULE[$r][0] }, { MSG_SCHEDULE[$r][1] }>($s, 0, 4, 8, 12, $seed, $n, $rot8);
+            g16_pow::<{ MSG_SCHEDULE[$r][2] }, { MSG_SCHEDULE[$r][3] }>($s, 1, 5, 9, 13, $seed, $n, $rot8);
+            g16_pow::<{ MSG_SCHEDULE[$r][4] }, { MSG_SCHEDULE[$r][5] }>($s, 2, 6, 10, 14, $seed, $n, $rot8);
+            g16_pow::<{ MSG_SCHEDULE[$r][6] }, { MSG_SCHEDULE[$r][7] }>($s, 3, 7, 11, 15, $seed, $n, $rot8);
+            g16_pow::<{ MSG_SCHEDULE[$r][8] }, { MSG_SCHEDULE[$r][9] }>($s, 0, 5, 10, 15, $seed, $n, $rot8);
+            g16_pow::<{ MSG_SCHEDULE[$r][10] }, { MSG_SCHEDULE[$r][11] }>($s, 1, 6, 11, 12, $seed, $n, $rot8);
+            g16_pow::<{ MSG_SCHEDULE[$r][12] }, { MSG_SCHEDULE[$r][13] }>($s, 2, 7, 8, 13, $seed, $n, $rot8);
+            g16_pow::<{ MSG_SCHEDULE[$r][14] }, { MSG_SCHEDULE[$r][15] }>($s, 3, 4, 9, 14, $seed, $n, $rot8);
+        };
+    }
+
+    fn precompute_pow_r0(key: &[u32; 8], seed_words: &[u32; 8]) -> [u32; 16] {
+        let mut s = [
+            key[0],
+            key[1],
+            key[2],
+            key[3],
+            key[4],
+            key[5],
+            key[6],
+            key[7],
+            IV[0],
+            IV[1],
+            IV[2],
+            IV[3],
+            0,
+            0,
+            40,
+            KEYED_HASH | CHUNK_START | CHUNK_END | ROOT,
+        ];
+        super::g(&mut s, 0, 4, 8, 12, seed_words[0], seed_words[1]);
+        super::g(&mut s, 1, 5, 9, 13, seed_words[2], seed_words[3]);
+        super::g(&mut s, 2, 6, 10, 14, seed_words[4], seed_words[5]);
+        super::g(&mut s, 3, 7, 11, 15, seed_words[6], seed_words[7]);
+        super::g(&mut s, 1, 6, 11, 12, 0, 0);
+        super::g(&mut s, 2, 7, 8, 13, 0, 0);
+        super::g(&mut s, 3, 4, 9, 14, 0, 0);
+        s
+    }
+
+    #[inline(always)]
+    unsafe fn round6_pow_16x(s: &mut [[V; 16]; 4], seed: &[V; 8], nonces: &[V; 4], rot8: uint8x16_t) {
+        const { assert!(MSG_SCHEDULE[6][8] == 14 && MSG_SCHEDULE[6][9] == 10) };
+        const { assert!(MSG_SCHEDULE[6][12] == 3 && MSG_SCHEDULE[6][13] == 4) };
+        unsafe {
+            g16_pow::<{ MSG_SCHEDULE[6][0] }, { MSG_SCHEDULE[6][1] }>(s, 0, 4, 8, 12, seed, nonces, rot8);
+            g16_pow::<{ MSG_SCHEDULE[6][2] }, { MSG_SCHEDULE[6][3] }>(s, 1, 5, 9, 13, seed, nonces, rot8);
+            g16_pow::<{ MSG_SCHEDULE[6][4] }, { MSG_SCHEDULE[6][5] }>(s, 2, 6, 10, 14, seed, nonces, rot8);
+            g16_pow::<{ MSG_SCHEDULE[6][6] }, { MSG_SCHEDULE[6][7] }>(s, 3, 7, 11, 15, seed, nonces, rot8);
+            for st in s.iter_mut() {
+                st[0] = vaddq_u32(st[0], st[5]);
+            }
+            for st in s.iter_mut() {
+                st[15] = rotr16(veorq_u32(st[15], st[0]));
+            }
+            for st in s.iter_mut() {
+                st[10] = vaddq_u32(st[10], st[15]);
+            }
+            for st in s.iter_mut() {
+                st[5] = rotr12(veorq_u32(st[5], st[10]));
+            }
+            for st in s.iter_mut() {
+                st[0] = vaddq_u32(st[0], st[5]);
+            }
+            for st in s.iter_mut() {
+                st[2] = vaddq_u32(vaddq_u32(st[2], seed[3]), st[7]);
+            }
+            for st in s.iter_mut() {
+                st[13] = rotr16(veorq_u32(st[13], st[2]));
+            }
+            for st in s.iter_mut() {
+                st[8] = vaddq_u32(st[8], st[13]);
+            }
+            for st in s.iter_mut() {
+                st[7] = rotr12(veorq_u32(st[7], st[8]));
+            }
+            for st in s.iter_mut() {
+                st[2] = vaddq_u32(vaddq_u32(st[2], seed[4]), st[7]);
+            }
+            for st in s.iter_mut() {
+                st[13] = rotr8(veorq_u32(st[13], st[2]), rot8);
+            }
+            for st in s.iter_mut() {
+                st[8] = vaddq_u32(st[8], st[13]);
+            }
+        }
+    }
+
+    #[inline(always)]
+    unsafe fn init_pow_nonces_32(start: u32) -> [V; 4] {
+        unsafe {
+            let mut nonces = [vdupq_n_u32(0); 4];
+            for (grp, slot) in nonces.iter_mut().enumerate() {
+                let b = start.wrapping_add((grp * 4) as u32);
+                let arr = [b, b.wrapping_add(1), b.wrapping_add(2), b.wrapping_add(3)];
+                *slot = vld1q_u32(arr.as_ptr());
+            }
+            nonces
+        }
+    }
+
+    fn find_pow_nonce_16x_fast32(
+        key: &[u32; 8],
+        seed: &[u8; 32],
+        bits: u32,
+        start: u32,
+        groups: usize,
+    ) -> Option<u64> {
+        assert!(bits > 0 && bits <= 32);
+        let seed_words = super::words_from_key(seed);
+        let r0_scalar = precompute_pow_r0(key, &seed_words);
+        let mask_be = if bits == 32 { !0u32 } else { !0u32 << (32 - bits) };
+        let mask_le = mask_be.swap_bytes();
+        unsafe {
+            let rot8 = vld1q_u8(ROT8_MASK.as_ptr());
+            let mut r0 = [vdupq_n_u32(0); 16];
+            for (dst, &word) in r0.iter_mut().zip(&r0_scalar) {
+                *dst = vdupq_n_u32(word);
+            }
+            let seed_v = broadcast_key(&seed_words);
+            let mask_v = vdupq_n_u32(mask_le);
+            let step_v = vdupq_n_u32(16);
+            let mut nonces = init_pow_nonces_32(start);
+            for grp in 0..groups {
+                let mut s = [r0; 4];
+                g16_pow::<8, 9>(&mut s, 0, 5, 10, 15, &seed_v, &nonces, rot8);
+                round16_pow!(1, &mut s, &seed_v, &nonces, rot8);
+                round16_pow!(2, &mut s, &seed_v, &nonces, rot8);
+                round16_pow!(3, &mut s, &seed_v, &nonces, rot8);
+                round16_pow!(4, &mut s, &seed_v, &nonces, rot8);
+                round16_pow!(5, &mut s, &seed_v, &nonces, rot8);
+                round6_pow_16x(&mut s, &seed_v, &nonces, rot8);
+                let w0 = vandq_u32(veorq_u32(s[0][0], s[0][8]), mask_v);
+                let w1 = vandq_u32(veorq_u32(s[1][0], s[1][8]), mask_v);
+                let w2 = vandq_u32(veorq_u32(s[2][0], s[2][8]), mask_v);
+                let w3 = vandq_u32(veorq_u32(s[3][0], s[3][8]), mask_v);
+                if vminvq_u32(vminq_u32(vminq_u32(w0, w1), vminq_u32(w2, w3))) == 0 {
+                    let base = start as u64 + (grp as u64) * 16;
+                    for lane in 0..16u64 {
+                        if super::pow_bits_with_key_words(key, seed, base + lane) >= bits {
+                            return Some(base + lane);
+                        }
+                    }
+                }
+                for n in &mut nonces {
+                    *n = vaddq_u32(*n, step_v);
+                }
+            }
+        }
+        None
+    }
+
+    fn find_pow_nonce_16x_general(
+        key: &[u32; 8],
+        seed: &[u8; 32],
+        bits: u32,
+        start: u64,
+        groups: usize,
+    ) -> Option<u64> {
+        assert!(bits > 0 && bits <= 64);
+        let seed_words = super::words_from_key(seed);
+        let mask_lo = if bits >= 32 { !0u32 } else { (!0u32 << (32 - bits)).swap_bytes() };
+        unsafe {
+            let rot8 = vld1q_u8(ROT8_MASK.as_ptr());
+            let key_v = broadcast_key(key);
+            let mut m_base = [vdupq_n_u32(0); 16];
+            for (dst, &word) in m_base[..8].iter_mut().zip(&seed_words) {
+                *dst = vdupq_n_u32(word);
+            }
+            let mask_v = vdupq_n_u32(mask_lo);
+            for grp in 0..groups {
+                let base = start + (grp as u64) * 16;
+                let mut m = [m_base; 4];
+                for (k, block) in m.iter_mut().enumerate() {
+                    let b = base + (k as u64) * 4;
+                    let lo = [
+                        b as u32,
+                        b.wrapping_add(1) as u32,
+                        b.wrapping_add(2) as u32,
+                        b.wrapping_add(3) as u32,
+                    ];
+                    let hi = [
+                        (b >> 32) as u32,
+                        (b.wrapping_add(1) >> 32) as u32,
+                        (b.wrapping_add(2) >> 32) as u32,
+                        (b.wrapping_add(3) >> 32) as u32,
+                    ];
+                    block[8] = vld1q_u32(lo.as_ptr());
+                    block[9] = vld1q_u32(hi.as_ptr());
+                }
+                let mut cv = [key_v; 4];
+                compress_cv_16x(&mut cv, &m, 0, 40, KEYED_HASH | CHUNK_START | CHUNK_END | ROOT, rot8);
+                let w0 = vandq_u32(cv[0][0], mask_v);
+                let w1 = vandq_u32(cv[1][0], mask_v);
+                let w2 = vandq_u32(cv[2][0], mask_v);
+                let w3 = vandq_u32(cv[3][0], mask_v);
+                if vminvq_u32(vminq_u32(vminq_u32(w0, w1), vminq_u32(w2, w3))) == 0 {
+                    for lane in 0..16u64 {
+                        if super::pow_bits_with_key_words(key, seed, base + lane) >= bits {
+                            return Some(base + lane);
+                        }
+                    }
+                }
+            }
+        }
+        None
+    }
+
+    pub fn find_pow_nonce_16x(
         key: &[u32; 8],
         seed: &[u8; 32],
         bits: u32,
@@ -1121,48 +1900,23 @@ mod neon {
     ) -> Option<u64> {
         assert!(bits <= 64);
         assert!(count == 0 || start <= u64::MAX - (count as u64 - 1));
+        if count == 0 {
+            return None;
+        }
         if bits == 0 {
-            return (count > 0).then_some(start);
+            return Some(start);
         }
-        let seed_words = super::words_from_key(seed);
-        let hi_mask = if bits >= 32 { u32::MAX } else { u32::MAX << (32 - bits) };
-        unsafe {
-            let cv = key_splat(key);
-            let rot8 = vld1q_u8(ROT8_MASK.as_ptr());
-            let zero = vdupq_n_u32(0);
-            let mut m0 = [zero; 16];
-            for word in 0..8 {
-                m0[word] = vdupq_n_u32(seed_words[word]);
-            }
-            let mut m1 = m0;
-            let hi_mask_v = vdupq_n_u32(hi_mask);
-            let flags = KEYED_HASH | CHUNK_START | CHUNK_END | ROOT;
-            let init = init_state_4x(&cv, 40, flags);
-            let groups = count / 8;
-            for group in 0..groups {
-                let n0 = start + (group as u64) * 8;
-                let n1 = n0 + 4;
-                (m0[8], m0[9]) = counter_vecs(n0);
-                (m1[8], m1[9]) = counter_vecs(n1);
-                let (s0, s1) = compress_pow_8x(&init, &m0, &m1, rot8);
-                let w0 = veorq_u32(s0[0], s0[8]);
-                let w0_be = vreinterpretq_u32_u8(vrev32q_u8(vreinterpretq_u8_u32(w0)));
-                let w0b = veorq_u32(s1[0], s1[8]);
-                let w0b_be = vreinterpretq_u32_u8(vrev32q_u8(vreinterpretq_u8_u32(w0b)));
-                let hit0 = vandq_u32(w0_be, hi_mask_v);
-                let hit1 = vandq_u32(w0b_be, hi_mask_v);
-                if vminvq_u32(vminq_u32(hit0, hit1)) == 0 {
-                    if let Some(found) = pow_check_4(w0, veorq_u32(s0[1], s0[9]), n0, bits) {
-                        return Some(found);
-                    }
-                    if let Some(found) = pow_check_4(w0b, veorq_u32(s1[1], s1[9]), n1, bits) {
-                        return Some(found);
-                    }
-                }
-            }
+        let end = start + (count as u64 - 1);
+        let groups = count / 16;
+        let found = if bits <= 32 && end <= u32::MAX as u64 {
+            find_pow_nonce_16x_fast32(key, seed, bits, start as u32, groups)
+        } else {
+            find_pow_nonce_16x_general(key, seed, bits, start, groups)
+        };
+        if found.is_some() {
+            return found;
         }
-        let done = (count / 8) * 8;
-        for offset in done..count {
+        for offset in (groups * 16)..count {
             let nonce = start + offset as u64;
             if super::pow_bits_with_key_words(key, seed, nonce) >= bits {
                 return Some(nonce);
@@ -1172,10 +1926,10 @@ mod neon {
     }
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone)]
 struct Output {
-    cv_input: [u32; 8],
-    message: [u32; 16],
+    input_chaining_value: [u32; 8],
+    block_words: [u32; 16],
     counter: u64,
     block_len: u32,
     flags: u32,
@@ -1183,103 +1937,89 @@ struct Output {
 
 impl Output {
     fn chaining_value(&self) -> [u32; 8] {
-        assert!(self.flags & ROOT == 0);
-        compress_cv(&self.cv_input, &self.message, self.counter, self.block_len, self.flags)
+        first_8_words(compress(
+            &self.input_chaining_value,
+            &self.block_words,
+            self.counter,
+            self.block_len,
+            self.flags,
+        ))
     }
 
-    fn root_block(&self, output_block_counter: u64) -> [u8; BLOCK_LEN] {
-        assert!(self.flags & ROOT == 0);
-        let state =
-            compress(&self.cv_input, &self.message, output_block_counter, self.block_len, self.flags | ROOT);
-        let mut block = [0; BLOCK_LEN];
-        for (bytes, word) in block.as_chunks_mut::<4>().0.iter_mut().zip(state) {
-            *bytes = word.to_le_bytes();
+    fn root_output_bytes(&self, out_slice: &mut [u8]) {
+        for (output_block_counter, out_block) in out_slice.chunks_mut(2 * OUT_LEN).enumerate() {
+            let words = compress(
+                &self.input_chaining_value,
+                &self.block_words,
+                output_block_counter as u64,
+                self.block_len,
+                self.flags | ROOT,
+            );
+            for (word, out_word) in words.iter().zip(out_block.chunks_mut(4)) {
+                out_word.copy_from_slice(&word.to_le_bytes()[..out_word.len()]);
+            }
         }
-        block
     }
-
-    fn root_hash(&self) -> [u8; OUT_LEN] {
-        assert!(self.flags & ROOT == 0);
-        let cv = compress_cv(&self.cv_input, &self.message, 0, self.block_len, self.flags | ROOT);
-        hash_from_cv(cv)
-    }
-}
-
-fn parent_output(left: &[u32; 8], right: &[u32; 8], key: &[u32; 8], flags: u32) -> Output {
-    assert!(flags & !KEYED_HASH == 0);
-    let mut message = [0; 16];
-    message[..8].copy_from_slice(left);
-    message[8..].copy_from_slice(right);
-    Output { cv_input: *key, message, counter: 0, block_len: BLOCK_LEN as u32, flags: flags | PARENT }
 }
 
 #[derive(Clone)]
 struct ChunkState {
-    cv: [u32; 8],
+    chaining_value: [u32; 8],
     chunk_counter: u64,
     block: [u8; BLOCK_LEN],
-    block_len: usize,
-    blocks_compressed: usize,
+    block_len: u8,
+    blocks_compressed: u8,
     flags: u32,
 }
 
 impl ChunkState {
-    fn new(key: &[u32; 8], chunk_counter: u64, flags: u32) -> Self {
-        assert!(flags & !KEYED_HASH == 0);
-        Self { cv: *key, chunk_counter, block: [0; BLOCK_LEN], block_len: 0, blocks_compressed: 0, flags }
+    fn new(key_words: [u32; 8], chunk_counter: u64, flags: u32) -> Self {
+        Self {
+            chaining_value: key_words,
+            chunk_counter,
+            block: [0; BLOCK_LEN],
+            block_len: 0,
+            blocks_compressed: 0,
+            flags,
+        }
     }
 
     fn len(&self) -> usize {
-        let len = self.blocks_compressed * BLOCK_LEN + self.block_len;
-        assert!(len <= CHUNK_LEN);
-        len
+        BLOCK_LEN * self.blocks_compressed as usize + self.block_len as usize
     }
 
     fn start_flag(&self) -> u32 {
         if self.blocks_compressed == 0 { CHUNK_START } else { 0 }
     }
 
-    #[inline(always)]
-    fn compress_block(&mut self, block: &[u8; BLOCK_LEN]) {
-        assert!(self.blocks_compressed < CHUNK_LEN / BLOCK_LEN - 1);
-        let message = words_from_block(block);
-        let flags = self.flags | self.start_flag();
-        self.cv = compress_cv(&self.cv, &message, self.chunk_counter, BLOCK_LEN as u32, flags);
-        self.blocks_compressed += 1;
-    }
-
     fn update(&mut self, mut input: &[u8]) {
-        assert!(self.len() + input.len() <= CHUNK_LEN);
-        if self.block_len > 0 {
-            let take = (BLOCK_LEN - self.block_len).min(input.len());
-            self.block[self.block_len..self.block_len + take].copy_from_slice(&input[..take]);
-            self.block_len += take;
-            input = &input[take..];
-            if input.is_empty() {
-                return;
+        while !input.is_empty() {
+            if self.block_len as usize == BLOCK_LEN {
+                let block_words = words_from_block(&self.block);
+                self.chaining_value = first_8_words(compress(
+                    &self.chaining_value,
+                    &block_words,
+                    self.chunk_counter,
+                    BLOCK_LEN as u32,
+                    self.flags | self.start_flag(),
+                ));
+                self.blocks_compressed += 1;
+                self.block = [0; BLOCK_LEN];
+                self.block_len = 0;
             }
-            let block = self.block;
-            self.compress_block(&block);
-            self.block_len = 0;
-        }
-        while input.len() > BLOCK_LEN {
-            let (block, rest) = input.split_first_chunk::<BLOCK_LEN>().expect("a block remains");
-            self.compress_block(block);
-            input = rest;
-        }
-        if !input.is_empty() {
-            assert!(self.block_len == 0);
-            self.block = [0; BLOCK_LEN];
-            self.block[..input.len()].copy_from_slice(input);
-            self.block_len = input.len();
+            let take = (BLOCK_LEN - self.block_len as usize).min(input.len());
+            self.block[self.block_len as usize..self.block_len as usize + take]
+                .copy_from_slice(&input[..take]);
+            self.block_len += take as u8;
+            input = &input[take..];
         }
     }
 
     fn output(&self) -> Output {
-        assert!(self.block_len <= BLOCK_LEN);
+        let block_words = words_from_block(&self.block);
         Output {
-            cv_input: self.cv,
-            message: words_from_block(&self.block),
+            input_chaining_value: self.chaining_value,
+            block_words,
             counter: self.chunk_counter,
             block_len: self.block_len as u32,
             flags: self.flags | self.start_flag() | CHUNK_END,
@@ -1287,135 +2027,129 @@ impl ChunkState {
     }
 }
 
+fn parent_output(
+    left_child_cv: [u32; 8],
+    right_child_cv: [u32; 8],
+    key_words: [u32; 8],
+    flags: u32,
+) -> Output {
+    let mut block_words = [0u32; 16];
+    block_words[..8].copy_from_slice(&left_child_cv);
+    block_words[8..].copy_from_slice(&right_child_cv);
+    Output {
+        input_chaining_value: key_words,
+        block_words,
+        counter: 0,
+        block_len: BLOCK_LEN as u32,
+        flags: PARENT | flags,
+    }
+}
+
 #[derive(Clone)]
 pub struct Hasher {
-    key: [u32; 8],
+    chunk_state: ChunkState,
+    key_words: [u32; 8],
+    cv_stack: [[u32; 8]; CV_STACK_LEN_MAX],
+    cv_stack_len: u8,
     flags: u32,
-    chunk: ChunkState,
-    cv_stack_inline: [[u32; 8]; CV_STACK_INLINE_LEN_MAX],
-    cv_stack_spill: Vec<[u32; 8]>,
-    cv_stack_len: usize,
 }
 
 impl Hasher {
-    pub(crate) fn with_key_words(key: [u32; 8], flags: u32) -> Self {
-        assert!(flags & !KEYED_HASH == 0);
-        let chunk = ChunkState::new(&key, 0, flags);
-        let cv_stack_inline = [[0; 8]; CV_STACK_INLINE_LEN_MAX];
-        Self { key, flags, chunk, cv_stack_inline, cv_stack_spill: Vec::new(), cv_stack_len: 0 }
+    fn new_internal(key_words: [u32; 8], flags: u32) -> Self {
+        Self {
+            chunk_state: ChunkState::new(key_words, 0, flags),
+            key_words,
+            cv_stack: [[0; 8]; CV_STACK_LEN_MAX],
+            cv_stack_len: 0,
+            flags,
+        }
     }
 
     pub fn new() -> Self {
-        Self::with_key_words(IV, 0)
+        Self::new_internal(IV, 0)
     }
 
     pub fn new_keyed(key: &[u8; KEY_LEN]) -> Self {
-        Self::with_key_words(words_from_key(key), KEYED_HASH)
+        Self::new_internal(words_from_key(key), KEYED_HASH)
     }
 
-    pub(crate) fn new_keyed_words(key: [u32; 8]) -> Self {
-        Self::with_key_words(key, KEYED_HASH)
+    pub(crate) fn new_keyed_words(key_words: [u32; 8]) -> Self {
+        Self::new_internal(key_words, KEYED_HASH)
     }
 
-    fn cv_stack_get(&self, index: usize) -> [u32; 8] {
-        assert!(index < self.cv_stack_len);
-        if index < CV_STACK_INLINE_LEN_MAX {
-            self.cv_stack_inline[index]
-        } else {
-            self.cv_stack_spill[index - CV_STACK_INLINE_LEN_MAX]
-        }
-    }
-
-    fn cv_stack_push(&mut self, cv: [u32; 8]) {
-        assert!(self.cv_stack_len < CV_STACK_LEN_MAX);
-        if self.cv_stack_len < CV_STACK_INLINE_LEN_MAX {
-            self.cv_stack_inline[self.cv_stack_len] = cv;
-        } else {
-            self.cv_stack_spill.push(cv);
-        }
+    fn push_stack(&mut self, cv: [u32; 8]) {
+        assert!((self.cv_stack_len as usize) < CV_STACK_LEN_MAX);
+        self.cv_stack[self.cv_stack_len as usize] = cv;
         self.cv_stack_len += 1;
-        assert!(self.cv_stack_spill.len() == self.cv_stack_len.saturating_sub(CV_STACK_INLINE_LEN_MAX));
     }
 
-    fn cv_stack_pop(&mut self) -> [u32; 8] {
-        let cv = self.cv_stack_get(self.cv_stack_len - 1);
-        if self.cv_stack_len > CV_STACK_INLINE_LEN_MAX {
-            self.cv_stack_spill.pop();
-        }
+    fn pop_stack(&mut self) -> [u32; 8] {
+        assert!(self.cv_stack_len > 0);
         self.cv_stack_len -= 1;
-        assert!(self.cv_stack_spill.len() == self.cv_stack_len.saturating_sub(CV_STACK_INLINE_LEN_MAX));
-        cv
+        self.cv_stack[self.cv_stack_len as usize]
     }
 
-    fn push_chunk_cv(&mut self, cv_chunk: [u32; 8], chunks_total: u64) {
-        assert!(chunks_total > 0);
-        let mut cv = cv_chunk;
-        let mut chunks = chunks_total;
-        while chunks & 1 == 0 {
-            let left = self.cv_stack_pop();
-            cv = parent_output(&left, &cv, &self.key, self.flags).chaining_value();
-            chunks >>= 1;
+    fn add_chunk_chaining_value(&mut self, mut new_cv: [u32; 8], mut total_chunks: u64) {
+        while total_chunks & 1 == 0 {
+            let left = self.pop_stack();
+            new_cv = parent_cv(&left, &new_cv, &self.key_words, self.flags);
+            total_chunks >>= 1;
         }
-        self.cv_stack_push(cv);
-        assert!(self.cv_stack_len as u32 == chunks_total.count_ones());
+        self.push_stack(new_cv);
     }
 
     pub fn update(&mut self, mut input: &[u8]) -> &mut Self {
         while !input.is_empty() {
-            if self.chunk.len() == CHUNK_LEN {
-                let cv_chunk = self.chunk.output().chaining_value();
-                let chunks_total = self.chunk.chunk_counter + 1;
-                self.push_chunk_cv(cv_chunk, chunks_total);
-                self.chunk = ChunkState::new(&self.key, chunks_total, self.flags);
+            if self.chunk_state.len() == CHUNK_LEN {
+                let chunk_cv = self.chunk_state.output().chaining_value();
+                let total_chunks = self.chunk_state.chunk_counter + 1;
+                self.add_chunk_chaining_value(chunk_cv, total_chunks);
+                self.chunk_state = ChunkState::new(self.key_words, total_chunks, self.flags);
             }
             #[cfg(all(target_arch = "aarch64", target_feature = "neon", target_endian = "little"))]
-            if self.chunk.len() == 0 && input.len() > 4 * CHUNK_LEN {
-                while input.len() > 8 * CHUNK_LEN {
-                    let (eight, rest) =
-                        input.split_first_chunk::<{ 8 * CHUNK_LEN }>().expect("eight chunks remain");
-                    let first = self.chunk.chunk_counter;
-                    let cvs = neon::compress_8_chunks(&self.key, eight, first, self.flags);
-                    for (offset, cv) in cvs.into_iter().enumerate() {
-                        self.push_chunk_cv(cv, first + offset as u64 + 1);
-                    }
-                    self.chunk = ChunkState::new(&self.key, first + 8, self.flags);
-                    input = rest;
+            if self.chunk_state.len() == 0 && input.len() > 16 * CHUNK_LEN {
+                let mut cvs = [[0u32; 8]; 16];
+                let start = self.chunk_state.chunk_counter;
+                neon::compress_16_chunks(
+                    &self.key_words,
+                    &input[..16 * CHUNK_LEN],
+                    start,
+                    self.flags,
+                    &mut cvs,
+                );
+                for (i, cv) in cvs.into_iter().enumerate() {
+                    self.add_chunk_chaining_value(cv, start + i as u64 + 1);
                 }
-                while input.len() > 4 * CHUNK_LEN {
-                    let (four, rest) =
-                        input.split_first_chunk::<{ 4 * CHUNK_LEN }>().expect("four chunks remain");
-                    let first = self.chunk.chunk_counter;
-                    let cvs = neon::compress_4_chunks(&self.key, four, first, self.flags);
-                    for (offset, cv) in cvs.into_iter().enumerate() {
-                        self.push_chunk_cv(cv, first + offset as u64 + 1);
-                    }
-                    self.chunk = ChunkState::new(&self.key, first + 4, self.flags);
-                    input = rest;
-                }
+                self.chunk_state = ChunkState::new(self.key_words, start + 16, self.flags);
+                input = &input[16 * CHUNK_LEN..];
                 continue;
             }
-            let take = (CHUNK_LEN - self.chunk.len()).min(input.len());
-            assert!(take > 0);
-            self.chunk.update(&input[..take]);
+            let take = (CHUNK_LEN - self.chunk_state.len()).min(input.len());
+            self.chunk_state.update(&input[..take]);
             input = &input[take..];
         }
         self
     }
 
     fn root_output(&self) -> Output {
-        assert!(self.cv_stack_len <= CV_STACK_LEN_MAX);
-        let mut output = self.chunk.output();
-        let mut remaining = self.cv_stack_len;
-        while remaining > 0 {
-            remaining -= 1;
-            let left = self.cv_stack_get(remaining);
-            output = parent_output(&left, &output.chaining_value(), &self.key, self.flags);
+        let mut output = self.chunk_state.output();
+        let mut parent_nodes_remaining = self.cv_stack_len as usize;
+        while parent_nodes_remaining > 0 {
+            parent_nodes_remaining -= 1;
+            output = parent_output(
+                self.cv_stack[parent_nodes_remaining],
+                output.chaining_value(),
+                self.key_words,
+                self.flags,
+            );
         }
         output
     }
 
     pub fn finalize(&self) -> [u8; OUT_LEN] {
-        self.root_output().root_hash()
+        let mut out = [0u8; OUT_LEN];
+        self.root_output().root_output_bytes(&mut out);
+        out
     }
 
     pub fn finalize_xof(&self) -> OutputReader {
@@ -1431,11 +2165,9 @@ impl Default for Hasher {
 
 pub(crate) fn hash_with_key_words(key: [u32; 8], flags: u32, input: &[u8]) -> [u8; OUT_LEN] {
     if input.len() <= CHUNK_LEN {
-        let mut chunk = ChunkState::new(&key, 0, flags);
-        chunk.update(input);
-        return chunk.output().root_hash();
+        return bytes_from_words(&compress_chunk_scalar(&key, input, 0, flags, ROOT));
     }
-    let mut hasher = Hasher::with_key_words(key, flags);
+    let mut hasher = Hasher::new_internal(key, flags);
     hasher.update(input);
     hasher.finalize()
 }
@@ -1446,9 +2178,29 @@ pub(crate) fn keyed_hash_words(key: &[u32; 8], input: &[u8]) -> [u8; OUT_LEN] {
 
 pub(crate) fn keyed_hash_block(key: &[u32; 8], block: &[u8; BLOCK_LEN]) -> [u8; OUT_LEN] {
     const { assert!(BLOCK_LEN == 64 && OUT_LEN == 32) };
-    let message = words_from_block(block);
-    let flags = KEYED_HASH | CHUNK_START | CHUNK_END | ROOT;
-    hash_from_cv(compress_cv(key, &message, 0, BLOCK_LEN as u32, flags))
+    let words = words_from_block(block);
+    let out = compress(key, &words, 0, BLOCK_LEN as u32, KEYED_HASH | CHUNK_START | CHUNK_END | ROOT);
+    bytes_from_words(&first_8_words(out))
+}
+
+pub(crate) fn keyed_hash_parent_16x(
+    key: &[u32; 8],
+    children: &[[u8; 32]; 32],
+    out: &mut [[u8; OUT_LEN]; 16],
+) {
+    #[cfg(all(target_arch = "aarch64", target_feature = "neon", target_endian = "little"))]
+    {
+        neon::keyed_hash_parent_16x(key, children, out);
+    }
+    #[cfg(not(all(target_arch = "aarch64", target_feature = "neon", target_endian = "little")))]
+    {
+        for (pair, dst) in children.as_chunks::<2>().0.iter().zip(out.iter_mut()) {
+            let mut block = [0u8; BLOCK_LEN];
+            block[..32].copy_from_slice(&pair[0]);
+            block[32..].copy_from_slice(&pair[1]);
+            *dst = keyed_hash_block(key, &block);
+        }
+    }
 }
 
 pub(crate) fn keyed_hash_parent_8x(key: &[u32; 8], children: &[[u8; 32]; 16], out: &mut [[u8; OUT_LEN]; 8]) {
@@ -1458,11 +2210,11 @@ pub(crate) fn keyed_hash_parent_8x(key: &[u32; 8], children: &[[u8; 32]; 16], ou
     }
     #[cfg(not(all(target_arch = "aarch64", target_feature = "neon", target_endian = "little")))]
     {
-        for lane in 0..8 {
+        for (pair, dst) in children.as_chunks::<2>().0.iter().zip(out.iter_mut()) {
             let mut block = [0u8; BLOCK_LEN];
-            block[..32].copy_from_slice(&children[2 * lane]);
-            block[32..].copy_from_slice(&children[2 * lane + 1]);
-            out[lane] = keyed_hash_block(key, &block);
+            block[..32].copy_from_slice(&pair[0]);
+            block[32..].copy_from_slice(&pair[1]);
+            *dst = keyed_hash_block(key, &block);
         }
     }
 }
@@ -1474,83 +2226,94 @@ pub(crate) fn keyed_hash_parent_4x(key: &[u32; 8], children: &[[u8; 32]; 8], out
     }
     #[cfg(not(all(target_arch = "aarch64", target_feature = "neon", target_endian = "little")))]
     {
-        for lane in 0..4 {
+        for (pair, dst) in children.as_chunks::<2>().0.iter().zip(out.iter_mut()) {
             let mut block = [0u8; BLOCK_LEN];
-            block[..32].copy_from_slice(&children[2 * lane]);
-            block[32..].copy_from_slice(&children[2 * lane + 1]);
-            out[lane] = keyed_hash_block(key, &block);
+            block[..32].copy_from_slice(&pair[0]);
+            block[32..].copy_from_slice(&pair[1]);
+            *dst = keyed_hash_block(key, &block);
+        }
+    }
+}
+
+pub(crate) fn keyed_hash_16x(key: &[u32; 8], inputs: &[&[u8]; 16], out: &mut [[u8; OUT_LEN]; 16]) {
+    #[cfg(all(target_arch = "aarch64", target_feature = "neon", target_endian = "little"))]
+    {
+        neon::keyed_hash_16x(key, inputs, out);
+    }
+    #[cfg(not(all(target_arch = "aarch64", target_feature = "neon", target_endian = "little")))]
+    {
+        for (dst, input) in out.iter_mut().zip(inputs.iter()) {
+            *dst = keyed_hash_words(key, input);
         }
     }
 }
 
 pub(crate) fn keyed_hash_8x(key: &[u32; 8], inputs: [&[u8]; 8], out: &mut [[u8; OUT_LEN]; 8]) {
-    let len_bytes = inputs[0].len();
-    assert!(inputs.iter().all(|slice| slice.len() == len_bytes));
     #[cfg(all(target_arch = "aarch64", target_feature = "neon", target_endian = "little"))]
     {
         neon::keyed_hash_8x(key, inputs, out);
     }
     #[cfg(not(all(target_arch = "aarch64", target_feature = "neon", target_endian = "little")))]
     {
-        for lane in 0..8 {
-            out[lane] = keyed_hash_words(key, inputs[lane]);
+        for (dst, input) in out.iter_mut().zip(inputs) {
+            *dst = keyed_hash_words(key, input);
         }
     }
 }
 
 pub(crate) fn keyed_hash_4x(key: &[u32; 8], inputs: [&[u8]; 4], out: &mut [[u8; OUT_LEN]; 4]) {
-    let len_bytes = inputs[0].len();
-    assert!(inputs.iter().all(|slice| slice.len() == len_bytes));
     #[cfg(all(target_arch = "aarch64", target_feature = "neon", target_endian = "little"))]
     {
         neon::keyed_hash_4x(key, inputs, out);
     }
     #[cfg(not(all(target_arch = "aarch64", target_feature = "neon", target_endian = "little")))]
     {
-        for lane in 0..4 {
-            out[lane] = keyed_hash_words(key, inputs[lane]);
+        for (dst, input) in out.iter_mut().zip(inputs) {
+            *dst = keyed_hash_words(key, input);
         }
     }
 }
 
 pub(crate) fn hash_challenge_words(key: &[u32; 8], seed: &[u8; 32], counter: u64) -> [u8; OUT_LEN] {
-    const { assert!(KEY_LEN == 32 && BLOCK_LEN == 64) };
-    let seed_words = words_from_key(seed);
-    let mut message = [0u32; 16];
-    message[..8].copy_from_slice(&seed_words);
-    message[8] = counter as u32;
-    message[9] = (counter >> 32) as u32;
-    let flags = KEYED_HASH | CHUNK_START | CHUNK_END | ROOT;
-    hash_from_cv(compress_cv(key, &message, 0, 40, flags))
+    const { assert!(OUT_LEN == 32) };
+    let mut block_words = [0u32; 16];
+    block_words[..8].copy_from_slice(&words_from_key(seed));
+    block_words[8] = counter as u32;
+    block_words[9] = (counter >> 32) as u32;
+    let out = compress(key, &block_words, 0, 40, KEYED_HASH | CHUNK_START | CHUNK_END | ROOT);
+    bytes_from_words(&first_8_words(out))
 }
 
 #[cfg(all(target_arch = "aarch64", target_feature = "neon", target_endian = "little"))]
+pub(crate) fn hash_rows_16x_direct<F: crate::field::Field>(
+    key: &[u32; 8],
+    rows: &[Vec<F>],
+    start: usize,
+    out: &mut [[[u8; OUT_LEN]; 16]],
+) {
+    neon::hash_rows_16x_direct(key, rows, start, out);
+}
+
+#[cfg(all(target_arch = "aarch64", target_feature = "neon", target_endian = "little"))]
+#[inline(never)]
 pub(crate) fn hash_rows_8x_direct<F: crate::field::Field>(
     key: &[u32; 8],
     rows: &[Vec<F>],
     base: usize,
     out: &mut [[u8; OUT_LEN]; 8],
 ) {
-    assert!(F::BYTES == 16 || F::BYTES == 32);
-    assert!(8 + rows.len() * F::BYTES <= CHUNK_LEN);
-    if F::BYTES == 32 {
-        neon::hash_rows_8x_f32(key, rows, base, out);
-    } else {
-        neon::hash_rows_8x_f16(key, rows, base, out);
-    }
+    neon::hash_rows_8x_direct(key, rows, base, out);
 }
 
 pub(crate) fn pow_bits_with_key_words(key: &[u32; 8], seed: &[u8; 32], nonce: u64) -> u32 {
-    const { assert!(KEY_LEN == 32 && BLOCK_LEN == 64) };
-    let seed_words = words_from_key(seed);
-    let mut message = [0u32; 16];
-    message[..8].copy_from_slice(&seed_words);
-    message[8] = nonce as u32;
-    message[9] = (nonce >> 32) as u32;
-    let flags = KEYED_HASH | CHUNK_START | CHUNK_END | ROOT;
-    let state = compress(key, &message, 0, 40, flags);
-    let head = ((state[0].swap_bytes() as u64) << 32) | (state[1].swap_bytes() as u64);
-    let bits = head.leading_zeros();
+    const { assert!(OUT_LEN == 32) };
+    let mut block_words = [0u32; 16];
+    block_words[..8].copy_from_slice(&words_from_key(seed));
+    block_words[8] = nonce as u32;
+    block_words[9] = (nonce >> 32) as u32;
+    let out = compress(key, &block_words, 0, 40, KEYED_HASH | CHUNK_START | CHUNK_END | ROOT);
+    let hi = (out[0].swap_bytes() as u64) << 32 | (out[1].swap_bytes() as u64);
+    let bits = hi.leading_zeros();
     assert!(bits <= 64);
     bits
 }
@@ -1566,7 +2329,7 @@ pub(crate) fn find_pow_nonce_with_key_words(
     assert!(count == 0 || start <= u64::MAX - (count as u64 - 1));
     #[cfg(all(target_arch = "aarch64", target_feature = "neon", target_endian = "little"))]
     {
-        neon::find_pow_nonce_4x(key, seed, bits, start, count)
+        neon::find_pow_nonce_16x(key, seed, bits, start, count)
     }
     #[cfg(not(all(target_arch = "aarch64", target_feature = "neon", target_endian = "little")))]
     {
@@ -1592,7 +2355,7 @@ pub fn keyed_hash(key: &[u8; KEY_LEN], input: &[u8]) -> [u8; OUT_LEN] {
 pub struct OutputReader {
     output: Output,
     block_counter: u64,
-    buffer: [u8; 8 * BLOCK_LEN],
+    buffer: [u8; 16 * BLOCK_LEN],
     buffer_position: usize,
     buffer_len: usize,
 }
@@ -1600,12 +2363,12 @@ pub struct OutputReader {
 impl OutputReader {
     fn new(output: Output) -> Self {
         assert!(output.flags & ROOT == 0);
-        Self { output, block_counter: 0, buffer: [0; 8 * BLOCK_LEN], buffer_position: 0, buffer_len: 0 }
+        Self { output, block_counter: 0, buffer: [0; 16 * BLOCK_LEN], buffer_position: 0, buffer_len: 0 }
     }
 
     pub fn position(&self) -> u64 {
         assert!(self.buffer_position <= self.buffer_len);
-        assert!(self.buffer_len <= 8 * BLOCK_LEN);
+        assert!(self.buffer_len <= 16 * BLOCK_LEN);
         self.block_counter * BLOCK_LEN as u64 - (self.buffer_len - self.buffer_position) as u64
     }
 
@@ -1613,33 +2376,66 @@ impl OutputReader {
         assert!(self.buffer_position == self.buffer_len);
         assert!(self.block_counter < u64::MAX);
         #[cfg(all(target_arch = "aarch64", target_feature = "neon", target_endian = "little"))]
-        if self.block_counter <= u64::MAX - 8 {
-            neon::root_blocks_8x(&self.output, self.block_counter, &mut self.buffer);
-            self.block_counter += 8;
+        if self.block_counter <= u64::MAX - 16 {
+            neon::root_blocks_16x(
+                &self.output.input_chaining_value,
+                &self.output.block_words,
+                self.block_counter,
+                self.output.block_len,
+                self.output.flags | ROOT,
+                &mut self.buffer,
+            );
+            self.block_counter += 16;
             self.buffer_position = 0;
-            self.buffer_len = 8 * BLOCK_LEN;
+            self.buffer_len = 16 * BLOCK_LEN;
             return;
         }
-        let block = self.output.root_block(self.block_counter);
-        self.buffer[..BLOCK_LEN].copy_from_slice(&block);
+        let words = compress(
+            &self.output.input_chaining_value,
+            &self.output.block_words,
+            self.block_counter,
+            self.output.block_len,
+            self.output.flags | ROOT,
+        );
+        for (dst, &word) in self.buffer[..BLOCK_LEN].as_chunks_mut::<4>().0.iter_mut().zip(&words) {
+            *dst = word.to_le_bytes();
+        }
         self.block_counter += 1;
         self.buffer_position = 0;
         self.buffer_len = BLOCK_LEN;
     }
 
-    pub fn fill(&mut self, buffer: &mut [u8]) {
-        let mut filled = 0;
-        while filled < buffer.len() {
+    pub fn fill(&mut self, mut dst: &mut [u8]) {
+        assert!(self.buffer_position <= self.buffer_len);
+        if self.buffer_position < self.buffer_len {
+            let take = (self.buffer_len - self.buffer_position).min(dst.len());
+            dst[..take].copy_from_slice(&self.buffer[self.buffer_position..self.buffer_position + take]);
+            self.buffer_position += take;
+            dst = &mut dst[take..];
+        }
+        #[cfg(all(target_arch = "aarch64", target_feature = "neon", target_endian = "little"))]
+        while dst.len() >= 16 * BLOCK_LEN && self.block_counter <= u64::MAX - 16 {
+            let (batch, rest) = dst.split_at_mut(16 * BLOCK_LEN);
+            neon::root_blocks_16x(
+                &self.output.input_chaining_value,
+                &self.output.block_words,
+                self.block_counter,
+                self.output.block_len,
+                self.output.flags | ROOT,
+                batch,
+            );
+            self.block_counter += 16;
+            dst = rest;
+        }
+        while !dst.is_empty() {
             if self.buffer_position == self.buffer_len {
                 self.refill();
             }
-            let take = (self.buffer_len - self.buffer_position).min(buffer.len() - filled);
-            buffer[filled..filled + take]
-                .copy_from_slice(&self.buffer[self.buffer_position..self.buffer_position + take]);
+            let take = (self.buffer_len - self.buffer_position).min(dst.len());
+            dst[..take].copy_from_slice(&self.buffer[self.buffer_position..self.buffer_position + take]);
             self.buffer_position += take;
-            filled += take;
+            dst = &mut dst[take..];
         }
-        assert!(filled == buffer.len());
         assert!(self.buffer_position <= self.buffer_len);
     }
 }

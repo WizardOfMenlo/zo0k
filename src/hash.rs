@@ -43,6 +43,7 @@ impl Domain {
 
 pub trait Hasher: Clone + Send + Sync + 'static {
     const NAME: &'static str;
+    const POW_CHUNK_NONCES: usize = 1024;
 
     fn new(domain: Domain) -> Self;
 
@@ -120,6 +121,7 @@ pub struct Blake3(crate::blake3::Hasher);
 
 impl Hasher for Blake3 {
     const NAME: &'static str = "blake3";
+    const POW_CHUNK_NONCES: usize = 4096;
 
     fn new(domain: Domain) -> Self {
         Self(crate::blake3::Hasher::new_keyed_words(domain.key_words()))
@@ -145,58 +147,66 @@ impl Hasher for Blake3 {
     fn hash_nodes(children: &[Digest], out: &mut [Digest]) {
         assert!(out.len() == children.len().div_ceil(2));
         const KEY: [u32; 8] = Domain::MerkleNode.key_words();
-        let (child_octs, child_after_oct) = children.as_chunks::<16>();
-        let (out_octs, out_after_oct) = out.split_at_mut(child_octs.len() * 8);
-        for (oct, dst) in child_octs.iter().zip(out_octs.as_chunks_mut::<8>().0.iter_mut()) {
-            crate::blake3::keyed_hash_parent_8x(&KEY, oct, dst);
+        let (c16, c_rem16) = children.as_chunks::<32>();
+        let (o16, o_rem16) = out.split_at_mut(c16.len() * 16);
+        for (grp, dst) in c16.iter().zip(o16.as_chunks_mut::<16>().0.iter_mut()) {
+            crate::blake3::keyed_hash_parent_16x(&KEY, grp, dst);
         }
-        let (child_quads, child_rem) = child_after_oct.as_chunks::<8>();
-        let (out_quads, out_rem) = out_after_oct.split_at_mut(child_quads.len() * 4);
-        for (quad, dst) in child_quads.iter().zip(out_quads.as_chunks_mut::<4>().0.iter_mut()) {
-            crate::blake3::keyed_hash_parent_4x(&KEY, quad, dst);
+        let (c8, c_rem8) = c_rem16.as_chunks::<16>();
+        let (o8, o_rem8) = o_rem16.split_at_mut(c8.len() * 8);
+        for (grp, dst) in c8.iter().zip(o8.as_chunks_mut::<8>().0.iter_mut()) {
+            crate::blake3::keyed_hash_parent_8x(&KEY, grp, dst);
         }
-        let (pairs, single) = child_rem.as_chunks::<2>();
-        assert!(out_rem.len() == pairs.len() + single.len());
-        for (pair, dst) in pairs.iter().zip(out_rem.iter_mut()) {
+        let (c4, c_rem4) = c_rem8.as_chunks::<8>();
+        let (o4, o_rem4) = o_rem8.split_at_mut(c4.len() * 4);
+        for (grp, dst) in c4.iter().zip(o4.as_chunks_mut::<4>().0.iter_mut()) {
+            crate::blake3::keyed_hash_parent_4x(&KEY, grp, dst);
+        }
+        let (pairs, single) = c_rem4.as_chunks::<2>();
+        assert!(o_rem4.len() == pairs.len() + single.len());
+        for (pair, dst) in pairs.iter().zip(o_rem4.iter_mut()) {
             let mut block = [0u8; 64];
             block[..32].copy_from_slice(&pair[0]);
             block[32..].copy_from_slice(&pair[1]);
             *dst = crate::blake3::keyed_hash_block(&KEY, &block);
         }
         if let Some(last) = single.first() {
-            out_rem[pairs.len()] = crate::blake3::keyed_hash_words(&KEY, last);
+            o_rem4[pairs.len()] = crate::blake3::keyed_hash_words(&KEY, last);
         }
     }
 
     fn hash_equal_len_batch(domain: Domain, inputs: &[u8], input_len: usize, out: &mut [Digest]) {
         assert!(inputs.len() == input_len * out.len());
         let key = domain.key_words();
-        let (out_octs, out_after_oct) = out.as_chunks_mut::<8>();
+        let (o16, o_rem16) = out.as_chunks_mut::<16>();
         let mut offset = 0;
-        for dst in out_octs {
-            let s = [
-                &inputs[offset..offset + input_len],
-                &inputs[offset + input_len..offset + 2 * input_len],
-                &inputs[offset + 2 * input_len..offset + 3 * input_len],
-                &inputs[offset + 3 * input_len..offset + 4 * input_len],
-                &inputs[offset + 4 * input_len..offset + 5 * input_len],
-                &inputs[offset + 5 * input_len..offset + 6 * input_len],
-                &inputs[offset + 6 * input_len..offset + 7 * input_len],
-                &inputs[offset + 7 * input_len..offset + 8 * input_len],
-            ];
-            crate::blake3::keyed_hash_8x(&key, s, dst);
+        for dst in o16 {
+            let slices = std::array::from_fn(|i| {
+                let s = offset + i * input_len;
+                &inputs[s..s + input_len]
+            });
+            crate::blake3::keyed_hash_16x(&key, &slices, dst);
+            offset += 16 * input_len;
+        }
+        let (o8, o_rem8) = o_rem16.as_chunks_mut::<8>();
+        for dst in o8 {
+            let slices = std::array::from_fn(|i| {
+                let s = offset + i * input_len;
+                &inputs[s..s + input_len]
+            });
+            crate::blake3::keyed_hash_8x(&key, slices, dst);
             offset += 8 * input_len;
         }
-        let (out_quads, out_rem) = out_after_oct.as_chunks_mut::<4>();
-        for dst in out_quads {
-            let s0 = &inputs[offset..offset + input_len];
-            let s1 = &inputs[offset + input_len..offset + 2 * input_len];
-            let s2 = &inputs[offset + 2 * input_len..offset + 3 * input_len];
-            let s3 = &inputs[offset + 3 * input_len..offset + 4 * input_len];
-            crate::blake3::keyed_hash_4x(&key, [s0, s1, s2, s3], dst);
+        let (o4, o_rem4) = o_rem8.as_chunks_mut::<4>();
+        for dst in o4 {
+            let slices = std::array::from_fn(|i| {
+                let s = offset + i * input_len;
+                &inputs[s..s + input_len]
+            });
+            crate::blake3::keyed_hash_4x(&key, slices, dst);
             offset += 4 * input_len;
         }
-        for dst in out_rem {
+        for dst in o_rem4 {
             *dst = crate::blake3::keyed_hash_words(&key, &inputs[offset..offset + input_len]);
             offset += input_len;
         }
@@ -213,21 +223,25 @@ impl Hasher for Blake3 {
         assert!(!rows.is_empty());
         assert!(out.len() == count);
         #[cfg(all(target_arch = "aarch64", target_feature = "neon", target_endian = "little"))]
-        if (F::BYTES == 16 || F::BYTES == 32) && 8 + rows.len() * F::BYTES <= crate::blake3::CHUNK_LEN {
+        if F::BYTES == 16 || F::BYTES == 32 {
             const KEY: [u32; 8] = Domain::MerkleLeaf.key_words();
-            let (out_octs, out_rem) = out.as_chunks_mut::<8>();
-            for (group, dst) in out_octs.iter_mut().enumerate() {
-                crate::blake3::hash_rows_8x_direct(&KEY, rows, start + group * 8, dst);
+            let (o16, rem16) = out.as_chunks_mut::<16>();
+            if !o16.is_empty() {
+                crate::blake3::hash_rows_16x_direct(&KEY, rows, start, o16);
             }
-            if !out_rem.is_empty() {
-                let done = out_octs.len() * 8;
-                crate::merkle::hash_rows_scratch::<Self, F>(
-                    rows,
-                    start + done,
-                    out_rem.len(),
-                    scratch,
-                    out_rem,
-                );
+            let done16 = o16.len() * 16;
+            let leaf_bytes = 8 + rows.len() * F::BYTES;
+            let (done, tail) = if leaf_bytes <= crate::blake3::CHUNK_LEN && rem16.len() >= 8 {
+                let (o8, rem8) = rem16.as_chunks_mut::<8>();
+                for (group, dst) in o8.iter_mut().enumerate() {
+                    crate::blake3::hash_rows_8x_direct(&KEY, rows, start + done16 + group * 8, dst);
+                }
+                (done16 + o8.len() * 8, rem8)
+            } else {
+                (done16, rem16)
+            };
+            if !tail.is_empty() {
+                crate::merkle::hash_rows_scratch::<Self, F>(rows, start + done, tail.len(), scratch, tail);
             }
             return;
         }
@@ -250,6 +264,7 @@ pub struct Keccak256(crate::keccak::Keccak256);
 
 impl Hasher for Keccak256 {
     const NAME: &'static str = "keccak256";
+    const POW_CHUNK_NONCES: usize = 768;
 
     fn new(domain: Domain) -> Self {
         Self(crate::keccak::Keccak256::new_with_prefix(&domain.key()))
@@ -275,33 +290,46 @@ impl Hasher for Keccak256 {
     fn hash_nodes(children: &[Digest], out: &mut [Digest]) {
         assert!(out.len() == children.len().div_ceil(2));
         const KEY: [u64; 4] = Domain::MerkleNode.key_lanes();
-        let (child_quads, child_rem) = children.as_chunks::<4>();
-        let (out_pairs, out_rem) = out.split_at_mut(child_quads.len() * 2);
-        for (quad, dst) in child_quads.iter().zip(out_pairs.as_chunks_mut::<2>().0.iter_mut()) {
-            *dst = crate::keccak::keccak256_node_pair_2x(&KEY, quad);
+        let (c3, c_rem3) = children.as_chunks::<6>();
+        let (o3, o_rem3) = out.split_at_mut(c3.len() * 3);
+        for (grp, dst) in c3.iter().zip(o3.as_chunks_mut::<3>().0.iter_mut()) {
+            *dst = crate::keccak::keccak256_node_pair_3x(&KEY, grp);
         }
-        let (pairs, single) = child_rem.as_chunks::<2>();
-        assert!(out_rem.len() == pairs.len() + single.len());
-        for (pair, dst) in pairs.iter().zip(out_rem.iter_mut()) {
+        let (c2, c_rem2) = c_rem3.as_chunks::<4>();
+        let (o2, o_rem2) = o_rem3.split_at_mut(c2.len() * 2);
+        for (grp, dst) in c2.iter().zip(o2.as_chunks_mut::<2>().0.iter_mut()) {
+            *dst = crate::keccak::keccak256_node_pair_2x(&KEY, grp);
+        }
+        let (pairs, single) = c_rem2.as_chunks::<2>();
+        assert!(o_rem2.len() == pairs.len() + single.len());
+        for (pair, dst) in pairs.iter().zip(o_rem2.iter_mut()) {
             *dst = crate::keccak::keccak256_node_pair(&KEY, &pair[0], &pair[1]);
         }
         if let Some(last) = single.first() {
-            out_rem[pairs.len()] = crate::keccak::keccak256_with_key_lanes(&KEY, last);
+            o_rem2[pairs.len()] = crate::keccak::keccak256_with_key_lanes(&KEY, last);
         }
     }
 
     fn hash_equal_len_batch(domain: Domain, inputs: &[u8], input_len: usize, out: &mut [Digest]) {
         assert!(inputs.len() == input_len * out.len());
         let key = domain.key_lanes();
-        let (out_pairs, out_rem) = out.as_chunks_mut::<2>();
+        let (o3, o_rem3) = out.as_chunks_mut::<3>();
         let mut offset = 0;
-        for dst in out_pairs {
+        for dst in o3 {
+            let s0 = &inputs[offset..offset + input_len];
+            let s1 = &inputs[offset + input_len..offset + 2 * input_len];
+            let s2 = &inputs[offset + 2 * input_len..offset + 3 * input_len];
+            *dst = crate::keccak::keccak256_domain_3x(&key, s0, s1, s2);
+            offset += 3 * input_len;
+        }
+        let (o2, o_rem2) = o_rem3.as_chunks_mut::<2>();
+        for dst in o2 {
             let s0 = &inputs[offset..offset + input_len];
             let s1 = &inputs[offset + input_len..offset + 2 * input_len];
             *dst = crate::keccak::keccak256_domain_2x(&key, s0, s1);
             offset += 2 * input_len;
         }
-        for dst in out_rem {
+        for dst in o_rem2 {
             *dst = crate::keccak::keccak256_with_key_lanes(&key, &inputs[offset..offset + input_len]);
             offset += input_len;
         }
@@ -320,19 +348,18 @@ impl Hasher for Keccak256 {
         #[cfg(all(target_arch = "aarch64", target_feature = "sha3", target_endian = "little"))]
         if F::BYTES == 16 || F::BYTES == 32 {
             const KEY: [u64; 4] = Domain::MerkleLeaf.key_lanes();
-            let (out_pairs, out_rem) = out.as_chunks_mut::<2>();
-            for (pair_index, dst) in out_pairs.iter_mut().enumerate() {
-                crate::keccak::hash_rows_2x_direct(&KEY, rows, start + pair_index * 2, dst);
+            let (o3, rem3) = out.as_chunks_mut::<3>();
+            if !o3.is_empty() {
+                crate::keccak::hash_rows_3x_direct(&KEY, rows, start, o3);
             }
-            if !out_rem.is_empty() {
-                let done = out_pairs.len() * 2;
-                crate::merkle::hash_rows_scratch::<Self, F>(
-                    rows,
-                    start + done,
-                    out_rem.len(),
-                    scratch,
-                    out_rem,
-                );
+            let done3 = o3.len() * 3;
+            let (o2, rem2) = rem3.as_chunks_mut::<2>();
+            for (group, dst) in o2.iter_mut().enumerate() {
+                crate::keccak::hash_rows_2x_direct(&KEY, rows, start + done3 + group * 2, dst);
+            }
+            if !rem2.is_empty() {
+                let done = done3 + o2.len() * 2;
+                crate::merkle::hash_rows_scratch::<Self, F>(rows, start + done, rem2.len(), scratch, rem2);
             }
             return;
         }
