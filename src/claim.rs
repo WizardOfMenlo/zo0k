@@ -98,10 +98,20 @@ impl<F: Field> EqFactor<F> {
         let total = self.len();
         let tile = self.lo.len();
         assert!(total >= 1 && tile >= 1);
-        let mut out = vec![F::ZERO; total];
-        for (t, &w) in self.hi.iter().enumerate() {
-            F::add_scaled_slice(&mut out[t * tile..(t + 1) * tile], &self.lo, scale * w);
+        assert_eq!(total, self.hi.len() * tile);
+        let mut out: Vec<F> = Vec::with_capacity(total);
+        let spare = &mut out.spare_capacity_mut()[..total];
+        if total < PARALLEL_EQ_DOT_MIN {
+            for (t, dst) in spare.chunks_exact_mut(tile).enumerate() {
+                F::scale_to_uninit(dst, &self.lo, scale * self.hi[t]);
+            }
+        } else {
+            parallel::for_each_chunk_mut(spare, tile, 1 << 11, |t, dst| {
+                F::scale_to_uninit(dst, &self.lo, scale * self.hi[t]);
+            });
         }
+        unsafe { out.set_len(total) };
+        assert_eq!(out.len(), total);
         out
     }
 }
@@ -206,18 +216,16 @@ struct FusedPowerState<F> {
     next_tile: usize,
     constant: F,
     quadratic: F,
-    scratch: Vec<F>,
 }
 
 impl<F: Field> FusedPowerState<F> {
-    fn new(rows_len: usize, scratch_len: usize) -> Self {
+    fn new(rows_len: usize) -> Self {
         Self {
             lo_powers: Vec::with_capacity(rows_len),
             hi_powers: Vec::with_capacity(rows_len),
             next_tile: usize::MAX,
             constant: F::ZERO,
             quadratic: F::ZERO,
-            scratch: vec![F::ZERO; scratch_len],
         }
     }
 
@@ -256,50 +264,78 @@ impl<F: Field> FusedPowerState<F> {
 fn write_scaled_uninit<'a, F: Field>(dst: &'a mut [MaybeUninit<F>], src: &[F], scale: F) -> &'a mut [F] {
     let len = dst.len();
     assert_eq!(len, src.len());
-    for slot in dst.iter_mut() {
-        slot.write(F::ZERO);
-    }
+    F::scale_to_uninit(dst, src, scale);
     let slice = unsafe { std::slice::from_raw_parts_mut(dst.as_mut_ptr().cast::<F>(), len) };
-    F::add_scaled_slice(slice, src, scale);
     assert_eq!(slice.len(), len);
     slice
 }
 
-fn scale_tile_with_scratch<F: Field>(tile: &mut [F], scale: F, scratch: &mut [F]) {
-    assert_eq!(tile.len(), scratch.len());
-    if scale == F::ONE {
+fn scale_slice_parallel<F: Field>(dst: &mut [F], scale: F) {
+    assert!(dst.len() <= isize::MAX as usize);
+    if scale == F::ONE || dst.is_empty() {
         return;
     }
-    if scale == F::ZERO {
-        tile.fill(F::ZERO);
-        return;
+    if dst.len() < PARALLEL_EQ_DOT_MIN {
+        F::scale_slice(dst, scale);
+    } else {
+        parallel::for_each_piece_mut(dst, 1 << 11, |_, piece| F::scale_slice(piece, scale));
     }
-    scratch.fill(F::ZERO);
-    F::add_scaled_slice(scratch, tile, scale);
-    tile.copy_from_slice(scratch);
-    assert!(!tile.is_empty());
+    assert!(dst.len() < usize::MAX);
 }
 
-pub(crate) fn materialize_and_round_from_eq<F: Field>(
+fn split_positioned<F: Copy>(rows: &[(PowerRow<F>, Option<usize>)]) -> (Vec<PowerRow<F>>, Vec<(usize, F)>) {
+    let mut unpositioned = Vec::with_capacity(rows.len());
+    let mut positioned = Vec::with_capacity(rows.len());
+    for &(row, pos) in rows {
+        match pos {
+            Some(index) => positioned.push((index, row.scale)),
+            None => unpositioned.push(row),
+        }
+    }
+    assert_eq!(unpositioned.len() + positioned.len(), rows.len());
+    assert!(unpositioned.len() <= rows.len());
+    (unpositioned, positioned)
+}
+
+fn should_use_transposed<F: Field>(n: usize, positioned: &[(PowerRow<F>, Option<usize>)]) -> bool {
+    const TRANSPOSE_MIN_LEN: usize = 1 << 16;
+    const TRANSPOSE_MAX_THREADS: usize = 4;
+    const MIN_QUERIES_PER_COSET_1T: usize = 7;
+    const MIN_QUERIES_PER_COSET_MT: usize = 9;
+    let threads = parallel::threads();
+    assert!(threads >= 1);
+    if threads > TRANSPOSE_MAX_THREADS
+        || n < TRANSPOSE_MIN_LEN
+        || !n.is_power_of_two()
+        || positioned.len() < 16
+    {
+        return false;
+    }
+    let mut cosets: Vec<usize> = positioned.iter().filter_map(|&(_, pos)| pos.map(|i| i / n)).collect();
+    if cosets.len() < 16 {
+        return false;
+    }
+    let count = cosets.len();
+    cosets.sort_unstable();
+    cosets.dedup();
+    assert!(!cosets.is_empty());
+    let threshold = if threads <= 2 { MIN_QUERIES_PER_COSET_1T } else { MIN_QUERIES_PER_COSET_MT };
+    count >= cosets.len().saturating_mul(threshold)
+}
+
+fn materialize_fused_from_eq<F: Field>(
     eq: &EqFactor<F>,
     scale: F,
     rows: &[PowerRow<F>],
     next_main: &[F],
 ) -> (Vec<F>, (F, F)) {
     let total = eq.len();
-    assert_eq!(next_main.len(), total);
-    assert!(total >= 2 && total.is_power_of_two());
     let half = total / 2;
     let tile_len = eq.lo.len();
-    if half < tile_len {
-        let mut main_form = eq.to_dense_scaled(scale);
-        add_power_rows_slice(&mut main_form, rows);
-        let r0 = round_coefficients(&main_form, next_main);
-        return (main_form, r0);
-    }
     let tile_log = tile_len.trailing_zeros();
     let half_tiles = half / tile_len;
     assert_eq!(eq.hi.len(), 2 * half_tiles);
+    assert_eq!(next_main.len(), total);
     let tile_steps: Vec<F> = rows.iter().map(|r| square_pow2(r.base, tile_log)).collect();
     let half_steps: Vec<F> = rows.iter().map(|r| square_pow2(r.base, half.trailing_zeros())).collect();
     let (main_lo, main_hi) = next_main.split_at(half);
@@ -311,7 +347,7 @@ pub(crate) fn materialize_and_round_from_eq<F: Field>(
         form_hi,
         tile_len,
         chunks_min,
-        || FusedPowerState::new(rows.len(), 0),
+        || FusedPowerState::new(rows.len()),
         |state, tile_start, lo_piece, hi_piece| {
             state.sync_tile(rows, &tile_steps, &half_steps, tile_start);
             for (k, (lo_u, hi_u)) in
@@ -338,48 +374,58 @@ pub(crate) fn materialize_and_round_from_eq<F: Field>(
     (main_form, r0)
 }
 
-pub(crate) fn scale_add_powers_and_round<F: Field>(
-    main_form: &mut [F],
+pub(crate) fn materialize_and_round_from_eq<F: RsField>(
+    eq: &EqFactor<F>,
     scale: F,
-    rows: &[PowerRow<F>],
+    positioned: &[(PowerRow<F>, Option<usize>)],
     next_main: &[F],
-) -> (F, F) {
-    let total = main_form.len();
+) -> (Vec<F>, (F, F)) {
+    let total = eq.len();
     assert_eq!(next_main.len(), total);
     assert!(total >= 2 && total.is_power_of_two());
+    if should_use_transposed::<F>(total, positioned) {
+        let (unpositioned, queries) = split_positioned(positioned);
+        let mut main_form = eq.to_dense_scaled(scale);
+        add_power_rows_slice(&mut main_form, &unpositioned);
+        F::add_transposed_queries(&mut main_form, &queries);
+        let r0 = round_coefficients(&main_form, next_main);
+        return (main_form, r0);
+    }
+    let rows: Vec<PowerRow<F>> = positioned.iter().map(|&(row, _)| row).collect();
+    if total / 2 < eq.lo.len() {
+        let mut main_form = eq.to_dense_scaled(scale);
+        add_power_rows_slice(&mut main_form, &rows);
+        let r0 = round_coefficients(&main_form, next_main);
+        return (main_form, r0);
+    }
+    materialize_fused_from_eq(eq, scale, &rows, next_main)
+}
+
+fn scale_add_fused<F: Field>(main_form: &mut [F], scale: F, rows: &[PowerRow<F>], next_main: &[F]) -> (F, F) {
+    let total = main_form.len();
     let half = total / 2;
     let tile_len = l1_tile_len::<F>();
-    if half < tile_len {
-        let mut scratch = vec![F::ZERO; total];
-        scale_tile_with_scratch(main_form, scale, &mut scratch);
-        add_power_rows_slice(main_form, rows);
-        return round_coefficients(main_form, next_main);
-    }
     let tile_log = l1_tile_log::<F>();
+    assert_eq!(next_main.len(), total);
+    assert!(half >= tile_len && half.is_multiple_of(tile_len));
     let tile_steps: Vec<F> = rows.iter().map(|r| square_pow2(r.base, tile_log)).collect();
     let half_steps: Vec<F> = rows.iter().map(|r| square_pow2(r.base, half.trailing_zeros())).collect();
     let (form_lo, form_hi) = main_form.split_at_mut(half);
     let (main_lo, main_hi) = next_main.split_at(half);
-    let need_scratch = if scale == F::ONE || scale == F::ZERO { 0 } else { tile_len };
     let chunks_min = (1usize << 11).div_ceil(tile_len).max(1);
     let states = parallel::fold_pair_chunks_mut_with(
         form_lo,
         form_hi,
         tile_len,
         chunks_min,
-        || FusedPowerState::new(rows.len(), need_scratch),
+        || FusedPowerState::new(rows.len()),
         |state, tile_start, lo_piece, hi_piece| {
             state.sync_tile(rows, &tile_steps, &half_steps, tile_start);
             for (k, (lo_tile, hi_tile)) in
                 lo_piece.chunks_exact_mut(tile_len).zip(hi_piece.chunks_exact_mut(tile_len)).enumerate()
             {
-                if need_scratch > 0 {
-                    scale_tile_with_scratch(lo_tile, scale, &mut state.scratch);
-                    scale_tile_with_scratch(hi_tile, scale, &mut state.scratch);
-                } else if scale == F::ZERO {
-                    lo_tile.fill(F::ZERO);
-                    hi_tile.fill(F::ZERO);
-                }
+                F::scale_slice(lo_tile, scale);
+                F::scale_slice(hi_tile, scale);
                 state.apply_and_advance(lo_tile, hi_tile, rows, &tile_steps);
                 let off = (tile_start + k) * tile_len;
                 let (tc, tq) = F::round_coefficients_slice(
@@ -394,6 +440,31 @@ pub(crate) fn scale_add_powers_and_round<F: Field>(
         },
     );
     states.into_iter().fold((F::ZERO, F::ZERO), |a, s| (a.0 + s.constant, a.1 + s.quadratic))
+}
+
+pub(crate) fn scale_add_powers_and_round<F: RsField>(
+    main_form: &mut [F],
+    scale: F,
+    positioned: &[(PowerRow<F>, Option<usize>)],
+    next_main: &[F],
+) -> (F, F) {
+    let total = main_form.len();
+    assert_eq!(next_main.len(), total);
+    assert!(total >= 2 && total.is_power_of_two());
+    if should_use_transposed::<F>(total, positioned) {
+        let (unpositioned, queries) = split_positioned(positioned);
+        scale_slice_parallel(main_form, scale);
+        add_power_rows_slice(main_form, &unpositioned);
+        F::add_transposed_queries(main_form, &queries);
+        return round_coefficients(main_form, next_main);
+    }
+    let rows: Vec<PowerRow<F>> = positioned.iter().map(|&(row, _)| row).collect();
+    if total / 2 < l1_tile_len::<F>() {
+        F::scale_slice(main_form, scale);
+        add_power_rows_slice(main_form, &rows);
+        return round_coefficients(main_form, next_main);
+    }
+    scale_add_fused(main_form, scale, &rows, next_main)
 }
 
 #[derive(Clone, Copy, Debug)]

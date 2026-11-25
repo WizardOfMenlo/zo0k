@@ -248,8 +248,8 @@ impl CodeSwitch<'_> {
             (&opened.challenges, opened.ood_answer, &opened.opening),
             fold_challenges,
         );
-        let rows: Vec<PowerRow<F>> = parts.main_rows.into_iter().map(|(row, _)| row).collect();
-        let (main, round0) = claim::materialize_and_round_from_eq(&claim.eq, claim.scale, &rows, next_main);
+        let (main, round0) =
+            claim::materialize_and_round_from_eq(&claim.eq, claim.scale, &parts.main_rows, next_main);
         assert_eq!(main.len(), next_main.len());
         (Claim { main, aux: parts.aux, target: parts.target }, round0)
     }
@@ -271,8 +271,7 @@ impl CodeSwitch<'_> {
             (&opened.challenges, opened.ood_answer, &opened.opening),
             fold_challenges,
         );
-        let rows: Vec<PowerRow<F>> = parts.main_rows.into_iter().map(|(row, _)| row).collect();
-        let round0 = claim::scale_add_powers_and_round(&mut main, main_scale, &rows, next_main);
+        let round0 = claim::scale_add_powers_and_round(&mut main, main_scale, &parts.main_rows, next_main);
         assert_eq!(main.len(), next_main.len());
         (Claim { main, aux: parts.aux, target: parts.target }, round0)
     }

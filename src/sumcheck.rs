@@ -84,15 +84,36 @@ fn fold_rows_tile_uninit<F: Field>(
 ) {
     let rows = weights.len();
     let len = out_tile.len();
+    assert!(rows >= 1 && offset + len <= width);
     assert_eq!(table.len(), rows * width);
-    assert!(offset + len <= width);
-    for slot in out_tile.iter_mut() {
-        slot.write(F::ZERO);
-    }
-    let out: &mut [F] = unsafe { std::slice::from_raw_parts_mut(out_tile.as_mut_ptr().cast(), len) };
     let stop = offset + len;
-    for (r, &w) in weights.iter().enumerate() {
-        F::add_scaled_slice(out, &table[r * width + offset..r * width + stop], w);
+    let start_row = if rows >= 4 && rows.is_multiple_of(4) {
+        for slot in out_tile.iter_mut() {
+            slot.write(F::ZERO);
+        }
+        0
+    } else {
+        F::scale_to_uninit(out_tile, &table[offset..stop], weights[0]);
+        1
+    };
+    let out: &mut [F] = unsafe { std::slice::from_raw_parts_mut(out_tile.as_mut_ptr().cast(), len) };
+    let groups = (rows - start_row) / 4;
+    for group in 0..groups {
+        let r = start_row + group * 4;
+        F::add_scaled_4_slice(
+            out,
+            &table[r * width + offset..r * width + stop],
+            weights[r],
+            &table[(r + 1) * width + offset..(r + 1) * width + stop],
+            weights[r + 1],
+            &table[(r + 2) * width + offset..(r + 2) * width + stop],
+            weights[r + 2],
+            &table[(r + 3) * width + offset..(r + 3) * width + stop],
+            weights[r + 3],
+        );
+    }
+    for row in (start_row + groups * 4)..rows {
+        F::add_scaled_slice(out, &table[row * width + offset..row * width + stop], weights[row]);
     }
 }
 
@@ -119,19 +140,6 @@ fn fold_rows_parallel<F: Field>(table: &[F], weights: &[F]) -> Vec<F> {
     unsafe { folded.set_len(width) };
     assert_eq!(folded.len(), width);
     folded
-}
-
-fn scale_chunk_in_place<F: Field>(slice: &mut [F], scale: F) {
-    assert!(slice.len() <= isize::MAX as usize);
-    let tile = fused_tile_len::<F>();
-    let mut buf = [F::ZERO; FUSED_TILE_MAX];
-    for chunk in slice.chunks_mut(tile) {
-        let len = chunk.len();
-        buf[..len].fill(F::ZERO);
-        F::add_scaled_slice(&mut buf[..len], chunk, scale);
-        chunk.copy_from_slice(&buf[..len]);
-    }
-    assert!(slice.len() < usize::MAX);
 }
 
 fn fused_fold_and_round<F: Field>(a: &mut Vec<F>, b: &mut Vec<F>, challenge: F) -> (F, F) {
@@ -205,7 +213,7 @@ fn fold_pair<F: Field>(form: &mut Vec<F>, values: &mut Vec<F>, challenge: F, sca
             let src = start + offset..start + stop;
             F::fold_slice(&mut fl[offset..stop], &f_hi[src.clone()], challenge);
             if let Some(batching) = scale_form {
-                scale_chunk_in_place(&mut fl[offset..stop], batching);
+                F::scale_slice(&mut fl[offset..stop], batching);
             }
             F::fold_slice(&mut vl[offset..stop], &v_hi[src], challenge);
             offset = stop;
