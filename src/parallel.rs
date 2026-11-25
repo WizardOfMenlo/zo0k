@@ -3,18 +3,29 @@ use std::cell::UnsafeCell;
 use std::mem::MaybeUninit;
 use std::ops::Range;
 use std::panic::{self, AssertUnwindSafe};
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Condvar, Mutex, MutexGuard, OnceLock, PoisonError};
 use std::thread;
 
 pub const THREADS_MAX: usize = 512;
 const PIECES_PER_THREAD: usize = 16;
-const SPIN_PAUSE_ROUNDS: usize = 256;
-const SPIN_YIELD_ROUNDS: usize = 2;
+const COMPUTE_HEAD_MULTIPLIER: usize = 4;
+const COMPUTE_TAIL_MULTIPLIER: usize = 8;
+const BOUNDARY_ALIGN: usize = 16;
+const SLOT_COUNT: usize = 64;
+const SPIN_PAUSE_ROUNDS: usize = 16384;
+const SPIN_YIELD_ROUNDS: usize = 4;
+const SPIN_CHECK_STRIDE: usize = 64;
 const WORKER_STACK_BYTES: usize = 8 << 20;
 
+const RESERVED_BIT: u64 = 1;
+const OPEN_BIT: u64 = 2;
+const REF_UNIT: u64 = 4;
+const REF_MASK: u64 = 0xFFFF_FFFC;
+const GEN_UNIT: u64 = 1u64 << 32;
+
 static THREADS_CHOSEN: AtomicUsize = AtomicUsize::new(0);
-static POOL: OnceLock<Pool> = OnceLock::new();
+static POOL: OnceLock<Box<Pool>> = OnceLock::new();
 
 #[repr(align(128))]
 struct CachePadded<T>(T);
@@ -67,6 +78,79 @@ impl<T> CellSlot<T> {
     }
 }
 
+#[derive(Clone, Copy)]
+struct PiecePlan {
+    len: usize,
+    align: usize,
+    head_units: usize,
+    tail_units: usize,
+    head_pieces: usize,
+    tail_pieces: usize,
+}
+
+impl PiecePlan {
+    fn compute(len: usize, piece_len_min: usize) -> Self {
+        assert!(piece_len_min >= 1);
+        let threads = threads();
+        if threads == 1 || len <= piece_len_min || len / piece_len_min < 2 {
+            return Self { len, align: 1, head_units: len, tail_units: 0, head_pieces: 1, tail_pieces: 0 };
+        }
+        if piece_len_min == 1 && len <= threads * PIECES_PER_THREAD {
+            return Self { len, align: 1, head_units: len, tail_units: 0, head_pieces: len, tail_pieces: 0 };
+        }
+        let align = if piece_len_min >= BOUNDARY_ALIGN
+            && len / BOUNDARY_ALIGN >= 2 * piece_len_min.div_ceil(BOUNDARY_ALIGN)
+        {
+            BOUNDARY_ALIGN
+        } else {
+            1
+        };
+        let units = len / align;
+        let min_units = piece_len_min.div_ceil(align);
+        assert!(units >= 2 * min_units);
+        let head_p = threads * COMPUTE_HEAD_MULTIPLIER;
+        let tail_p = threads * COMPUTE_TAIL_MULTIPLIER;
+        let head_u = (units * 3) / 4;
+        let tail_u = units - head_u;
+        if head_u >= head_p * min_units && tail_u >= tail_p * min_units {
+            return Self {
+                len,
+                align,
+                head_units: head_u,
+                tail_units: tail_u,
+                head_pieces: head_p,
+                tail_pieces: tail_p,
+            };
+        }
+        let pieces = (units / min_units).clamp(2, threads * PIECES_PER_THREAD);
+        Self { len, align, head_units: units, tail_units: 0, head_pieces: pieces, tail_pieces: 0 }
+    }
+
+    fn pieces(self) -> usize {
+        self.head_pieces + self.tail_pieces
+    }
+
+    fn range(self, piece: usize) -> Range<usize> {
+        let total = self.pieces();
+        assert!(piece < total);
+        let (start, end) = if piece < self.head_pieces {
+            let s = ((piece as u128 * self.head_units as u128) / self.head_pieces as u128) as usize;
+            let e = (((piece + 1) as u128 * self.head_units as u128) / self.head_pieces as u128) as usize;
+            (s * self.align, if piece + 1 == total { self.len } else { e * self.align })
+        } else {
+            let t = piece - self.head_pieces;
+            let s = ((t as u128 * self.tail_units as u128) / self.tail_pieces as u128) as usize;
+            let e = (((t + 1) as u128 * self.tail_units as u128) / self.tail_pieces as u128) as usize;
+            (
+                (self.head_units + s) * self.align,
+                if piece + 1 == total { self.len } else { (self.head_units + e) * self.align },
+            )
+        };
+        assert!(start <= end && end <= self.len);
+        start..end
+    }
+}
+
 pub fn set_threads(threads: usize) {
     assert!(threads <= THREADS_MAX, "at most {THREADS_MAX} threads");
     let threads_resolved = if threads == 0 { threads_default() } else { threads };
@@ -109,7 +193,8 @@ pub fn filter_map<T: Sync, R: Send>(items: &[T], f: impl Fn(&T) -> Option<R> + S
 }
 
 pub fn map_range<R: Send>(len: usize, piece_len_min: usize, f: impl Fn(usize) -> R + Sync) -> Vec<R> {
-    let pieces = pieces_len(len, piece_len_min);
+    let plan = PiecePlan::compute(len, piece_len_min);
+    let pieces = plan.pieces();
     if pieces == 1 {
         return (0..len).map(f).collect();
     }
@@ -117,7 +202,7 @@ pub fn map_range<R: Send>(len: usize, piece_len_min: usize, f: impl Fn(usize) ->
     let mut results: Vec<R> = Vec::with_capacity(len);
     let slots = SliceMut::new(&mut results.spare_capacity_mut()[..len]);
     run(pieces, &|piece| {
-        let range = piece_range(len, pieces, piece);
+        let range = plan.range(piece);
         let start = range.start;
         let slot: &mut [MaybeUninit<R>] = unsafe { slots.range_mut(range) };
         for (offset, result) in slot.iter_mut().enumerate() {
@@ -147,10 +232,135 @@ pub fn map_chunks<T: Sync, R: Send>(
 }
 
 pub fn map_pieces<R: Send>(len: usize, piece_len_min: usize, f: impl Fn(Range<usize>) -> R + Sync) -> Vec<R> {
-    let pieces = pieces_len(len, piece_len_min);
-    let results = map_range(pieces, 1, |piece| f(piece_range(len, pieces, piece)));
+    let plan = PiecePlan::compute(len, piece_len_min);
+    let pieces = plan.pieces();
+    if pieces == 1 {
+        return vec![f(0..len)];
+    }
+    let mut results: Vec<R> = Vec::with_capacity(pieces);
+    let out = SliceMut::new(&mut results.spare_capacity_mut()[..pieces]);
+    run(pieces, &|piece| {
+        let value = f(plan.range(piece));
+        unsafe { out.range_mut(piece..piece + 1)[0].write(value) };
+    });
+    assert!(results.capacity() >= pieces);
+    unsafe { results.set_len(pieces) };
     assert_eq!(results.len(), pieces);
     results
+}
+
+pub(crate) fn fold_pieces<S: Send>(
+    len: usize,
+    piece_len_min: usize,
+    init: impl Fn() -> S + Sync,
+    f: impl Fn(&mut S, Range<usize>) + Sync,
+) -> Vec<S> {
+    let plan = PiecePlan::compute(len, piece_len_min);
+    let pieces = plan.pieces();
+    assert!(pieces >= 1);
+    if pieces == 1 {
+        let mut acc = init();
+        f(&mut acc, 0..len);
+        return vec![acc];
+    }
+    let workers = threads().min(pieces);
+    let next_piece = CachePadded(AtomicUsize::new(0));
+    let mut partials: Vec<Option<S>> = Vec::with_capacity(workers);
+    let out = SliceMut::new(&mut partials.spare_capacity_mut()[..workers]);
+    run(workers, &|worker| {
+        let mut state: Option<S> = None;
+        for _ in 0..pieces {
+            let piece = next_piece.0.fetch_add(1, Ordering::Relaxed);
+            if piece >= pieces {
+                break;
+            }
+            let acc = state.get_or_insert_with(&init);
+            f(acc, plan.range(piece));
+        }
+        unsafe { out.range_mut(worker..worker + 1)[0].write(state) };
+    });
+    assert!(partials.capacity() >= workers);
+    unsafe { partials.set_len(workers) };
+    partials.into_iter().flatten().collect()
+}
+
+pub(crate) fn for_each_piece_mut_with<T: Send, S>(
+    items: &mut [T],
+    piece_len_min: usize,
+    init: impl Fn() -> S + Sync,
+    f: impl Fn(&mut S, usize, &mut [T]) + Sync,
+) {
+    let len = items.len();
+    let plan = PiecePlan::compute(len, piece_len_min);
+    let pieces = plan.pieces();
+    assert!(pieces >= 1);
+    if pieces == 1 {
+        let mut state = init();
+        f(&mut state, 0, items);
+        return;
+    }
+    let workers = threads().min(pieces);
+    let next_piece = CachePadded(AtomicUsize::new(0));
+    let slots = SliceMut::new(items);
+    run(workers, &|_| {
+        let mut state: Option<S> = None;
+        for _ in 0..pieces {
+            let piece = next_piece.0.fetch_add(1, Ordering::Relaxed);
+            if piece >= pieces {
+                break;
+            }
+            let range = plan.range(piece);
+            let start = range.start;
+            let acc = state.get_or_insert_with(&init);
+            f(acc, start, unsafe { slots.range_mut(range) });
+        }
+    });
+    assert!(next_piece.0.load(Ordering::Relaxed) >= pieces);
+}
+
+pub(crate) fn fold_pair_chunks_mut_with<A: Send, B: Send, S: Send>(
+    a: &mut [A],
+    b: &mut [B],
+    chunk_len: usize,
+    chunks_min: usize,
+    init: impl Fn() -> S + Sync,
+    f: impl Fn(&mut S, usize, &mut [A], &mut [B]) + Sync,
+) -> Vec<S> {
+    assert_eq!(a.len(), b.len());
+    assert!(chunk_len >= 1 && a.len().is_multiple_of(chunk_len));
+    let chunks_len = a.len() / chunk_len;
+    let plan = PiecePlan::compute(chunks_len, chunks_min.max(1));
+    let pieces = plan.pieces();
+    if pieces == 1 {
+        let mut state = init();
+        f(&mut state, 0, a, b);
+        return vec![state];
+    }
+    let workers = threads().min(pieces);
+    let next_piece = CachePadded(AtomicUsize::new(0));
+    let slots_a = SliceMut::new(a);
+    let slots_b = SliceMut::new(b);
+    let mut partials: Vec<Option<S>> = Vec::with_capacity(workers);
+    let out = SliceMut::new(&mut partials.spare_capacity_mut()[..workers]);
+    run(workers, &|worker| {
+        let mut state: Option<S> = None;
+        for _ in 0..pieces {
+            let piece = next_piece.0.fetch_add(1, Ordering::Relaxed);
+            if piece >= pieces {
+                break;
+            }
+            let units = plan.range(piece);
+            let elem_range = (units.start * chunk_len)..(units.end * chunk_len);
+            let acc = state.get_or_insert_with(&init);
+            f(acc, units.start, unsafe { slots_a.range_mut(elem_range.clone()) }, unsafe {
+                slots_b.range_mut(elem_range)
+            });
+        }
+        unsafe { out.range_mut(worker..worker + 1)[0].write(state) };
+    });
+    assert!(partials.capacity() >= workers);
+    unsafe { partials.set_len(workers) };
+    partials.into_iter().flatten().collect()
 }
 
 pub fn for_each_piece_mut<T: Send>(
@@ -159,7 +369,8 @@ pub fn for_each_piece_mut<T: Send>(
     f: impl Fn(usize, &mut [T]) + Sync,
 ) {
     let len = items.len();
-    let pieces = pieces_len(len, piece_len_min);
+    let plan = PiecePlan::compute(len, piece_len_min);
+    let pieces = plan.pieces();
     assert!(pieces >= 1 && pieces <= len.max(1));
     if pieces == 1 {
         return f(0, items);
@@ -167,7 +378,7 @@ pub fn for_each_piece_mut<T: Send>(
     let slots = SliceMut::new(items);
     assert!(pieces >= 2);
     run(pieces, &|piece| {
-        let range = piece_range(len, pieces, piece);
+        let range = plan.range(piece);
         f(range.start, unsafe { slots.range_mut(range) });
     });
 }
@@ -181,7 +392,8 @@ pub fn for_each_chunk_mut<T: Send>(
     assert!(chunk_len >= 1);
     let len = items.len();
     let chunks_len = len.div_ceil(chunk_len);
-    let pieces = pieces_len(chunks_len, piece_len_min.div_ceil(chunk_len).max(1));
+    let plan = PiecePlan::compute(chunks_len, piece_len_min.div_ceil(chunk_len).max(1));
+    let pieces = plan.pieces();
     let visit = |chunk_first: usize, piece: &mut [T]| {
         for (offset, chunk) in piece.chunks_mut(chunk_len).enumerate() {
             f(chunk_first + offset, chunk);
@@ -193,7 +405,7 @@ pub fn for_each_chunk_mut<T: Send>(
     let slots = SliceMut::new(items);
     assert!(pieces <= chunks_len);
     run(pieces, &|piece| {
-        let units = piece_range(chunks_len, pieces, piece);
+        let units = plan.range(piece);
         let start = units.start.saturating_mul(chunk_len).min(len);
         let end = units.end.saturating_mul(chunk_len).min(len);
         visit(units.start, unsafe { slots.range_mut(start..end) });
@@ -217,7 +429,8 @@ pub(crate) fn for_each_pair_indexed_mut<A: Send, B: Send>(
 ) {
     assert_eq!(a.len(), b.len());
     let len = a.len();
-    let pieces = pieces_len(len, piece_len_min);
+    let plan = PiecePlan::compute(len, piece_len_min);
+    let pieces = plan.pieces();
     assert!(pieces >= 1);
     if pieces == 1 {
         return f(0, a, b);
@@ -225,47 +438,62 @@ pub(crate) fn for_each_pair_indexed_mut<A: Send, B: Send>(
     let slots_a = SliceMut::new(a);
     let slots_b = SliceMut::new(b);
     run(pieces, &|piece| {
-        let range = piece_range(len, pieces, piece);
+        let range = plan.range(piece);
         let start = range.start;
         f(start, unsafe { slots_a.range_mut(range.clone()) }, unsafe { slots_b.range_mut(range) });
     });
 }
 
-pub(crate) fn map_four_mut<T: Send, R: Send>(
+pub(crate) fn fold_four_mut<T: Send, S: Send>(
     a: &mut [T],
     b: &mut [T],
     c: &mut [T],
     d: &mut [T],
     piece_len_min: usize,
-    f: impl Fn(usize, &mut [T], &mut [T], &mut [T], &mut [T]) -> R + Sync,
-) -> Vec<R> {
+    init: impl Fn() -> S + Sync,
+    f: impl Fn(&mut S, usize, &mut [T], &mut [T], &mut [T], &mut [T]) + Sync,
+) -> Vec<S> {
     let len = a.len();
     assert!(b.len() == len && c.len() == len && d.len() == len);
-    let pieces = pieces_len(len, piece_len_min);
+    let plan = PiecePlan::compute(len, piece_len_min);
+    let pieces = plan.pieces();
     assert!(pieces >= 1);
     if pieces == 1 {
-        return vec![f(0, a, b, c, d)];
+        let mut state = init();
+        f(&mut state, 0, a, b, c, d);
+        return vec![state];
     }
+    let workers = threads().min(pieces);
+    let next_piece = CachePadded(AtomicUsize::new(0));
     let slots_a = SliceMut::new(a);
     let slots_b = SliceMut::new(b);
     let slots_c = SliceMut::new(c);
     let slots_d = SliceMut::new(d);
-    let mut results: Vec<R> = Vec::with_capacity(pieces);
-    let out = SliceMut::new(&mut results.spare_capacity_mut()[..pieces]);
-    run(pieces, &|piece| {
-        let range = piece_range(len, pieces, piece);
-        let value = f(
-            range.start,
-            unsafe { slots_a.range_mut(range.clone()) },
-            unsafe { slots_b.range_mut(range.clone()) },
-            unsafe { slots_c.range_mut(range.clone()) },
-            unsafe { slots_d.range_mut(range) },
-        );
-        unsafe { out.range_mut(piece..piece + 1)[0].write(value) };
+    let mut partials: Vec<Option<S>> = Vec::with_capacity(workers);
+    let out = SliceMut::new(&mut partials.spare_capacity_mut()[..workers]);
+    run(workers, &|worker| {
+        let mut state: Option<S> = None;
+        for _ in 0..pieces {
+            let piece = next_piece.0.fetch_add(1, Ordering::Relaxed);
+            if piece >= pieces {
+                break;
+            }
+            let range = plan.range(piece);
+            let acc = state.get_or_insert_with(&init);
+            f(
+                acc,
+                range.start,
+                unsafe { slots_a.range_mut(range.clone()) },
+                unsafe { slots_b.range_mut(range.clone()) },
+                unsafe { slots_c.range_mut(range.clone()) },
+                unsafe { slots_d.range_mut(range) },
+            );
+        }
+        unsafe { out.range_mut(worker..worker + 1)[0].write(state) };
     });
-    assert!(results.capacity() >= pieces);
-    unsafe { results.set_len(pieces) };
-    results
+    assert!(partials.capacity() >= workers);
+    unsafe { partials.set_len(workers) };
+    partials.into_iter().flatten().collect()
 }
 
 pub fn join<RA: Send, RB: Send>(a: impl FnOnce() -> RA + Send, b: impl FnOnce() -> RB + Send) -> (RA, RB) {
@@ -350,26 +578,145 @@ fn wait<'a, T>(condvar: &Condvar, guard: MutexGuard<'a, T>) -> MutexGuard<'a, T>
     condvar.wait(guard).unwrap_or_else(PoisonError::into_inner)
 }
 
+fn erase_task<'a>(task: &'a (dyn Fn(usize) + Sync + 'a)) -> *const (dyn Fn(usize) + Sync + 'static) {
+    let raw: *const (dyn Fn(usize) + Sync + 'a) = task;
+    let erased = unsafe {
+        std::mem::transmute::<*const (dyn Fn(usize) + Sync + 'a), *const (dyn Fn(usize) + Sync + 'static)>(
+            raw,
+        )
+    };
+    assert!(!erased.is_null());
+    assert!(std::mem::size_of_val(&erased) == 2 * std::mem::size_of::<usize>());
+    erased
+}
+
 fn run(tasks_len: usize, task: &(dyn Fn(usize) + Sync)) {
     assert!(tasks_len >= 1);
-    if tasks_len == 1 || threads() == 1 {
+    let active_threads = threads();
+    assert!(active_threads >= 1);
+    if tasks_len == 1 || active_threads == 1 {
         for index in 0..tasks_len {
             task(index);
         }
         return;
     }
     let pool = pool();
-    let job = Arc::new(Job::new(task, tasks_len));
-    pool.push(&job);
-    pool.execute(&job);
-    pool.prune();
-    pool.help_until_finished(&job);
-    assert!(job.is_finished());
-    if job.panicked.load(Ordering::Acquire) {
-        let payload = lock(&job.panic).take();
-        if let Some(payload) = payload {
-            panic::resume_unwind(payload);
+    if let Some(slot_idx) = pool.acquire_slot() {
+        pool.run_slot(slot_idx, tasks_len, task);
+    } else {
+        pool.run_overflow(tasks_len, task);
+    }
+}
+
+struct Slot {
+    meta: CachePadded<AtomicU64>,
+    claimed: CachePadded<AtomicUsize>,
+    finished: CachePadded<AtomicUsize>,
+    owner_sleeping: CachePadded<AtomicBool>,
+    task: UnsafeCell<Option<*const (dyn Fn(usize) + Sync + 'static)>>,
+    tasks_len: UnsafeCell<usize>,
+    done_lock: Mutex<()>,
+    done_cv: Condvar,
+    panicked: AtomicBool,
+    panic: Mutex<Option<Box<dyn Any + Send>>>,
+}
+
+unsafe impl Send for Slot {}
+unsafe impl Sync for Slot {}
+
+impl Slot {
+    fn new() -> Self {
+        Self {
+            meta: CachePadded(AtomicU64::new(0)),
+            claimed: CachePadded(AtomicUsize::new(0)),
+            finished: CachePadded(AtomicUsize::new(0)),
+            owner_sleeping: CachePadded(AtomicBool::new(false)),
+            task: UnsafeCell::new(None),
+            tasks_len: UnsafeCell::new(0),
+            done_lock: Mutex::new(()),
+            done_cv: Condvar::new(),
+            panicked: AtomicBool::new(false),
+            panic: Mutex::new(None),
         }
+    }
+
+    fn init(&self, task: &(dyn Fn(usize) + Sync), tasks_len: usize) {
+        assert!(tasks_len >= 2);
+        assert_eq!(self.meta.0.load(Ordering::Relaxed) & (RESERVED_BIT | OPEN_BIT | REF_MASK), RESERVED_BIT);
+        unsafe {
+            *self.task.get() = Some(erase_task(task));
+            *self.tasks_len.get() = tasks_len;
+        }
+        self.claimed.0.store(0, Ordering::Relaxed);
+        self.finished.0.store(0, Ordering::Relaxed);
+        self.owner_sleeping.0.store(false, Ordering::Relaxed);
+        self.panicked.store(false, Ordering::Relaxed);
+    }
+
+    fn close(&self, active_mask: &CachePadded<AtomicU64>, idx: usize) {
+        assert!(idx < SLOT_COUNT);
+        if self.meta.0.load(Ordering::Relaxed) & OPEN_BIT == 0 {
+            return;
+        }
+        let prev = self.meta.0.fetch_and(!OPEN_BIT, Ordering::AcqRel);
+        if prev & OPEN_BIT != 0 {
+            active_mask.0.fetch_and(!(1u64 << idx), Ordering::AcqRel);
+        }
+        assert!(idx < 64);
+    }
+
+    fn record_panic(&self, payload: Box<dyn Any + Send>) {
+        let mut slot = lock(&self.panic);
+        if slot.is_none() {
+            *slot = Some(payload);
+            self.panicked.store(true, Ordering::Release);
+        }
+        assert!(self.panicked.load(Ordering::Relaxed));
+    }
+
+    fn execute_body(&self, active_mask: &CachePadded<AtomicU64>, idx: usize) {
+        let tasks_len = unsafe { *self.tasks_len.get() };
+        let task_ptr = unsafe { (*self.task.get()).expect("active slot has a task") };
+        let task = unsafe { &*task_ptr };
+        assert!(tasks_len >= 2);
+        let mut completed = 0usize;
+        for _ in 0..tasks_len {
+            let index = self.claimed.0.fetch_add(1, Ordering::Relaxed);
+            if index >= tasks_len {
+                self.close(active_mask, idx);
+                break;
+            }
+            if index + 1 == tasks_len {
+                self.close(active_mask, idx);
+            }
+            if let Err(payload) = panic::catch_unwind(AssertUnwindSafe(|| task(index))) {
+                self.record_panic(payload);
+            }
+            completed += 1;
+        }
+        if completed > 0 {
+            let finished = self.finished.0.fetch_add(completed, Ordering::Release) + completed;
+            assert!(finished <= tasks_len);
+        }
+    }
+
+    fn finish_and_release(
+        &self,
+        active_mask: &CachePadded<AtomicU64>,
+        idx: usize,
+        tasks_len: usize,
+    ) -> Option<Box<dyn Any + Send>> {
+        assert_eq!(self.meta.0.load(Ordering::Acquire) & (OPEN_BIT | REF_MASK), 0);
+        assert_eq!(self.finished.0.load(Ordering::Acquire), tasks_len);
+        if active_mask.0.load(Ordering::Relaxed) & (1u64 << idx) != 0 {
+            active_mask.0.fetch_and(!(1u64 << idx), Ordering::Release);
+        }
+        let payload = if self.panicked.load(Ordering::Acquire) { lock(&self.panic).take() } else { None };
+        unsafe {
+            *self.task.get() = None;
+        }
+        self.meta.0.fetch_and(!RESERVED_BIT, Ordering::Release);
+        payload
     }
 }
 
@@ -381,20 +728,17 @@ struct Job {
     claimed: CachePadded<AtomicUsize>,
     finished: CachePadded<AtomicUsize>,
     waiter_sleeping: CachePadded<AtomicBool>,
+    done_lock: Mutex<()>,
+    done_cv: Condvar,
 }
 
 unsafe impl Send for Job {}
 unsafe impl Sync for Job {}
 
 impl Job {
-    fn new<'a>(task: &'a (dyn Fn(usize) + Sync + 'a), tasks_len: usize) -> Self {
+    fn new(task: &(dyn Fn(usize) + Sync), tasks_len: usize) -> Self {
         assert!(tasks_len >= 2);
-        let task: *const (dyn Fn(usize) + Sync + 'a) = task;
-        let task = unsafe {
-            std::mem::transmute::<*const (dyn Fn(usize) + Sync + 'a), *const (dyn Fn(usize) + Sync + 'static)>(
-                task,
-            )
-        };
+        let task = erase_task(task);
         assert!(!task.is_null());
         Self {
             task,
@@ -404,6 +748,8 @@ impl Job {
             claimed: CachePadded(AtomicUsize::new(0)),
             finished: CachePadded(AtomicUsize::new(0)),
             waiter_sleeping: CachePadded(AtomicBool::new(false)),
+            done_lock: Mutex::new(()),
+            done_cv: Condvar::new(),
         }
     }
 
@@ -420,25 +766,33 @@ impl Job {
 
 struct Queue {
     jobs: Vec<Arc<Job>>,
-    sleepers: usize,
     workers_len: usize,
 }
 
 struct Pool {
+    slots: Box<[Slot; SLOT_COUNT]>,
+    active_mask: CachePadded<AtomicU64>,
+    sleepers: CachePadded<AtomicUsize>,
+    overflow_len: CachePadded<AtomicUsize>,
     queue: Mutex<Queue>,
     wake: Condvar,
     parked: Condvar,
-    jobs_len: CachePadded<AtomicUsize>,
     workers_len: AtomicUsize,
 }
 
 fn pool() -> &'static Pool {
-    let pool = POOL.get_or_init(|| Pool {
-        queue: Mutex::new(Queue { jobs: Vec::new(), sleepers: 0, workers_len: 0 }),
-        wake: Condvar::new(),
-        parked: Condvar::new(),
-        jobs_len: CachePadded(AtomicUsize::new(0)),
-        workers_len: AtomicUsize::new(0),
+    let pool = POOL.get_or_init(|| {
+        let slots: Box<[Slot; SLOT_COUNT]> = Box::new(std::array::from_fn(|_| Slot::new()));
+        Box::new(Pool {
+            slots,
+            active_mask: CachePadded(AtomicU64::new(0)),
+            sleepers: CachePadded(AtomicUsize::new(0)),
+            overflow_len: CachePadded(AtomicUsize::new(0)),
+            queue: Mutex::new(Queue { jobs: Vec::new(), workers_len: 0 }),
+            wake: Condvar::new(),
+            parked: Condvar::new(),
+            workers_len: AtomicUsize::new(0),
+        })
     });
     let workers_needed = threads() - 1;
     if pool.workers_len.load(Ordering::Acquire) < workers_needed {
@@ -447,6 +801,18 @@ fn pool() -> &'static Pool {
     assert!(pool.workers_len.load(Ordering::Acquire) >= workers_needed);
     pool
 }
+
+#[cfg(target_os = "macos")]
+fn set_worker_qos() {
+    const QOS_CLASS_USER_INTERACTIVE: u32 = 0x21;
+    unsafe extern "C" {
+        fn pthread_set_qos_class_self_np(qos_class: u32, relative_priority: i32) -> i32;
+    }
+    let _ = unsafe { pthread_set_qos_class_self_np(QOS_CLASS_USER_INTERACTIVE, 0) };
+}
+
+#[cfg(not(target_os = "macos"))]
+fn set_worker_qos() {}
 
 fn is_active(worker: usize) -> bool {
     worker + 1 < threads()
@@ -473,52 +839,191 @@ impl Pool {
         self.parked.notify_all();
     }
 
-    fn push(&self, job: &Arc<Job>) {
-        assert!(!job.is_exhausted());
-        let (wakes, notify_all) = {
-            let mut queue = lock(&self.queue);
-            queue.jobs.push(Arc::clone(job));
-            self.jobs_len.0.store(queue.jobs.len(), Ordering::Release);
-            let wakes = queue.sleepers.min(job.tasks_len - 1);
-            (wakes, wakes > 1 && wakes == queue.sleepers)
+    fn wake_workers(&self, max_wakes: usize) {
+        assert!(max_wakes >= 1);
+        let sleepers = self.sleepers.0.load(Ordering::SeqCst);
+        if sleepers == 0 {
+            return;
+        }
+        let wakes = {
+            let _queue = lock(&self.queue);
+            let current = self.sleepers.0.load(Ordering::Relaxed);
+            let wakes = current.min(max_wakes);
+            (wakes, wakes > 1 && wakes == current)
         };
-        assert!(wakes < THREADS_MAX);
-        if notify_all {
+        assert!(wakes.0 < THREADS_MAX);
+        if wakes.1 {
             self.wake.notify_all();
         } else {
-            for _ in 0..wakes {
+            for _ in 0..wakes.0 {
                 self.wake.notify_one();
             }
         }
     }
 
-    fn take_job(&self, queue: &mut Queue) -> Option<Arc<Job>> {
+    fn acquire_slot(&self) -> Option<usize> {
+        assert_eq!(self.slots.len(), SLOT_COUNT);
+        for idx in 0..SLOT_COUNT {
+            let slot = &self.slots[idx];
+            let m = slot.meta.0.load(Ordering::Relaxed);
+            if m & (RESERVED_BIT | OPEN_BIT | REF_MASK) == 0
+                && slot
+                    .meta
+                    .0
+                    .compare_exchange(m, m | RESERVED_BIT, Ordering::Acquire, Ordering::Relaxed)
+                    .is_ok()
+            {
+                return Some(idx);
+            }
+        }
+        assert!(self.workers_len.load(Ordering::Relaxed) < THREADS_MAX);
+        None
+    }
+
+    fn run_slot(&self, idx: usize, tasks_len: usize, task: &(dyn Fn(usize) + Sync)) {
+        assert!(idx < SLOT_COUNT);
+        assert!(tasks_len >= 2);
+        let slot = &self.slots[idx];
+        slot.init(task, tasks_len);
+        slot.meta.0.fetch_add(OPEN_BIT + GEN_UNIT, Ordering::Release);
+        self.active_mask.0.fetch_or(1u64 << idx, Ordering::SeqCst);
+        if self.sleepers.0.load(Ordering::SeqCst) > 0 {
+            self.wake_workers(tasks_len - 1);
+        }
+        slot.execute_body(&self.active_mask, idx);
+        slot.close(&self.active_mask, idx);
+        self.help_slot_until_done(idx);
+        let payload = slot.finish_and_release(&self.active_mask, idx, tasks_len);
+        if let Some(payload) = payload {
+            panic::resume_unwind(payload);
+        }
+    }
+
+    fn try_join_slot(&self, skip: Option<usize>) -> Option<usize> {
+        assert!(skip.is_none_or(|s| s < SLOT_COUNT));
+        let mut mask = self.active_mask.0.load(Ordering::Acquire);
+        if let Some(skip_idx) = skip {
+            mask &= !(1u64 << skip_idx);
+        }
+        for _ in 0..SLOT_COUNT {
+            if mask == 0 {
+                break;
+            }
+            let idx = 63 - mask.leading_zeros() as usize;
+            mask &= !(1u64 << idx);
+            let slot = &self.slots[idx];
+            let mut m = slot.meta.0.load(Ordering::Acquire);
+            for _ in 0..THREADS_MAX {
+                if m & OPEN_BIT == 0 {
+                    break;
+                }
+                match slot.meta.0.compare_exchange_weak(m, m + REF_UNIT, Ordering::Acquire, Ordering::Relaxed)
+                {
+                    Ok(_) => return Some(idx),
+                    Err(actual) => m = actual,
+                }
+            }
+        }
+        assert!(mask == 0);
+        None
+    }
+
+    fn execute_slot_worker(&self, idx: usize) {
+        assert!(idx < SLOT_COUNT);
+        let slot = &self.slots[idx];
+        slot.execute_body(&self.active_mask, idx);
+        let prev = slot.meta.0.fetch_sub(REF_UNIT, Ordering::SeqCst);
+        assert!(prev & REF_MASK >= REF_UNIT);
+        if (prev - REF_UNIT) & REF_MASK == 0 && slot.owner_sleeping.0.load(Ordering::SeqCst) {
+            let _guard = lock(&slot.done_lock);
+            slot.done_cv.notify_one();
+        }
+    }
+
+    fn help_slot_until_done(&self, idx: usize) {
+        assert!(idx < SLOT_COUNT);
+        let slot = &self.slots[idx];
+        let mut idle_rounds = 0usize;
+        while slot.meta.0.load(Ordering::Acquire) & REF_MASK != 0 {
+            if self.try_help_any(Some(idx)) {
+                idle_rounds = 0;
+            } else if idle_rounds < SPIN_PAUSE_ROUNDS {
+                idle_rounds += 1;
+                std::hint::spin_loop();
+            } else if idle_rounds < SPIN_PAUSE_ROUNDS + SPIN_YIELD_ROUNDS {
+                idle_rounds += 1;
+                thread::yield_now();
+            } else {
+                self.sleep_slot_done(idx);
+                idle_rounds = 0;
+            }
+        }
+        assert_eq!(slot.meta.0.load(Ordering::Acquire) & REF_MASK, 0);
+    }
+
+    fn sleep_slot_done(&self, idx: usize) {
+        assert!(idx < SLOT_COUNT);
+        let slot = &self.slots[idx];
+        let mut guard = lock(&slot.done_lock);
+        slot.owner_sleeping.0.store(true, Ordering::SeqCst);
+        if slot.meta.0.load(Ordering::SeqCst) & REF_MASK != 0 {
+            guard = wait(&slot.done_cv, guard);
+        }
+        slot.owner_sleeping.0.store(false, Ordering::Relaxed);
+        drop(guard);
+        assert!(idx < 64);
+    }
+
+    fn run_overflow(&self, tasks_len: usize, task: &(dyn Fn(usize) + Sync)) {
+        assert!(tasks_len >= 2);
+        let job = Arc::new(Job::new(task, tasks_len));
+        {
+            let mut queue = lock(&self.queue);
+            queue.jobs.push(Arc::clone(&job));
+            self.overflow_len.0.store(queue.jobs.len(), Ordering::SeqCst);
+        }
+        if self.sleepers.0.load(Ordering::SeqCst) > 0 {
+            self.wake_workers(tasks_len - 1);
+        }
+        self.execute_overflow(&job);
+        self.prune_overflow();
+        self.help_overflow_until_finished(&job);
+        assert!(job.is_finished());
+        if job.panicked.load(Ordering::Acquire) {
+            let payload = lock(&job.panic).take();
+            if let Some(payload) = payload {
+                panic::resume_unwind(payload);
+            }
+        }
+    }
+
+    fn take_overflow_job(&self, queue: &mut Queue) -> Option<Arc<Job>> {
         if queue.jobs.first().is_some_and(|job| job.is_exhausted()) {
             queue.jobs.retain(|job| !job.is_exhausted());
-            self.jobs_len.0.store(queue.jobs.len(), Ordering::Release);
+            self.overflow_len.0.store(queue.jobs.len(), Ordering::Release);
         }
-        let job = queue.jobs.first().cloned();
+        let job = queue.jobs.last().cloned();
         assert!(job.as_ref().is_none_or(|job| job.tasks_len >= 2));
         job
     }
 
-    fn prune(&self) {
-        if self.jobs_len.0.load(Ordering::Acquire) == 0 {
+    fn prune_overflow(&self) {
+        if self.overflow_len.0.load(Ordering::Acquire) == 0 {
             return;
         }
         let mut queue = lock(&self.queue);
         queue.jobs.retain(|job| !job.is_exhausted());
-        self.jobs_len.0.store(queue.jobs.len(), Ordering::Release);
+        self.overflow_len.0.store(queue.jobs.len(), Ordering::Release);
     }
 
-    fn try_take_job(&self) -> Option<Arc<Job>> {
-        if self.jobs_len.0.load(Ordering::Acquire) == 0 {
+    fn try_take_overflow(&self) -> Option<Arc<Job>> {
+        if self.overflow_len.0.load(Ordering::Acquire) == 0 {
             return None;
         }
-        self.take_job(&mut lock(&self.queue))
+        self.take_overflow_job(&mut lock(&self.queue))
     }
 
-    fn execute(&self, job: &Job) {
+    fn execute_overflow(&self, job: &Job) {
         assert!(job.tasks_len >= 2);
         let mut completed = 0usize;
         for _ in 0..job.tasks_len {
@@ -540,72 +1045,17 @@ impl Pool {
             let finished = job.finished.0.fetch_add(completed, Ordering::SeqCst) + completed;
             assert!(finished <= job.tasks_len);
             if finished == job.tasks_len && job.waiter_sleeping.0.load(Ordering::SeqCst) {
-                let _queue = lock(&self.queue);
-                self.wake.notify_all();
+                let _guard = lock(&job.done_lock);
+                job.done_cv.notify_one();
             }
         }
     }
 
-    fn work_forever(&self, worker: usize) {
-        assert!(worker < THREADS_MAX);
-        loop {
-            let job = self.next_job(worker);
-            self.execute(&job);
-        }
-    }
-
-    fn spin_for_job(&self, worker: usize) -> Option<Arc<Job>> {
-        assert!(worker < THREADS_MAX);
-        if !is_active(worker) {
-            return None;
-        }
-        for _ in 0..SPIN_PAUSE_ROUNDS {
-            if let Some(job) = self.try_take_job() {
-                return Some(job);
-            }
-            std::hint::spin_loop();
-        }
-        for _ in 0..SPIN_YIELD_ROUNDS {
-            if !is_active(worker) {
-                return None;
-            }
-            if let Some(job) = self.try_take_job() {
-                return Some(job);
-            }
-            thread::yield_now();
-        }
-        assert!(worker < THREADS_MAX);
-        None
-    }
-
-    fn next_job(&self, worker: usize) -> Arc<Job> {
-        assert!(worker < THREADS_MAX);
-        if let Some(job) = self.spin_for_job(worker) {
-            return job;
-        }
-        let mut queue = lock(&self.queue);
-        loop {
-            if !is_active(worker) {
-                queue = wait(&self.parked, queue);
-                continue;
-            }
-            if let Some(job) = self.take_job(&mut queue) {
-                assert!(!job.is_exhausted() || job.tasks_len >= 2);
-                return job;
-            }
-            assert!(queue.sleepers < THREADS_MAX);
-            queue.sleepers += 1;
-            queue = wait(&self.wake, queue);
-            queue.sleepers -= 1;
-        }
-    }
-
-    fn help_until_finished(&self, job: &Job) {
+    fn help_overflow_until_finished(&self, job: &Job) {
         assert!(job.tasks_len >= 2);
-        let mut idle_rounds = 0;
+        let mut idle_rounds = 0usize;
         while !job.is_finished() {
-            if let Some(other) = self.try_take_job() {
-                self.execute(&other);
+            if self.try_help_any(None) {
                 idle_rounds = 0;
             } else if idle_rounds < SPIN_PAUSE_ROUNDS {
                 idle_rounds += 1;
@@ -614,25 +1064,88 @@ impl Pool {
                 idle_rounds += 1;
                 thread::yield_now();
             } else {
-                self.sleep_until_ready(job);
+                let mut guard = lock(&job.done_lock);
+                job.waiter_sleeping.0.store(true, Ordering::SeqCst);
+                if !job.is_finished() {
+                    guard = wait(&job.done_cv, guard);
+                }
+                job.waiter_sleeping.0.store(false, Ordering::Relaxed);
+                drop(guard);
                 idle_rounds = 0;
             }
         }
         assert!(job.is_exhausted());
     }
 
-    fn sleep_until_ready(&self, job: &Job) {
-        let mut queue = lock(&self.queue);
-        if self.take_job(&mut queue).is_some() {
-            return;
+    fn try_help_any(&self, skip: Option<usize>) -> bool {
+        if let Some(idx) = self.try_join_slot(skip) {
+            self.execute_slot_worker(idx);
+            return true;
         }
-        job.waiter_sleeping.0.store(true, Ordering::SeqCst);
-        if job.is_finished() {
-            return;
+        if let Some(job) = self.try_take_overflow() {
+            self.execute_overflow(&job);
+            return true;
         }
-        queue.sleepers += 1;
-        queue = wait(&self.wake, queue);
-        queue.sleepers -= 1;
-        assert!(queue.workers_len < THREADS_MAX);
+        false
+    }
+
+    fn spin_for_work(&self, worker: usize) -> bool {
+        assert!(worker < THREADS_MAX);
+        if !is_active(worker) {
+            return false;
+        }
+        for round in 0..SPIN_PAUSE_ROUNDS {
+            if self.try_help_any(None) {
+                return true;
+            }
+            if round % SPIN_CHECK_STRIDE == SPIN_CHECK_STRIDE - 1 && !is_active(worker) {
+                return false;
+            }
+            std::hint::spin_loop();
+        }
+        for _ in 0..SPIN_YIELD_ROUNDS {
+            if !is_active(worker) {
+                return false;
+            }
+            if self.try_help_any(None) {
+                return true;
+            }
+            thread::yield_now();
+        }
+        assert!(worker < THREADS_MAX);
+        false
+    }
+
+    fn work_forever(&self, worker: usize) {
+        assert!(worker < THREADS_MAX);
+        set_worker_qos();
+        loop {
+            if self.spin_for_work(worker) {
+                continue;
+            }
+            let mut queue = lock(&self.queue);
+            loop {
+                if !is_active(worker) {
+                    queue = wait(&self.parked, queue);
+                    continue;
+                }
+                self.sleepers.0.fetch_add(1, Ordering::SeqCst);
+                let has_work = self.active_mask.0.load(Ordering::SeqCst) != 0
+                    || self.overflow_len.0.load(Ordering::SeqCst) != 0;
+                if has_work {
+                    self.sleepers.0.fetch_sub(1, Ordering::SeqCst);
+                    drop(queue);
+                    break;
+                }
+                queue = wait(&self.wake, queue);
+                self.sleepers.0.fetch_sub(1, Ordering::SeqCst);
+                if self.active_mask.0.load(Ordering::Acquire) != 0
+                    || self.overflow_len.0.load(Ordering::Acquire) != 0
+                {
+                    drop(queue);
+                    break;
+                }
+            }
+        }
     }
 }

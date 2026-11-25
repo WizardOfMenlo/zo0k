@@ -34,7 +34,7 @@ pub use reed_solomon::RsField;
 pub use rng::Rng;
 pub use witness::Witness;
 
-use claim::{ProverClaim, VerifierClaim};
+use claim::{EqFactor, ProverClaim, VerifierClaim};
 use code_switch::CodeSwitch;
 use std::marker::PhantomData;
 use transcript::{ProverTranscript, VerifierTranscript};
@@ -91,6 +91,38 @@ impl<F: RsField, H: Hasher> Protocol<F, H> {
         Ok((Commitment(witness.oracle.root()), witness))
     }
 
+    fn prove_single_stage(
+        &self,
+        mut transcript: ProverTranscript<H>,
+        folded_claim: &claim::EqFoldedClaim<F>,
+        row: &witness::Row<F>,
+        mask: &witness::Row<F>,
+        oracle: &oracle::Oracle<F>,
+        spent_main: Vec<F>,
+    ) -> Proof {
+        let first = &self.layout.stages[0];
+        assert_eq!(self.layout.stages.len(), 1);
+        assert_eq!(row.main.len(), first.main_len);
+        let mask_eval = folded_claim.scale * folded_claim.eq.inner_product(&mask.main)
+            + polynomial::inner_product(&folded_claim.mask, &mask.mask);
+        let (_, proof) = parallel::join(
+            || drop(spent_main),
+            || {
+                base_case::prove_with_mask_eval(
+                    &mut transcript,
+                    &self.parameters,
+                    first,
+                    mask_eval,
+                    row,
+                    mask,
+                    oracle,
+                );
+                Proof(transcript.finish())
+            },
+        );
+        proof
+    }
+
     pub fn prove(
         &self,
         commitment: &Commitment,
@@ -110,13 +142,13 @@ impl<F: RsField, H: Hasher> Protocol<F, H> {
         let first = &stages[0];
         let (prefix, suffix) = point.split_at(first.folding);
         let eq_prefix = polynomial::eq_table(prefix);
-        let eq_suffix = polynomial::eq_table(suffix);
-        let row_dots = sumcheck::row_inner_products(&witness.message.main, &eq_suffix, first.rows());
+        let eq_suffix = EqFactor::new(suffix);
+        let row_dots = sumcheck::row_inner_products_factored(&witness.message.main, &eq_suffix, first.rows());
         let value = polynomial::inner_product(&eq_prefix, &row_dots);
         let mut transcript = ProverTranscript::new(&self.statement(commitment, point, value));
         let Witness { message, oracle, base_case_mask } = witness;
         let StageParameters { sumcheck_pow_bits, ood_pow_bits, .. } = self.parameters.stages[0];
-        let (folded_claim, row, challenges) = sumcheck::prove_evaluation(
+        let (folded_claim, row, challenges, spent_main) = sumcheck::prove_evaluation(
             &mut transcript,
             eq_prefix,
             eq_suffix,
@@ -127,49 +159,89 @@ impl<F: RsField, H: Hasher> Protocol<F, H> {
         );
         let Some(next) = stages.get(1) else {
             let mask = base_case_mask.expect("the last oracle carries the mask of the base case");
-            base_case::prove(&mut transcript, &self.parameters, first, &folded_claim, &row, &mask, &oracle);
-            return Ok((value, Proof(transcript.finish())));
+            let proof = self.prove_single_stage(transcript, &folded_claim, &row, &mask, &oracle, spent_main);
+            return Ok((value, proof));
         };
-        let next_is_last = stages.len() == 2;
         let switch = CodeSwitch {
             source: first,
             next,
-            next_is_last,
+            next_is_last: stages.len() == 2,
             ood_pow_bits,
             query_pow_bits: self.parameters.pow_bits,
         };
-        let (claim, witness) = switch.prove(&mut transcript, folded_claim, row, &oracle, &challenges, rng);
-        Ok((value, self.prove_remaining(transcript, claim, witness, 1, rng)))
+        let (_, (opened, next_witness)) = parallel::join(
+            || drop(spent_main),
+            || switch.commit_and_open(&mut transcript, row, &oracle, rng),
+        );
+        let (_, proof) = parallel::join(
+            || drop(oracle),
+            || {
+                let (claim, round0) =
+                    switch.finish_from_eq(&folded_claim, &opened, &challenges, &next_witness.message.main);
+                self.prove_remaining(transcript, claim, round0, next_witness, 1, rng)
+            },
+        );
+        Ok((value, proof))
     }
 
     fn prove_remaining(
         &self,
         mut transcript: ProverTranscript<H>,
-        mut claim: ProverClaim<F>,
-        mut witness: Witness<F>,
-        start_stage: usize,
+        claim: ProverClaim<F>,
+        round0: (F, F),
+        witness: Witness<F>,
+        stage_index: usize,
         rng: &mut Rng,
     ) -> Proof {
         let parameters = &self.parameters;
         let stages = &self.layout.stages;
-        assert!(start_stage < stages.len());
+        assert!(stage_index < stages.len());
         assert_eq!(stages.len(), parameters.stages.len());
-        for (index, stage) in stages.iter().enumerate().skip(start_stage) {
-            let Witness { message, oracle, base_case_mask } = witness;
-            let StageParameters { sumcheck_pow_bits, ood_pow_bits, .. } = parameters.stages[index];
-            let (folded_claim, row, challenges) =
-                sumcheck::prove(&mut transcript, claim, message, sumcheck_pow_bits);
-            let Some(next) = stages.get(index + 1) else {
-                let mask = base_case_mask.expect("the last oracle carries the mask of the base case");
-                base_case::prove(&mut transcript, parameters, stage, &folded_claim, &row, &mask, &oracle);
-                break;
-            };
-            let next_is_last = index + 2 == stages.len();
-            let query_pow_bits = parameters.pow_bits;
-            let switch = CodeSwitch { source: stage, next, next_is_last, ood_pow_bits, query_pow_bits };
-            (claim, witness) = switch.prove(&mut transcript, folded_claim, row, &oracle, &challenges, rng);
-        }
-        Proof(transcript.finish())
+        let stage = &stages[stage_index];
+        let Witness { message, oracle, base_case_mask } = witness;
+        let StageParameters { sumcheck_pow_bits, ood_pow_bits, .. } = parameters.stages[stage_index];
+        let (folded_claim, main_scale, row, challenges) =
+            sumcheck::prove_inner(&mut transcript, claim, message, sumcheck_pow_bits, Some(round0), false);
+        let Some(next) = stages.get(stage_index + 1) else {
+            let mask = base_case_mask.expect("the last oracle carries the mask of the base case");
+            let mask_eval = main_scale * polynomial::inner_product(&folded_claim.main, &mask.main)
+                + polynomial::inner_product(&folded_claim.aux, &mask.aux)
+                + polynomial::inner_product(&folded_claim.mask, &mask.mask);
+            let (_, proof) = parallel::join(
+                || drop(folded_claim),
+                || {
+                    base_case::prove_with_mask_eval(
+                        &mut transcript,
+                        parameters,
+                        stage,
+                        mask_eval,
+                        &row,
+                        &mask,
+                        &oracle,
+                    );
+                    Proof(transcript.finish())
+                },
+            );
+            return proof;
+        };
+        let next_is_last = stage_index + 2 == stages.len();
+        let query_pow_bits = parameters.pow_bits;
+        let switch = CodeSwitch { source: stage, next, next_is_last, ood_pow_bits, query_pow_bits };
+        let (opened, next_witness) = switch.commit_and_open(&mut transcript, row, &oracle, rng);
+        let (_, proof) = parallel::join(
+            || drop(oracle),
+            || {
+                let (next_claim, next_round0) = switch.finish_from_dense(
+                    folded_claim,
+                    main_scale,
+                    &opened,
+                    &challenges,
+                    &next_witness.message.main,
+                );
+                self.prove_remaining(transcript, next_claim, next_round0, next_witness, stage_index + 1, rng)
+            },
+        );
+        proof
     }
 
     pub fn verify(&self, commitment: &Commitment, point: &[F], value: F, proof: &Proof) -> Result<()> {
@@ -184,7 +256,8 @@ impl<F: RsField, H: Hasher> Protocol<F, H> {
         }
         let statement = self.statement(commitment, point, value);
         let mut transcript = VerifierTranscript::<H>::new(&statement, &proof.0);
-        let mut claim = VerifierClaim::evaluation(point, value);
+        let min_vars = self.layout.last().main_len.trailing_zeros() as usize;
+        let mut claim = VerifierClaim::evaluation_with_min_vars(point, value, min_vars);
         let mut root = commitment.0;
         for (index, stage) in stages.iter().enumerate() {
             let StageParameters { sumcheck_pow_bits, ood_pow_bits, .. } = parameters.stages[index];

@@ -8,6 +8,27 @@ use crate::reed_solomon::RsField;
 use crate::transcript::{Challenges, ProverTranscript, VerifierTranscript};
 use crate::witness::Row;
 
+pub(crate) fn prove_with_mask_eval<F: RsField, H: Hasher>(
+    transcript: &mut ProverTranscript<H>,
+    parameters: &Parameters,
+    stage: &Stage,
+    mask_eval: F,
+    row: &Row<F>,
+    mask: &Row<F>,
+    oracle: &Oracle<F>,
+) {
+    assert_eq!(row.main.len(), stage.main_len);
+    assert_eq!(mask.main.len(), stage.main_len);
+    transcript.send_field(mask_eval);
+    transcript.prove_work(parameters.base_case_pow_bits);
+    let combination = transcript.challenge_field();
+    transcript.send_fields(&mask.add_scaled(row, combination).to_fields());
+
+    transcript.prove_work(parameters.pow_bits);
+    let positions = transcript.challenge_positions(stage.domain_size, stage.queries);
+    oracle.open(transcript, &positions, stage.rows());
+}
+
 pub fn prove<F: RsField, H: Hasher>(
     transcript: &mut ProverTranscript<H>,
     parameters: &Parameters,
@@ -17,14 +38,7 @@ pub fn prove<F: RsField, H: Hasher>(
     mask: &Row<F>,
     oracle: &Oracle<F>,
 ) {
-    transcript.send_field(claim.evaluate(mask));
-    transcript.prove_work(parameters.base_case_pow_bits);
-    let combination = transcript.challenge_field();
-    transcript.send_fields(&mask.add_scaled(row, combination).to_fields());
-
-    transcript.prove_work(parameters.pow_bits);
-    let positions = transcript.challenge_positions(stage.domain_size, stage.queries);
-    oracle.open(transcript, &positions, stage.rows());
+    prove_with_mask_eval(transcript, parameters, stage, claim.evaluate(mask), row, mask, oracle);
 }
 
 pub fn verify<F: RsField, H: Hasher>(
@@ -53,7 +67,7 @@ pub fn verify<F: RsField, H: Hasher>(
     let polynomial = disclosed.polynomial();
     let weights = eq_table(fold_challenges);
     let mask_symbol = |position: usize, column: &[F]| {
-        let folded = inner_product(column, &weights);
+        let folded = F::inner_product_slice(column, &weights);
         vec![F::evaluate_at(&polynomial, position) - folded * combination]
     };
     Opening::read(transcript, root, stage.domain_size, &positions, stage.rows(), mask_symbol)?;

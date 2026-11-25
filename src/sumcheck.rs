@@ -1,5 +1,8 @@
-use crate::claim::{Claim, FoldedClaim, ProverClaim, ProverFoldedClaim, VerifierClaim, VerifierFoldedClaim};
-use crate::error::Result;
+use crate::claim::{
+    Claim, EqFactor, EqFoldedClaim, FoldedClaim, ProverClaim, ProverFoldedClaim, VerifierClaim,
+    VerifierFoldedClaim, l1_tile_len,
+};
+use crate::error::{Error, Result};
 use crate::field::Field;
 use crate::hash::Hasher;
 use crate::mask;
@@ -9,64 +12,67 @@ use crate::transcript::{Challenges, ProverTranscript, VerifierTranscript};
 use crate::witness::{Message, Row};
 use std::mem::MaybeUninit;
 
-const PARALLEL_THRESHOLD: usize = 1 << 14;
-const PIECE_MIN: usize = 1 << 12;
-const L1_TILE: usize = 1 << 11;
-const FUSED_TILE: usize = 1 << 9;
+const PARALLEL_THRESHOLD: usize = 1 << 12;
+const PIECE_MIN: usize = 1 << 11;
+const FUSED_TILE_BYTES: usize = 8192;
+const FUSED_TILE_MAX: usize = 512;
+
+const fn fused_tile_len<F: Field>() -> usize {
+    let elems = FUSED_TILE_BYTES / F::BYTES;
+    if elems > FUSED_TILE_MAX {
+        FUSED_TILE_MAX
+    } else if elems < 64 {
+        64
+    } else {
+        elems
+    }
+}
 
 fn evaluate_round<F: Field>(target: F, constant: F, quadratic: F, challenge: F) -> F {
     let linear = target - F::from_integer(2) * constant - quadratic;
     constant + (linear + quadratic * challenge) * challenge
 }
 
-fn accumulate_row_dots_range<F: Field>(
-    table: &[F],
-    eq_suffix: &[F],
-    rows: usize,
-    start: usize,
-    end: usize,
-) -> Vec<F> {
-    let width = eq_suffix.len();
-    assert!(start <= end && end <= width);
+pub(crate) fn row_inner_products_factored<F: Field>(table: &[F], eq: &EqFactor<F>, rows: usize) -> Vec<F> {
+    let tile_len = eq.lo.len();
+    let tiles_per_row = eq.hi.len();
+    let width = tile_len * tiles_per_row;
     assert_eq!(table.len(), rows * width);
-    let mut dots = vec![F::ZERO; rows];
-    let mut offset = start;
-    while offset < end {
-        let stop = (offset + L1_TILE).min(end);
-        let eq_tile = &eq_suffix[offset..stop];
-        for (r, dot) in dots.iter_mut().enumerate() {
-            *dot += F::inner_product_slice(eq_tile, &table[r * width + offset..r * width + stop]);
-        }
-        offset = stop;
-    }
-    dots
-}
-
-pub(crate) fn row_inner_products<F: Field>(table: &[F], eq_suffix: &[F], rows: usize) -> Vec<F> {
-    let width = eq_suffix.len();
-    assert_eq!(table.len(), rows * width);
-    assert!(rows >= 1);
-    if width == 0 {
-        return vec![F::ZERO; rows];
-    }
-    if width >= PIECE_MIN {
-        let partials = parallel::map_pieces(width, PIECE_MIN, |range| {
-            accumulate_row_dots_range(table, eq_suffix, rows, range.start, range.end)
-        });
+    assert!(rows >= 1 && width >= 1);
+    let total_tiles = rows * tiles_per_row;
+    if table.len() < PARALLEL_THRESHOLD || total_tiles < 2 {
         let mut dots = vec![F::ZERO; rows];
-        for partial in partials {
-            for (d, p) in dots.iter_mut().zip(partial) {
-                *d += p;
+        for (r, dot) in dots.iter_mut().enumerate() {
+            let row = &table[r * width..(r + 1) * width];
+            let mut sum = F::ZERO;
+            for (t, &w) in eq.hi.iter().enumerate() {
+                sum += w * F::inner_product_slice(&eq.lo, &row[t * tile_len..(t + 1) * tile_len]);
             }
+            *dot = sum;
         }
         return dots;
     }
-    if table.len() >= PARALLEL_THRESHOLD {
-        return parallel::map_range(rows, 1, |r| {
-            F::inner_product_slice(eq_suffix, &table[r * width..(r + 1) * width])
-        });
+    let tiles_min = PIECE_MIN.div_ceil(tile_len).max(1);
+    let partials = parallel::fold_pieces(
+        total_tiles,
+        tiles_min,
+        || vec![F::ZERO; rows],
+        |dots, range| {
+            for g in range {
+                let r = g / tiles_per_row;
+                let t = g % tiles_per_row;
+                let off = g * tile_len;
+                dots[r] += eq.hi[t] * F::inner_product_slice(&eq.lo, &table[off..off + tile_len]);
+            }
+        },
+    );
+    let mut dots = vec![F::ZERO; rows];
+    for partial in partials {
+        for (d, p) in dots.iter_mut().zip(partial) {
+            *d += p;
+        }
     }
-    accumulate_row_dots_range(table, eq_suffix, rows, 0, width)
+    dots
 }
 
 fn fold_rows_tile_uninit<F: Field>(
@@ -97,11 +103,12 @@ fn fold_rows_parallel<F: Field>(table: &[F], weights: &[F]) -> Vec<F> {
     if width == 0 {
         return Vec::new();
     }
+    let tile_len = l1_tile_len::<F>();
     let mut folded: Vec<F> = Vec::with_capacity(width);
     let spare = &mut folded.spare_capacity_mut()[..width];
     let process = |piece_start: usize, piece: &mut [MaybeUninit<F>]| {
-        for (index, tile) in piece.chunks_mut(L1_TILE).enumerate() {
-            fold_rows_tile_uninit(table, weights, width, piece_start + index * L1_TILE, tile);
+        for (index, tile) in piece.chunks_mut(tile_len).enumerate() {
+            fold_rows_tile_uninit(table, weights, width, piece_start + index * tile_len, tile);
         }
     };
     if table.len() < PARALLEL_THRESHOLD || width < PIECE_MIN {
@@ -116,29 +123,13 @@ fn fold_rows_parallel<F: Field>(table: &[F], weights: &[F]) -> Vec<F> {
 
 fn scale_chunk_in_place<F: Field>(slice: &mut [F], scale: F) {
     assert!(slice.len() <= isize::MAX as usize);
-    let mut buf = [F::ZERO; FUSED_TILE];
-    for chunk in slice.chunks_mut(FUSED_TILE) {
+    let tile = fused_tile_len::<F>();
+    let mut buf = [F::ZERO; FUSED_TILE_MAX];
+    for chunk in slice.chunks_mut(tile) {
         let len = chunk.len();
         buf[..len].fill(F::ZERO);
         F::add_scaled_slice(&mut buf[..len], chunk, scale);
         chunk.copy_from_slice(&buf[..len]);
-    }
-    assert!(slice.len() < usize::MAX);
-}
-
-fn scale_slice_in_place<F: Field>(slice: &mut [F], scale: F) {
-    assert!(slice.len() <= isize::MAX as usize);
-    if scale == F::ONE {
-        return;
-    }
-    if scale == F::ZERO {
-        slice.fill(F::ZERO);
-        return;
-    }
-    if slice.len() < PARALLEL_THRESHOLD {
-        scale_chunk_in_place(slice, scale);
-    } else {
-        parallel::for_each_piece_mut(slice, PIECE_MIN, |_, piece| scale_chunk_in_place(piece, scale));
     }
     assert!(slice.len() < usize::MAX);
 }
@@ -151,39 +142,41 @@ fn fused_fold_and_round<F: Field>(a: &mut Vec<F>, b: &mut Vec<F>, challenge: F) 
     }
     let half = a.len() / 2;
     let quarter = half / 2;
+    let tile = fused_tile_len::<F>();
     let (a_dst, a_src) = a.split_at_mut(half);
     let (b_dst, b_src) = b.split_at_mut(half);
     let (a0, a1) = a_dst.split_at_mut(quarter);
     let (b0, b1) = b_dst.split_at_mut(quarter);
     let (a2, a3) = a_src.split_at(quarter);
     let (b2, b3) = b_src.split_at(quarter);
-    let kernel = |start: usize, s_a0: &mut [F], s_a1: &mut [F], s_b0: &mut [F], s_b1: &mut [F]| {
-        let (mut c, mut q) = (F::ZERO, F::ZERO);
-        let len = s_a0.len();
-        let mut offset = 0;
-        while offset < len {
-            let stop = (offset + FUSED_TILE).min(len);
-            let src = start + offset..start + stop;
-            F::fold_slice(&mut s_a0[offset..stop], &a2[src.clone()], challenge);
-            F::fold_slice(&mut s_a1[offset..stop], &a3[src.clone()], challenge);
-            F::fold_slice(&mut s_b0[offset..stop], &b2[src.clone()], challenge);
-            F::fold_slice(&mut s_b1[offset..stop], &b3[src], challenge);
-            let (tc, tq) = F::round_coefficients_slice(
-                &s_a0[offset..stop],
-                &s_a1[offset..stop],
-                &s_b0[offset..stop],
-                &s_b1[offset..stop],
-            );
-            c += tc;
-            q += tq;
-            offset = stop;
-        }
-        (c, q)
-    };
+    let kernel =
+        |acc: &mut (F, F), start: usize, s_a0: &mut [F], s_a1: &mut [F], s_b0: &mut [F], s_b1: &mut [F]| {
+            let len = s_a0.len();
+            let mut offset = 0;
+            while offset < len {
+                let stop = (offset + tile).min(len);
+                let src = start + offset..start + stop;
+                F::fold_slice(&mut s_a0[offset..stop], &a2[src.clone()], challenge);
+                F::fold_slice(&mut s_a1[offset..stop], &a3[src.clone()], challenge);
+                F::fold_slice(&mut s_b0[offset..stop], &b2[src.clone()], challenge);
+                F::fold_slice(&mut s_b1[offset..stop], &b3[src], challenge);
+                let (tc, tq) = F::round_coefficients_slice(
+                    &s_a0[offset..stop],
+                    &s_a1[offset..stop],
+                    &s_b0[offset..stop],
+                    &s_b1[offset..stop],
+                );
+                acc.0 += tc;
+                acc.1 += tq;
+                offset = stop;
+            }
+        };
     let result = if quarter < PARALLEL_THRESHOLD {
-        kernel(0, a0, a1, b0, b1)
+        let mut acc = (F::ZERO, F::ZERO);
+        kernel(&mut acc, 0, a0, a1, b0, b1);
+        acc
     } else {
-        parallel::map_four_mut(a0, a1, b0, b1, PIECE_MIN, kernel)
+        parallel::fold_four_mut(a0, a1, b0, b1, PIECE_MIN, || (F::ZERO, F::ZERO), kernel)
             .into_iter()
             .fold((F::ZERO, F::ZERO), |x, y| (x.0 + y.0, x.1 + y.1))
     };
@@ -192,13 +185,14 @@ fn fused_fold_and_round<F: Field>(a: &mut Vec<F>, b: &mut Vec<F>, challenge: F) 
     result
 }
 
-fn fold_pair_scaled<F: Field>(form: &mut Vec<F>, values: &mut Vec<F>, challenge: F, batching: F) {
+fn fold_pair<F: Field>(form: &mut Vec<F>, values: &mut Vec<F>, challenge: F, scale_form: Option<F>) {
     assert_eq!(form.len(), values.len());
     assert!(form.len().is_multiple_of(2));
     if form.is_empty() {
         return;
     }
     let half = form.len() / 2;
+    let tile = fused_tile_len::<F>();
     let (f_lo, f_hi) = form.split_at_mut(half);
     let (v_lo, v_hi) = values.split_at_mut(half);
     let f_hi = &*f_hi;
@@ -207,10 +201,12 @@ fn fold_pair_scaled<F: Field>(form: &mut Vec<F>, values: &mut Vec<F>, challenge:
         let len = fl.len();
         let mut offset = 0;
         while offset < len {
-            let stop = (offset + FUSED_TILE).min(len);
+            let stop = (offset + tile).min(len);
             let src = start + offset..start + stop;
             F::fold_slice(&mut fl[offset..stop], &f_hi[src.clone()], challenge);
-            scale_chunk_in_place(&mut fl[offset..stop], batching);
+            if let Some(batching) = scale_form {
+                scale_chunk_in_place(&mut fl[offset..stop], batching);
+            }
             F::fold_slice(&mut vl[offset..stop], &v_hi[src], challenge);
             offset = stop;
         }
@@ -227,12 +223,12 @@ fn fold_pair_scaled<F: Field>(form: &mut Vec<F>, values: &mut Vec<F>, challenge:
 pub(crate) fn prove_evaluation<F: Field, H: Hasher>(
     transcript: &mut ProverTranscript<H>,
     mut eq_prefix: Vec<F>,
-    mut eq_suffix: Vec<F>,
+    eq_suffix: EqFactor<F>,
     mut row_dots: Vec<F>,
     target_value: F,
     message: Message<F>,
     pow_bits: u32,
-) -> (ProverFoldedClaim<F>, Row<F>, Vec<F>) {
+) -> (EqFoldedClaim<F>, Row<F>, Vec<F>, Vec<F>) {
     let Message { main, aux, mask, seeds } = message;
     let folding = mask.folding();
     assert!(aux.is_empty());
@@ -264,26 +260,31 @@ pub(crate) fn prove_evaluation<F: Field, H: Hasher>(
     }
 
     assert_eq!(eq_prefix.len(), 1);
-    scale_slice_in_place(&mut eq_suffix, eq_prefix[0] * batching);
     let weights = eq_table(&challenges);
     let folded_main = fold_rows_parallel(&main, &weights);
-    let folded_claim =
-        FoldedClaim { main: eq_suffix, aux: Vec::new(), mask: mask::linear_form(&challenges), target };
+    let folded_claim = EqFoldedClaim {
+        eq: eq_suffix,
+        scale: eq_prefix[0] * batching,
+        mask: mask::linear_form(&challenges),
+        target,
+    };
     let folded_row = Row {
         main: folded_main,
         aux: Vec::new(),
         mask: mask.fold(&challenges),
         seed: fold_rows(&seeds, &weights),
     };
-    (folded_claim, folded_row, challenges)
+    (folded_claim, folded_row, challenges, main)
 }
 
-pub fn prove<F: Field, H: Hasher>(
+pub(crate) fn prove_inner<F: Field, H: Hasher>(
     transcript: &mut ProverTranscript<H>,
     claim: ProverClaim<F>,
     message: Message<F>,
     pow_bits: u32,
-) -> (ProverFoldedClaim<F>, Row<F>, Vec<F>) {
+    precomputed_main_r0: Option<(F, F)>,
+    scale_final_main: bool,
+) -> (ProverFoldedClaim<F>, F, Row<F>, Vec<F>) {
     let Claim { main: mut main_form, aux: mut aux_form, target } = claim;
     let Message { mut main, mut aux, mask, seeds } = message;
     let folding = mask.folding();
@@ -297,7 +298,8 @@ pub fn prove<F: Field, H: Hasher>(
 
     let mut target = mask_sum + target * batching;
     let mut challenges = Vec::with_capacity(folding);
-    let (mut main_constant, mut main_quadratic) = round_coefficients(&main_form, &main);
+    let (mut main_constant, mut main_quadratic) =
+        precomputed_main_r0.unwrap_or_else(|| round_coefficients(&main_form, &main));
     let (mut aux_constant, mut aux_quadratic) = round_coefficients(&aux_form, &aux);
     for round in 0..folding {
         let (mask_constant, mask_quadratic) = mask_sumcheck.round_coefficients();
@@ -313,19 +315,40 @@ pub fn prove<F: Field, H: Hasher>(
             (main_constant, main_quadratic) = fused_fold_and_round(&mut main_form, &mut main, challenge);
             (aux_constant, aux_quadratic) = fused_fold_and_round(&mut aux_form, &mut aux, challenge);
         } else {
-            fold_pair_scaled(&mut main_form, &mut main, challenge, batching);
-            fold_pair_scaled(&mut aux_form, &mut aux, challenge, batching);
+            let main_scale = scale_final_main.then_some(batching);
+            fold_pair(&mut main_form, &mut main, challenge, main_scale);
+            fold_pair(&mut aux_form, &mut aux, challenge, Some(batching));
         }
         challenges.push(challenge);
     }
 
-    main_form.shrink_to_fit();
-    main.shrink_to_fit();
     let folded_claim =
         FoldedClaim { main: main_form, aux: aux_form, mask: mask::linear_form(&challenges), target };
     let folded_row =
         Row { main, aux, mask: mask.fold(&challenges), seed: fold_rows(&seeds, &eq_table(&challenges)) };
+    let deferred_scale = if scale_final_main { F::ONE } else { batching };
+    (folded_claim, deferred_scale, folded_row, challenges)
+}
+
+pub fn prove<F: Field, H: Hasher>(
+    transcript: &mut ProverTranscript<H>,
+    claim: ProverClaim<F>,
+    message: Message<F>,
+    pow_bits: u32,
+) -> (ProverFoldedClaim<F>, Row<F>, Vec<F>) {
+    let (folded_claim, _, folded_row, challenges) =
+        prove_inner(transcript, claim, message, pow_bits, None, true);
     (folded_claim, folded_row, challenges)
+}
+
+fn read_field_pair<F: Field, H: Hasher>(transcript: &mut VerifierTranscript<H>) -> Result<(F, F)> {
+    assert!(F::BYTES <= 32);
+    let bytes = transcript.read_bytes(2 * F::BYTES)?;
+    let error = Error::InvalidProof("a field element is not encoded canonically");
+    let first = F::from_bytes(&bytes[..F::BYTES]).ok_or(error.clone())?;
+    let second = F::from_bytes(&bytes[F::BYTES..]).ok_or(error)?;
+    assert_eq!(bytes.len(), 2 * F::BYTES);
+    Ok((first, second))
 }
 
 pub fn verify<F: Field, H: Hasher>(
@@ -340,14 +363,13 @@ pub fn verify<F: Field, H: Hasher>(
     let mut target = mask_sum + target * batching;
     let mut challenges = Vec::with_capacity(folding);
     for _ in 0..folding {
-        let coefficients = transcript.read_fields(2)?;
+        let (constant, quadratic) = read_field_pair::<F, H>(transcript)?;
         transcript.check_work(pow_bits)?;
         let challenge = transcript.challenge_field();
-        target = evaluate_round(target, coefficients[0], coefficients[1], challenge);
+        target = evaluate_round(target, constant, quadratic, challenge);
         challenges.push(challenge);
     }
-    main.fix(&challenges);
-    main.scale(batching);
+    main.fix_and_scale(&challenges, batching);
     let aux = if aux.is_empty() {
         Vec::new()
     } else {
