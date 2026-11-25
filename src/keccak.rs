@@ -305,14 +305,14 @@ mod sha3_extension {
         out
     }
 
-    #[inline(always)]
+    #[inline(never)]
     unsafe fn permute_2x(a: &mut [V; LANES]) {
         for &rc in &ROUND_CONSTANTS {
             unsafe { round(a, rc) };
         }
     }
 
-    #[inline(always)]
+    #[inline(never)]
     unsafe fn permute_3x(a: &mut [V; LANES], s: &mut [u64; LANES]) {
         for &rc in &ROUND_CONSTANTS {
             unsafe { round(a, rc) };
@@ -320,7 +320,7 @@ mod sha3_extension {
         }
     }
 
-    #[inline(always)]
+    #[inline(never)]
     unsafe fn permute_to_2_digests(a: &mut [V; LANES]) -> [[u8; OUT_LEN]; 2] {
         for &rc in &ROUND_CONSTANTS[..23] {
             unsafe { round(a, rc) };
@@ -328,7 +328,7 @@ mod sha3_extension {
         unsafe { extract_2_digests(&final_round_row0_2x(a)) }
     }
 
-    #[inline(always)]
+    #[inline(never)]
     unsafe fn permute_to_3_digests(a: &mut [V; LANES], s: &mut [u64; LANES]) -> [[u8; OUT_LEN]; 3] {
         for &rc in &ROUND_CONSTANTS[..23] {
             unsafe { round(a, rc) };
@@ -354,42 +354,21 @@ mod sha3_extension {
         for (lane, &word) in lanes.iter_mut().zip(state.iter()) {
             *lane = unsafe { vdupq_n_u64(word) };
         }
-        unsafe { permute_2x(&mut lanes) };
+        for &rc in &ROUND_CONSTANTS {
+            unsafe { round(&mut lanes, rc) };
+        }
         for (word, &lane) in state.iter_mut().zip(lanes.iter()) {
             *word = unsafe { vgetq_lane_u64::<0>(lane) };
         }
     }
 
-    pub fn keccak256_node_pair_3x(key_lanes: &[u64; 4], children: &[[u8; 32]; 6]) -> [[u8; OUT_LEN]; 3] {
-        const { assert!(RATE_BYTES == 136 && OUT_LEN == 32) };
-        unsafe {
-            let zero = vdupq_n_u64(0);
-            let mut a = [zero; LANES];
-            let mut s = [0u64; LANES];
-            for i in 0..4 {
-                a[i] = vdupq_n_u64(key_lanes[i]);
-                s[i] = key_lanes[i];
-            }
-            (a[4], a[5]) = load_pair2(children[0].as_ptr(), children[2].as_ptr());
-            (a[6], a[7]) = load_pair2(children[0].as_ptr().add(16), children[2].as_ptr().add(16));
-            (a[8], a[9]) = load_pair2(children[1].as_ptr(), children[3].as_ptr());
-            (a[10], a[11]) = load_pair2(children[1].as_ptr().add(16), children[3].as_ptr().add(16));
-            a[12] = vdupq_n_u64(0x01);
-            a[16] = vdupq_n_u64(0x8000_0000_0000_0000);
-            s[4..8].copy_from_slice(&lanes_from_32(&children[4]));
-            s[8..12].copy_from_slice(&lanes_from_32(&children[5]));
-            s[12] = 0x01;
-            s[16] = 0x8000_0000_0000_0000;
-            permute_to_3_digests(&mut a, &mut s)
-        }
-    }
-
+    #[inline(never)]
     pub fn keccak256_node_pair_2x(key_lanes: &[u64; 4], children: &[[u8; 32]; 4]) -> [[u8; OUT_LEN]; 2] {
         const { assert!(RATE_BYTES == 136 && OUT_LEN == 32) };
         unsafe {
             let mut a = [vdupq_n_u64(0); LANES];
             for i in 0..4 {
-                a[i] = vdupq_n_u64(key_lanes[i]);
+                a[i] = vld1q_dup_u64(&key_lanes[i]);
             }
             (a[4], a[5]) = load_pair2(children[0].as_ptr(), children[2].as_ptr());
             (a[6], a[7]) = load_pair2(children[0].as_ptr().add(16), children[2].as_ptr().add(16));
@@ -477,73 +456,164 @@ mod sha3_extension {
     }
 
     #[inline(always)]
-    unsafe fn absorb_f32_phase_3x<F: crate::field::Field>(
+    unsafe fn absorb_f32_blocks_2x<F: crate::field::Field>(
         a: &mut [V; LANES],
-        s: &mut [u64; LANES],
         rows: &[Vec<F>],
         base: usize,
-        phase: usize,
-        carry_v: &mut [V; 3],
-        carry_s: &mut [u64; 3],
-    ) -> usize {
-        assert!(phase < 4 && rows.len() >= 4 + usize::from(phase == 0));
+    ) -> (usize, usize) {
+        assert!(rows.len() >= 3);
         unsafe {
-            match phase {
-                0 => {
-                    for (i, row) in rows.iter().enumerate().take(4) {
-                        xor4_2x(a, 4 * i, load_row_2x_32(row, base));
-                        xor4_1x(s, 4 * i, load_row_1x_32(row, base + 2));
-                    }
-                    let rv = load_row_2x_32(&rows[4], base);
-                    let rs = load_row_1x_32(&rows[4], base + 2);
-                    a[16] = veorq_u64(a[16], rv[0]);
-                    s[16] ^= rs[0];
-                    *carry_v = [rv[1], rv[2], rv[3]];
-                    *carry_s = [rs[1], rs[2], rs[3]];
-                    5
-                }
-                1 => {
-                    for (i, row) in rows.iter().enumerate().take(3) {
-                        xor4_2x(a, 3 + 4 * i, load_row_2x_32(row, base));
-                        xor4_1x(s, 3 + 4 * i, load_row_1x_32(row, base + 2));
-                    }
-                    let rv = load_row_2x_32(&rows[3], base);
-                    let rs = load_row_1x_32(&rows[3], base + 2);
-                    a[15] = veorq_u64(a[15], rv[0]);
-                    a[16] = veorq_u64(a[16], rv[1]);
-                    s[15] ^= rs[0];
-                    s[16] ^= rs[1];
-                    carry_v[0] = rv[2];
-                    carry_v[1] = rv[3];
-                    carry_s[0] = rs[2];
-                    carry_s[1] = rs[3];
-                    4
-                }
-                2 => {
-                    for (i, row) in rows.iter().enumerate().take(3) {
-                        xor4_2x(a, 2 + 4 * i, load_row_2x_32(row, base));
-                        xor4_1x(s, 2 + 4 * i, load_row_1x_32(row, base + 2));
-                    }
-                    let rv = load_row_2x_32(&rows[3], base);
-                    let rs = load_row_1x_32(&rows[3], base + 2);
-                    a[14] = veorq_u64(a[14], rv[0]);
-                    a[15] = veorq_u64(a[15], rv[1]);
-                    a[16] = veorq_u64(a[16], rv[2]);
-                    s[14] ^= rs[0];
-                    s[15] ^= rs[1];
-                    s[16] ^= rs[2];
-                    carry_v[0] = rv[3];
-                    carry_s[0] = rs[3];
-                    4
-                }
-                _ => {
-                    for (i, row) in rows.iter().enumerate().take(4) {
-                        xor4_2x(a, 1 + 4 * i, load_row_2x_32(row, base));
-                        xor4_1x(s, 1 + 4 * i, load_row_1x_32(row, base + 2));
-                    }
-                    4
-                }
+            for (i, row) in rows.iter().enumerate().take(3) {
+                a[5 + 4 * i..9 + 4 * i].copy_from_slice(&load_row_2x_32(row, base));
             }
+            permute_2x(a);
+            let mut idx = 3usize;
+            let mut phase = 0usize;
+            let mut carry = [vdupq_n_u64(0); 3];
+            for _ in 0..(rows.len() / 4 + 2) {
+                let carry_len = (4 - phase) & 3;
+                for i in 0..carry_len {
+                    a[i] = veorq_u64(a[i], carry[i]);
+                }
+                if idx + 4 + usize::from(phase == 0) > rows.len() {
+                    return (idx, carry_len);
+                }
+                let full_rows = if phase == 0 || phase == 3 { 4 } else { 3 };
+                for i in 0..full_rows {
+                    xor4_2x(a, carry_len + 4 * i, load_row_2x_32(&rows[idx + i], base));
+                }
+                if phase != 3 {
+                    let rv = load_row_2x_32(&rows[idx + full_rows], base);
+                    let take = phase + 1;
+                    for j in 0..take {
+                        a[RATE_LANES - take + j] = veorq_u64(a[RATE_LANES - take + j], rv[j]);
+                    }
+                    let carry_rem = 4 - take;
+                    carry[..carry_rem].copy_from_slice(&rv[take..]);
+                    idx += full_rows + 1;
+                } else {
+                    idx += 4;
+                }
+                permute_2x(a);
+                phase = (phase + 1) & 3;
+            }
+            unreachable!("bounded loop finishes all rows")
+        }
+    }
+
+    #[inline(never)]
+    fn hash_rows_2x_f32<F: crate::field::Field>(
+        key_lanes: &[u64; 4],
+        rows: &[Vec<F>],
+        start: usize,
+        out: &mut [[[u8; OUT_LEN]; 2]],
+    ) {
+        assert!(F::BYTES == 32 && !rows.is_empty());
+        assert!(start + out.len() * 2 <= rows[0].len());
+        unsafe {
+            for (group, dst) in out.iter_mut().enumerate() {
+                let base = start + group * 2;
+                let mut a = [vdupq_n_u64(0); LANES];
+                for i in 0..4 {
+                    a[i] = vld1q_dup_u64(&key_lanes[i]);
+                }
+                a[4] = pair(base as u64, (base + 1) as u64);
+                let (idx, mut pos) =
+                    if rows.len() >= 3 { absorb_f32_blocks_2x(&mut a, rows, base) } else { (0, 5) };
+                for row in &rows[idx..] {
+                    xor4_2x(&mut a, pos, load_row_2x_32(row, base));
+                    pos += 4;
+                }
+                a[pos] = veorq_u64(a[pos], vdupq_n_u64(0x01));
+                a[RATE_LANES - 1] = veorq_u64(a[RATE_LANES - 1], vdupq_n_u64(0x8000_0000_0000_0000));
+                *dst = permute_to_2_digests(&mut a);
+            }
+        }
+    }
+
+    #[inline(always)]
+    unsafe fn absorb_f16_blocks_2x<F: crate::field::Field>(
+        a: &mut [V; LANES],
+        rows: &[Vec<F>],
+        base: usize,
+    ) -> (usize, usize) {
+        assert!(rows.len() >= 6);
+        unsafe {
+            for (i, row) in rows.iter().enumerate().take(6) {
+                let rv = load_row_2x_16(row, base);
+                a[5 + 2 * i] = rv[0];
+                a[6 + 2 * i] = rv[1];
+            }
+            permute_2x(a);
+            let mut idx = 6usize;
+            let mut phase = 0usize;
+            let mut carry = vdupq_n_u64(0);
+            for _ in 0..(rows.len() / 8 + 2) {
+                if phase == 1 {
+                    a[0] = veorq_u64(a[0], carry);
+                }
+                let need = 9 - phase;
+                if idx + need > rows.len() {
+                    return (idx, phase);
+                }
+                for i in 0..8 {
+                    xor2_2x(a, phase + 2 * i, load_row_2x_16(&rows[idx + i], base));
+                }
+                if phase == 0 {
+                    let rv = load_row_2x_16(&rows[idx + 8], base);
+                    a[16] = veorq_u64(a[16], rv[0]);
+                    carry = rv[1];
+                }
+                idx += need;
+                permute_2x(a);
+                phase ^= 1;
+            }
+            unreachable!("bounded loop finishes all rows")
+        }
+    }
+
+    #[inline(never)]
+    fn hash_rows_2x_f16<F: crate::field::Field>(
+        key_lanes: &[u64; 4],
+        rows: &[Vec<F>],
+        start: usize,
+        out: &mut [[[u8; OUT_LEN]; 2]],
+    ) {
+        assert!(F::BYTES == 16 && !rows.is_empty());
+        assert!(start + out.len() * 2 <= rows[0].len());
+        unsafe {
+            for (group, dst) in out.iter_mut().enumerate() {
+                let base = start + group * 2;
+                let mut a = [vdupq_n_u64(0); LANES];
+                for i in 0..4 {
+                    a[i] = vld1q_dup_u64(&key_lanes[i]);
+                }
+                a[4] = pair(base as u64, (base + 1) as u64);
+                let (idx, mut pos) =
+                    if rows.len() >= 6 { absorb_f16_blocks_2x(&mut a, rows, base) } else { (0, 5) };
+                for row in &rows[idx..] {
+                    xor2_2x(&mut a, pos, load_row_2x_16(row, base));
+                    pos += 2;
+                }
+                a[pos] = veorq_u64(a[pos], vdupq_n_u64(0x01));
+                a[RATE_LANES - 1] = veorq_u64(a[RATE_LANES - 1], vdupq_n_u64(0x8000_0000_0000_0000));
+                *dst = permute_to_2_digests(&mut a);
+            }
+        }
+    }
+
+    pub fn hash_rows_2x_direct<F: crate::field::Field>(
+        key_lanes: &[u64; 4],
+        rows: &[Vec<F>],
+        start: usize,
+        out: &mut [[[u8; OUT_LEN]; 2]],
+    ) {
+        assert!(F::BYTES == 16 || F::BYTES == 32);
+        assert!(!rows.is_empty());
+        if F::BYTES == 32 {
+            hash_rows_2x_f32(key_lanes, rows, start, out);
+        } else {
+            hash_rows_2x_f16(key_lanes, rows, start, out);
         }
     }
 
@@ -553,7 +623,6 @@ mod sha3_extension {
         s: &mut [u64; LANES],
         rows: &[Vec<F>],
         base: usize,
-        zero: V,
     ) -> (usize, usize) {
         assert!(rows.len() >= 3);
         unsafe {
@@ -564,7 +633,7 @@ mod sha3_extension {
             permute_3x(a, s);
             let mut idx = 3usize;
             let mut phase = 0usize;
-            let mut carry_v = [zero; 3];
+            let mut carry_v = [vdupq_n_u64(0); 3];
             let mut carry_s = [0u64; 3];
             for _ in 0..(rows.len() / 4 + 2) {
                 let carry_len = (4 - phase) & 3;
@@ -575,7 +644,26 @@ mod sha3_extension {
                 if idx + 4 + usize::from(phase == 0) > rows.len() {
                     return (idx, carry_len);
                 }
-                idx += absorb_f32_phase_3x(a, s, &rows[idx..], base, phase, &mut carry_v, &mut carry_s);
+                let full_rows = if phase == 0 || phase == 3 { 4 } else { 3 };
+                for i in 0..full_rows {
+                    xor4_2x(a, carry_len + 4 * i, load_row_2x_32(&rows[idx + i], base));
+                    xor4_1x(s, carry_len + 4 * i, load_row_1x_32(&rows[idx + i], base + 2));
+                }
+                if phase != 3 {
+                    let rv = load_row_2x_32(&rows[idx + full_rows], base);
+                    let rs = load_row_1x_32(&rows[idx + full_rows], base + 2);
+                    let take = phase + 1;
+                    for j in 0..take {
+                        a[RATE_LANES - take + j] = veorq_u64(a[RATE_LANES - take + j], rv[j]);
+                        s[RATE_LANES - take + j] ^= rs[j];
+                    }
+                    let carry_rem = 4 - take;
+                    carry_v[..carry_rem].copy_from_slice(&rv[take..]);
+                    carry_s[..carry_rem].copy_from_slice(&rs[take..]);
+                    idx += full_rows + 1;
+                } else {
+                    idx += 4;
+                }
                 permute_3x(a, s);
                 phase = (phase + 1) & 3;
             }
@@ -593,35 +681,25 @@ mod sha3_extension {
         assert!(F::BYTES == 32 && !rows.is_empty());
         assert!(start + out.len() * 3 <= rows[0].len());
         unsafe {
-            let zero = vdupq_n_u64(0);
-            let kv = [
-                vdupq_n_u64(key_lanes[0]),
-                vdupq_n_u64(key_lanes[1]),
-                vdupq_n_u64(key_lanes[2]),
-                vdupq_n_u64(key_lanes[3]),
-            ];
-            let pad01 = vdupq_n_u64(0x01);
-            let pad80 = vdupq_n_u64(0x8000_0000_0000_0000);
             for (group, dst) in out.iter_mut().enumerate() {
                 let base = start + group * 3;
-                let mut a = [zero; LANES];
+                let mut a = [vdupq_n_u64(0); LANES];
                 let mut s = [0u64; LANES];
-                a[..4].copy_from_slice(&kv);
-                s[..4].copy_from_slice(key_lanes);
+                for i in 0..4 {
+                    a[i] = vld1q_dup_u64(&key_lanes[i]);
+                    s[i] = key_lanes[i];
+                }
                 a[4] = pair(base as u64, (base + 1) as u64);
                 s[4] = (base + 2) as u64;
-                let (idx, mut pos) = if rows.len() >= 3 {
-                    absorb_f32_blocks_3x(&mut a, &mut s, rows, base, zero)
-                } else {
-                    (0, 5)
-                };
+                let (idx, mut pos) =
+                    if rows.len() >= 3 { absorb_f32_blocks_3x(&mut a, &mut s, rows, base) } else { (0, 5) };
                 for row in &rows[idx..] {
                     xor4_2x(&mut a, pos, load_row_2x_32(row, base));
                     xor4_1x(&mut s, pos, load_row_1x_32(row, base + 2));
                     pos += 4;
                 }
-                a[pos] = veorq_u64(a[pos], pad01);
-                a[RATE_LANES - 1] = veorq_u64(a[RATE_LANES - 1], pad80);
+                a[pos] = veorq_u64(a[pos], vdupq_n_u64(0x01));
+                a[RATE_LANES - 1] = veorq_u64(a[RATE_LANES - 1], vdupq_n_u64(0x8000_0000_0000_0000));
                 s[pos] ^= 0x01;
                 s[RATE_LANES - 1] ^= 0x8000_0000_0000_0000;
                 *dst = permute_to_3_digests(&mut a, &mut s);
@@ -635,7 +713,6 @@ mod sha3_extension {
         s: &mut [u64; LANES],
         rows: &[Vec<F>],
         base: usize,
-        zero: V,
     ) -> (usize, usize) {
         assert!(rows.len() >= 6);
         unsafe {
@@ -650,7 +727,7 @@ mod sha3_extension {
             permute_3x(a, s);
             let mut idx = 6usize;
             let mut phase = 0usize;
-            let mut carry_v = zero;
+            let mut carry_v = vdupq_n_u64(0);
             let mut carry_s = 0u64;
             for _ in 0..(rows.len() / 8 + 2) {
                 if phase == 1 {
@@ -694,28 +771,18 @@ mod sha3_extension {
         assert!(F::BYTES == 16 && !rows.is_empty());
         assert!(start + out.len() * 3 <= rows[0].len());
         unsafe {
-            let zero = vdupq_n_u64(0);
-            let kv = [
-                vdupq_n_u64(key_lanes[0]),
-                vdupq_n_u64(key_lanes[1]),
-                vdupq_n_u64(key_lanes[2]),
-                vdupq_n_u64(key_lanes[3]),
-            ];
-            let pad01 = vdupq_n_u64(0x01);
-            let pad80 = vdupq_n_u64(0x8000_0000_0000_0000);
             for (group, dst) in out.iter_mut().enumerate() {
                 let base = start + group * 3;
-                let mut a = [zero; LANES];
+                let mut a = [vdupq_n_u64(0); LANES];
                 let mut s = [0u64; LANES];
-                a[..4].copy_from_slice(&kv);
-                s[..4].copy_from_slice(key_lanes);
+                for i in 0..4 {
+                    a[i] = vld1q_dup_u64(&key_lanes[i]);
+                    s[i] = key_lanes[i];
+                }
                 a[4] = pair(base as u64, (base + 1) as u64);
                 s[4] = (base + 2) as u64;
-                let (idx, mut pos) = if rows.len() >= 6 {
-                    absorb_f16_blocks_3x(&mut a, &mut s, rows, base, zero)
-                } else {
-                    (0, 5)
-                };
+                let (idx, mut pos) =
+                    if rows.len() >= 6 { absorb_f16_blocks_3x(&mut a, &mut s, rows, base) } else { (0, 5) };
                 for row in &rows[idx..] {
                     let rv = load_row_2x_16(row, base);
                     let rs = load_row_1x_16(row, base + 2);
@@ -724,8 +791,8 @@ mod sha3_extension {
                     s[pos + 1] ^= rs[1];
                     pos += 2;
                 }
-                a[pos] = veorq_u64(a[pos], pad01);
-                a[RATE_LANES - 1] = veorq_u64(a[RATE_LANES - 1], pad80);
+                a[pos] = veorq_u64(a[pos], vdupq_n_u64(0x01));
+                a[RATE_LANES - 1] = veorq_u64(a[RATE_LANES - 1], vdupq_n_u64(0x8000_0000_0000_0000));
                 s[pos] ^= 0x01;
                 s[RATE_LANES - 1] ^= 0x8000_0000_0000_0000;
                 *dst = permute_to_3_digests(&mut a, &mut s);
@@ -749,179 +816,6 @@ mod sha3_extension {
     }
 
     #[inline(always)]
-    unsafe fn absorb_f32_phase_2x<F: crate::field::Field>(
-        a: &mut [V; LANES],
-        rows: &[Vec<F>],
-        base: usize,
-        phase: usize,
-        carry: &mut [V; 3],
-    ) -> usize {
-        assert!(phase < 4 && rows.len() >= 4 + usize::from(phase == 0));
-        unsafe {
-            match phase {
-                0 => {
-                    for (i, row) in rows.iter().enumerate().take(4) {
-                        xor4_2x(a, 4 * i, load_row_2x_32(row, base));
-                    }
-                    let rv = load_row_2x_32(&rows[4], base);
-                    a[16] = veorq_u64(a[16], rv[0]);
-                    *carry = [rv[1], rv[2], rv[3]];
-                    5
-                }
-                1 => {
-                    for (i, row) in rows.iter().enumerate().take(3) {
-                        xor4_2x(a, 3 + 4 * i, load_row_2x_32(row, base));
-                    }
-                    let rv = load_row_2x_32(&rows[3], base);
-                    a[15] = veorq_u64(a[15], rv[0]);
-                    a[16] = veorq_u64(a[16], rv[1]);
-                    carry[0] = rv[2];
-                    carry[1] = rv[3];
-                    4
-                }
-                2 => {
-                    for (i, row) in rows.iter().enumerate().take(3) {
-                        xor4_2x(a, 2 + 4 * i, load_row_2x_32(row, base));
-                    }
-                    let rv = load_row_2x_32(&rows[3], base);
-                    a[14] = veorq_u64(a[14], rv[0]);
-                    a[15] = veorq_u64(a[15], rv[1]);
-                    a[16] = veorq_u64(a[16], rv[2]);
-                    carry[0] = rv[3];
-                    4
-                }
-                _ => {
-                    for (i, row) in rows.iter().enumerate().take(4) {
-                        xor4_2x(a, 1 + 4 * i, load_row_2x_32(row, base));
-                    }
-                    4
-                }
-            }
-        }
-    }
-
-    fn hash_rows_2x_f32<F: crate::field::Field>(
-        key_lanes: &[u64; 4],
-        rows: &[Vec<F>],
-        base: usize,
-        out: &mut [[u8; OUT_LEN]; 2],
-    ) {
-        assert!(F::BYTES == 32 && base + 2 <= rows[0].len());
-        unsafe {
-            let zero = vdupq_n_u64(0);
-            let mut a = [zero; LANES];
-            for i in 0..4 {
-                a[i] = vdupq_n_u64(key_lanes[i]);
-            }
-            a[4] = pair(base as u64, (base + 1) as u64);
-            let mut idx = 0usize;
-            let mut pos = 5usize;
-            if rows.len() >= 3 {
-                for (i, row) in rows.iter().enumerate().take(3) {
-                    a[5 + 4 * i..9 + 4 * i].copy_from_slice(&load_row_2x_32(row, base));
-                }
-                permute_2x(&mut a);
-                idx = 3;
-                let mut phase = 0usize;
-                let mut carry = [zero; 3];
-                for _ in 0..(rows.len() / 4 + 2) {
-                    let carry_len = (4 - phase) & 3;
-                    for i in 0..carry_len {
-                        a[i] = veorq_u64(a[i], carry[i]);
-                    }
-                    if idx + 4 + usize::from(phase == 0) > rows.len() {
-                        pos = carry_len;
-                        break;
-                    }
-                    idx += absorb_f32_phase_2x(&mut a, &rows[idx..], base, phase, &mut carry);
-                    permute_2x(&mut a);
-                    phase = (phase + 1) & 3;
-                }
-            }
-            for row in &rows[idx..] {
-                xor4_2x(&mut a, pos, load_row_2x_32(row, base));
-                pos += 4;
-            }
-            a[pos] = veorq_u64(a[pos], vdupq_n_u64(0x01));
-            a[RATE_LANES - 1] = veorq_u64(a[RATE_LANES - 1], vdupq_n_u64(0x8000_0000_0000_0000));
-            *out = permute_to_2_digests(&mut a);
-        }
-    }
-
-    fn hash_rows_2x_f16<F: crate::field::Field>(
-        key_lanes: &[u64; 4],
-        rows: &[Vec<F>],
-        base: usize,
-        out: &mut [[u8; OUT_LEN]; 2],
-    ) {
-        assert!(F::BYTES == 16 && base + 2 <= rows[0].len());
-        unsafe {
-            let zero = vdupq_n_u64(0);
-            let mut a = [zero; LANES];
-            for i in 0..4 {
-                a[i] = vdupq_n_u64(key_lanes[i]);
-            }
-            a[4] = pair(base as u64, (base + 1) as u64);
-            let mut idx = 0usize;
-            let mut pos = 5usize;
-            if rows.len() >= 6 {
-                for (i, row) in rows.iter().enumerate().take(6) {
-                    let rv = load_row_2x_16(row, base);
-                    a[5 + 2 * i] = rv[0];
-                    a[6 + 2 * i] = rv[1];
-                }
-                permute_2x(&mut a);
-                idx = 6;
-                let mut phase = 0usize;
-                let mut carry = zero;
-                for _ in 0..(rows.len() / 8 + 2) {
-                    if phase == 1 {
-                        a[0] = veorq_u64(a[0], carry);
-                    }
-                    let need = 9 - phase;
-                    if idx + need > rows.len() {
-                        pos = phase;
-                        break;
-                    }
-                    for i in 0..8 {
-                        xor2_2x(&mut a, phase + 2 * i, load_row_2x_16(&rows[idx + i], base));
-                    }
-                    if phase == 0 {
-                        let rv = load_row_2x_16(&rows[idx + 8], base);
-                        a[16] = veorq_u64(a[16], rv[0]);
-                        carry = rv[1];
-                    }
-                    idx += need;
-                    permute_2x(&mut a);
-                    phase ^= 1;
-                }
-            }
-            for row in &rows[idx..] {
-                xor2_2x(&mut a, pos, load_row_2x_16(row, base));
-                pos += 2;
-            }
-            a[pos] = veorq_u64(a[pos], vdupq_n_u64(0x01));
-            a[RATE_LANES - 1] = veorq_u64(a[RATE_LANES - 1], vdupq_n_u64(0x8000_0000_0000_0000));
-            *out = permute_to_2_digests(&mut a);
-        }
-    }
-
-    pub fn hash_rows_2x_direct<F: crate::field::Field>(
-        key_lanes: &[u64; 4],
-        rows: &[Vec<F>],
-        base: usize,
-        out: &mut [[u8; OUT_LEN]; 2],
-    ) {
-        assert!(F::BYTES == 16 || F::BYTES == 32);
-        assert!(!rows.is_empty());
-        if F::BYTES == 32 {
-            hash_rows_2x_f32(key_lanes, rows, base, out);
-        } else {
-            hash_rows_2x_f16(key_lanes, rows, base, out);
-        }
-    }
-
-    #[inline(always)]
     unsafe fn xor_full_block_2x(a: &mut [V; LANES], b0: &[u8; RATE_BYTES], b1: &[u8; RATE_BYTES]) {
         unsafe {
             let p0 = b0.as_ptr();
@@ -935,13 +829,6 @@ mod sha3_extension {
             let w0 = u64::from_le_bytes(b0[128..136].try_into().expect("last lane"));
             let w1 = u64::from_le_bytes(b1[128..136].try_into().expect("last lane"));
             a[16] = veorq_u64(a[16], pair(w0, w1));
-        }
-    }
-
-    #[inline(always)]
-    fn xor_full_block_1x(s: &mut [u64; LANES], b: &[u8; RATE_BYTES]) {
-        for (lane, chunk) in s[..RATE_LANES].iter_mut().zip(b.as_chunks::<8>().0) {
-            *lane ^= u64::from_le_bytes(*chunk);
         }
     }
 
@@ -960,80 +847,7 @@ mod sha3_extension {
         }
     }
 
-    #[inline(always)]
-    fn load_first_payload_1x(s: &mut [u64; LANES], b: &[u8; 104]) {
-        for (lane, chunk) in s[4..RATE_LANES].iter_mut().zip(b.as_chunks::<8>().0) {
-            *lane = u64::from_le_bytes(*chunk);
-        }
-    }
-
-    pub fn keccak256_domain_3x(
-        key_lanes: &[u64; 4],
-        in0: &[u8],
-        in1: &[u8],
-        in2: &[u8],
-    ) -> [[u8; OUT_LEN]; 3] {
-        assert!(in0.len() == in1.len() && in0.len() == in2.len());
-        const FIRST_PAYLOAD: usize = RATE_BYTES - 32;
-        const { assert!(FIRST_PAYLOAD == 104) };
-        unsafe {
-            let mut a = [vdupq_n_u64(0); LANES];
-            let mut s = [0u64; LANES];
-            for i in 0..4 {
-                a[i] = vdupq_n_u64(key_lanes[i]);
-                s[i] = key_lanes[i];
-            }
-            if in0.len() < FIRST_PAYLOAD {
-                let (mut p0, mut p1, mut p2) =
-                    ([0u8; FIRST_PAYLOAD], [0u8; FIRST_PAYLOAD], [0u8; FIRST_PAYLOAD]);
-                p0[..in0.len()].copy_from_slice(in0);
-                p1[..in1.len()].copy_from_slice(in1);
-                p2[..in2.len()].copy_from_slice(in2);
-                p0[in0.len()] ^= 0x01;
-                p1[in1.len()] ^= 0x01;
-                p2[in2.len()] ^= 0x01;
-                p0[FIRST_PAYLOAD - 1] ^= 0x80;
-                p1[FIRST_PAYLOAD - 1] ^= 0x80;
-                p2[FIRST_PAYLOAD - 1] ^= 0x80;
-                load_first_payload_2x(&mut a, &p0, &p1);
-                load_first_payload_1x(&mut s, &p2);
-                return permute_to_3_digests(&mut a, &mut s);
-            }
-            let (h0, mut r0) = in0.split_first_chunk::<FIRST_PAYLOAD>().expect("first payload");
-            let (h1, mut r1) = in1.split_first_chunk::<FIRST_PAYLOAD>().expect("first payload");
-            let (h2, mut r2) = in2.split_first_chunk::<FIRST_PAYLOAD>().expect("first payload");
-            load_first_payload_2x(&mut a, h0, h1);
-            load_first_payload_1x(&mut s, h2);
-            permute_3x(&mut a, &mut s);
-            while let (Some((b0, t0)), Some((b1, t1)), Some((b2, t2))) = (
-                r0.split_first_chunk::<RATE_BYTES>(),
-                r1.split_first_chunk::<RATE_BYTES>(),
-                r2.split_first_chunk::<RATE_BYTES>(),
-            ) {
-                xor_full_block_2x(&mut a, b0, b1);
-                xor_full_block_1x(&mut s, b2);
-                permute_3x(&mut a, &mut s);
-                r0 = t0;
-                r1 = t1;
-                r2 = t2;
-            }
-            assert!(r0.len() < RATE_BYTES);
-            let (mut b0, mut b1, mut b2) = ([0u8; RATE_BYTES], [0u8; RATE_BYTES], [0u8; RATE_BYTES]);
-            b0[..r0.len()].copy_from_slice(r0);
-            b1[..r1.len()].copy_from_slice(r1);
-            b2[..r2.len()].copy_from_slice(r2);
-            b0[r0.len()] ^= 0x01;
-            b1[r1.len()] ^= 0x01;
-            b2[r2.len()] ^= 0x01;
-            b0[RATE_BYTES - 1] ^= 0x80;
-            b1[RATE_BYTES - 1] ^= 0x80;
-            b2[RATE_BYTES - 1] ^= 0x80;
-            xor_full_block_2x(&mut a, &b0, &b1);
-            xor_full_block_1x(&mut s, &b2);
-            permute_to_3_digests(&mut a, &mut s)
-        }
-    }
-
+    #[inline(never)]
     pub fn keccak256_domain_2x(key_lanes: &[u64; 4], in0: &[u8], in1: &[u8]) -> [[u8; OUT_LEN]; 2] {
         assert!(in0.len() == in1.len());
         const FIRST_PAYLOAD: usize = RATE_BYTES - 32;
@@ -1041,7 +855,7 @@ mod sha3_extension {
         unsafe {
             let mut a = [vdupq_n_u64(0); LANES];
             for i in 0..4 {
-                a[i] = vdupq_n_u64(key_lanes[i]);
+                a[i] = vld1q_dup_u64(&key_lanes[i]);
             }
             if in0.len() < FIRST_PAYLOAD {
                 let (mut p0, mut p1) = ([0u8; FIRST_PAYLOAD], [0u8; FIRST_PAYLOAD]);
@@ -1217,6 +1031,7 @@ mod sha3_extension {
         s
     }
 
+    #[inline(never)]
     pub fn find_pow_nonce_3x(
         key_lanes: &[u64; 4],
         seed: &[u8; 32],
@@ -1297,14 +1112,13 @@ pub(crate) fn hash_rows_3x_direct<F: crate::field::Field>(
 }
 
 #[cfg(all(target_arch = "aarch64", target_feature = "sha3", target_endian = "little"))]
-#[inline(never)]
 pub(crate) fn hash_rows_2x_direct<F: crate::field::Field>(
     key_lanes: &[u64; 4],
     rows: &[Vec<F>],
-    base: usize,
-    out: &mut [[u8; OUT_LEN]; 2],
+    start: usize,
+    out: &mut [[[u8; OUT_LEN]; 2]],
 ) {
-    sha3_extension::hash_rows_2x_direct(key_lanes, rows, base, out);
+    sha3_extension::hash_rows_2x_direct(key_lanes, rows, start, out);
 }
 
 #[inline(always)]
@@ -1363,21 +1177,6 @@ pub(crate) fn keccak256_node_pair(key_lanes: &[u64; 4], left: &[u8; 32], right: 
     digest_from_state(&state)
 }
 
-pub(crate) fn keccak256_node_pair_3x(key_lanes: &[u64; 4], children: &[[u8; 32]; 6]) -> [[u8; OUT_LEN]; 3] {
-    #[cfg(all(target_arch = "aarch64", target_feature = "sha3", target_endian = "little"))]
-    {
-        sha3_extension::keccak256_node_pair_3x(key_lanes, children)
-    }
-    #[cfg(not(all(target_arch = "aarch64", target_feature = "sha3", target_endian = "little")))]
-    {
-        [
-            keccak256_node_pair(key_lanes, &children[0], &children[1]),
-            keccak256_node_pair(key_lanes, &children[2], &children[3]),
-            keccak256_node_pair(key_lanes, &children[4], &children[5]),
-        ]
-    }
-}
-
 pub(crate) fn keccak256_node_pair_2x(key_lanes: &[u64; 4], children: &[[u8; 32]; 4]) -> [[u8; OUT_LEN]; 2] {
     #[cfg(all(target_arch = "aarch64", target_feature = "sha3", target_endian = "little"))]
     {
@@ -1388,27 +1187,6 @@ pub(crate) fn keccak256_node_pair_2x(key_lanes: &[u64; 4], children: &[[u8; 32];
         [
             keccak256_node_pair(key_lanes, &children[0], &children[1]),
             keccak256_node_pair(key_lanes, &children[2], &children[3]),
-        ]
-    }
-}
-
-pub(crate) fn keccak256_domain_3x(
-    key_lanes: &[u64; 4],
-    in0: &[u8],
-    in1: &[u8],
-    in2: &[u8],
-) -> [[u8; OUT_LEN]; 3] {
-    assert!(in0.len() == in1.len() && in0.len() == in2.len());
-    #[cfg(all(target_arch = "aarch64", target_feature = "sha3", target_endian = "little"))]
-    {
-        sha3_extension::keccak256_domain_3x(key_lanes, in0, in1, in2)
-    }
-    #[cfg(not(all(target_arch = "aarch64", target_feature = "sha3", target_endian = "little")))]
-    {
-        [
-            keccak256_with_key_lanes(key_lanes, in0),
-            keccak256_with_key_lanes(key_lanes, in1),
-            keccak256_with_key_lanes(key_lanes, in2),
         ]
     }
 }

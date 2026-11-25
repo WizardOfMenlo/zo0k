@@ -147,13 +147,8 @@ impl Hasher for Blake3 {
     fn hash_nodes(children: &[Digest], out: &mut [Digest]) {
         assert!(out.len() == children.len().div_ceil(2));
         const KEY: [u32; 8] = Domain::MerkleNode.key_words();
-        let (c16, c_rem16) = children.as_chunks::<32>();
-        let (o16, o_rem16) = out.split_at_mut(c16.len() * 16);
-        for (grp, dst) in c16.iter().zip(o16.as_chunks_mut::<16>().0.iter_mut()) {
-            crate::blake3::keyed_hash_parent_16x(&KEY, grp, dst);
-        }
-        let (c8, c_rem8) = c_rem16.as_chunks::<16>();
-        let (o8, o_rem8) = o_rem16.split_at_mut(c8.len() * 8);
+        let (c8, c_rem8) = children.as_chunks::<16>();
+        let (o8, o_rem8) = out.split_at_mut(c8.len() * 8);
         for (grp, dst) in c8.iter().zip(o8.as_chunks_mut::<8>().0.iter_mut()) {
             crate::blake3::keyed_hash_parent_8x(&KEY, grp, dst);
         }
@@ -178,17 +173,8 @@ impl Hasher for Blake3 {
     fn hash_equal_len_batch(domain: Domain, inputs: &[u8], input_len: usize, out: &mut [Digest]) {
         assert!(inputs.len() == input_len * out.len());
         let key = domain.key_words();
-        let (o16, o_rem16) = out.as_chunks_mut::<16>();
+        let (o8, o_rem8) = out.as_chunks_mut::<8>();
         let mut offset = 0;
-        for dst in o16 {
-            let slices = std::array::from_fn(|i| {
-                let s = offset + i * input_len;
-                &inputs[s..s + input_len]
-            });
-            crate::blake3::keyed_hash_16x(&key, &slices, dst);
-            offset += 16 * input_len;
-        }
-        let (o8, o_rem8) = o_rem16.as_chunks_mut::<8>();
         for dst in o8 {
             let slices = std::array::from_fn(|i| {
                 let s = offset + i * input_len;
@@ -225,23 +211,13 @@ impl Hasher for Blake3 {
         #[cfg(all(target_arch = "aarch64", target_feature = "neon", target_endian = "little"))]
         if F::BYTES == 16 || F::BYTES == 32 {
             const KEY: [u32; 8] = Domain::MerkleLeaf.key_words();
-            let (o16, rem16) = out.as_chunks_mut::<16>();
-            if !o16.is_empty() {
-                crate::blake3::hash_rows_16x_direct(&KEY, rows, start, o16);
+            let (o8, rem8) = out.as_chunks_mut::<8>();
+            if !o8.is_empty() {
+                crate::blake3::hash_rows_8x_direct(&KEY, rows, start, o8);
             }
-            let done16 = o16.len() * 16;
-            let leaf_bytes = 8 + rows.len() * F::BYTES;
-            let (done, tail) = if leaf_bytes <= crate::blake3::CHUNK_LEN && rem16.len() >= 8 {
-                let (o8, rem8) = rem16.as_chunks_mut::<8>();
-                for (group, dst) in o8.iter_mut().enumerate() {
-                    crate::blake3::hash_rows_8x_direct(&KEY, rows, start + done16 + group * 8, dst);
-                }
-                (done16 + o8.len() * 8, rem8)
-            } else {
-                (done16, rem16)
-            };
-            if !tail.is_empty() {
-                crate::merkle::hash_rows_scratch::<Self, F>(rows, start + done, tail.len(), scratch, tail);
+            if !rem8.is_empty() {
+                let done = o8.len() * 8;
+                crate::merkle::hash_rows_scratch::<Self, F>(rows, start + done, rem8.len(), scratch, rem8);
             }
             return;
         }
@@ -290,13 +266,8 @@ impl Hasher for Keccak256 {
     fn hash_nodes(children: &[Digest], out: &mut [Digest]) {
         assert!(out.len() == children.len().div_ceil(2));
         const KEY: [u64; 4] = Domain::MerkleNode.key_lanes();
-        let (c3, c_rem3) = children.as_chunks::<6>();
-        let (o3, o_rem3) = out.split_at_mut(c3.len() * 3);
-        for (grp, dst) in c3.iter().zip(o3.as_chunks_mut::<3>().0.iter_mut()) {
-            *dst = crate::keccak::keccak256_node_pair_3x(&KEY, grp);
-        }
-        let (c2, c_rem2) = c_rem3.as_chunks::<4>();
-        let (o2, o_rem2) = o_rem3.split_at_mut(c2.len() * 2);
+        let (c2, c_rem2) = children.as_chunks::<4>();
+        let (o2, o_rem2) = out.split_at_mut(c2.len() * 2);
         for (grp, dst) in c2.iter().zip(o2.as_chunks_mut::<2>().0.iter_mut()) {
             *dst = crate::keccak::keccak256_node_pair_2x(&KEY, grp);
         }
@@ -313,16 +284,8 @@ impl Hasher for Keccak256 {
     fn hash_equal_len_batch(domain: Domain, inputs: &[u8], input_len: usize, out: &mut [Digest]) {
         assert!(inputs.len() == input_len * out.len());
         let key = domain.key_lanes();
-        let (o3, o_rem3) = out.as_chunks_mut::<3>();
+        let (o2, o_rem2) = out.as_chunks_mut::<2>();
         let mut offset = 0;
-        for dst in o3 {
-            let s0 = &inputs[offset..offset + input_len];
-            let s1 = &inputs[offset + input_len..offset + 2 * input_len];
-            let s2 = &inputs[offset + 2 * input_len..offset + 3 * input_len];
-            *dst = crate::keccak::keccak256_domain_3x(&key, s0, s1, s2);
-            offset += 3 * input_len;
-        }
-        let (o2, o_rem2) = o_rem3.as_chunks_mut::<2>();
         for dst in o2 {
             let s0 = &inputs[offset..offset + input_len];
             let s1 = &inputs[offset + input_len..offset + 2 * input_len];
@@ -352,13 +315,13 @@ impl Hasher for Keccak256 {
             if !o3.is_empty() {
                 crate::keccak::hash_rows_3x_direct(&KEY, rows, start, o3);
             }
-            let done3 = o3.len() * 3;
+            let d3 = o3.len() * 3;
             let (o2, rem2) = rem3.as_chunks_mut::<2>();
-            for (group, dst) in o2.iter_mut().enumerate() {
-                crate::keccak::hash_rows_2x_direct(&KEY, rows, start + done3 + group * 2, dst);
+            if !o2.is_empty() {
+                crate::keccak::hash_rows_2x_direct(&KEY, rows, start + d3, o2);
             }
             if !rem2.is_empty() {
-                let done = done3 + o2.len() * 2;
+                let done = d3 + o2.len() * 2;
                 crate::merkle::hash_rows_scratch::<Self, F>(rows, start + done, rem2.len(), scratch, rem2);
             }
             return;

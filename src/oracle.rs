@@ -6,8 +6,8 @@ use crate::parallel;
 use crate::transcript::{ProverTranscript, VerifierTranscript};
 
 const PARALLEL_THRESHOLD: usize = 1 << 12;
-const LEAF_BATCH: usize = 24;
-const PARALLEL_LEAF_MIN: usize = 12;
+const LEAF_BATCH: usize = 8;
+const PARALLEL_LEAF_MIN: usize = 8;
 
 pub struct Oracle<F> {
     rows: Vec<Vec<F>>,
