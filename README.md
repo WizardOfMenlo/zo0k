@@ -136,13 +136,14 @@ of the proving time on small tables.
 
 | Row | Table | Commit | Prove | Verify | Argument |
 |---|---|---|---|---|---|
-| `sublinear-20` | 32 MiB | 0.02 s | 0.1 s | 1.2 ms | 544 KiB |
-| `polylog-20` | 32 MiB | 0.03 s | 0.3 s | 1.0 ms | 125 KiB |
-| `polylog-24` | 512 MiB | 0.45 s | 0.55 s | 1.0 ms | 165 KiB |
-| `polylog-26` | 2 GiB | 2.2 s | 1.4 s | 1.1 ms | 182 KiB |
+| `sublinear-20` | 32 MiB | 0.011 s | 0.011 s | 0.71 ms | 544 KiB |
+| `polylog-20` | 32 MiB | 0.011 s | 0.058 s | 0.38 ms | 125 KiB |
+| `polylog-24` | 512 MiB | 0.19 s | 0.12 s | 0.44 ms | 165 KiB |
+| `polylog-26` | 2 GiB | 0.86 s | 0.34 s | 0.46 ms | 182 KiB |
 
-With Keccak-256, on `polylog-20` and `polylog-24`, committing and verifying
-take about a third longer and proving about twice as long.
+With Keccak-256, on `polylog-20` and `polylog-24`, committing takes about half
+again as long, verifying about twice as long, and proving about three to five
+times as long.
 
 ### `GF(2^128)`
 
@@ -169,17 +170,17 @@ The results for 100 bits, with 24 bits before the queries:
 
 | Table | Limit | Slack | Commit | Prove | Verify | Argument |
 |---|---|---|---|---|---|---|
-| `2^20` entries, 16 MiB | 24 | 0.015 | 0.02 s | 0.7 s | 0.6 ms | 93 KiB |
-| `2^20` entries, 16 MiB | 18 | 0.03 | 0.02 s | 0.2 s | 0.6 ms | 97 KiB |
-| `2^24` entries, 256 MiB | 24 | 0.025 | 0.27 s | 0.8 s | 0.7 ms | 129 KiB |
-| `2^26` entries, 1 GiB | 24 | 0.03 | 1.1 s | 2.2 s | 0.8 ms | 151 KiB |
+| `2^20` entries, 16 MiB | 24 | 0.015 | 0.0063 s | 0.12 s | 0.24 ms | 93 KiB |
+| `2^20` entries, 16 MiB | 18 | 0.03 | 0.0063 s | 0.048 s | 0.25 ms | 97 KiB |
+| `2^24` entries, 256 MiB | 24 | 0.025 | 0.11 s | 0.17 s | 0.38 ms | 129 KiB |
+| `2^26` entries, 1 GiB | 24 | 0.03 | 0.45 s | 0.46 s | 0.48 ms | 151 KiB |
 
 Compared with the rows for the same tables over `GF(2^256)`, the arguments are
-between a sixth and a quarter smaller, and committing is 1.6 to 2 times
+between a sixth and a quarter smaller, and committing is 1.7 to 1.9 times
 faster. Proving takes longer with the limit of 24 bits, because up to four
 rounds per stage then have a proof of work of that size. A smaller limit
 trades argument size for that time: at `2^20` entries, a limit of 18 bits
-costs 4% of the argument size and takes a third of the time.
+costs 4% of the argument size and takes about two fifths of the time.
 
 As for the rows of the paper's tables, the bound on the soundness error of the
 interactive protocol is about `2^-76` for these schedules, and the proofs of
